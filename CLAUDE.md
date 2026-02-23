@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 sshore — Terminal-native SSH connection manager with environment-aware safety, built in Rust. Manages SSH bookmarks with color-coded environment tiers (production/staging/development/local/testing), interactive TUI, native SSH via `russh`, sudo password assist, SFTP/SCP shortcuts, and persistent tunnels.
 
-See `SSHORE_PLAN.md` for the full 8-phase implementation specification. Follow it phase by phase, in order.
+See `CLAUDE.local.md` for the implementation plan (phase files, project overview, Cargo.toml spec). Follow phases in order.
 
 ## Build & Run
 

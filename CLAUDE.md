@@ -153,6 +153,7 @@ src/
 
 ## Commit Guidelines
 
+- **Never commit automatically** — only commit when the user explicitly asks. Do not create commits on your own.
 - **Message style**: Concise, action-oriented. Start with a verb: Add / Fix / Refactor / Update / Remove.
 - **Scope prefix** when helpful: e.g. `config: ...`, `ssh: ...`, `tui: ...`, `cli: ...`
 - **One logical change per commit** — don't bundle unrelated refactors.

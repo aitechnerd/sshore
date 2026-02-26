@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<VanDyke>
+  <key name="Sessions">
+    <key name="prod-web-01">
+      <string name="Hostname">10.0.1.5</string>
+      <dword name="[SSH2] Port">0x00000016</dword>
+      <string name="Username">deploy</string>
+      <string name="Identity Filename V2">~/.ssh/id_ed25519</string>
+    </key>
+    <key name="staging-api">
+      <string name="Hostname">10.0.2.10</string>
+      <dword name="[SSH2] Port">0x00000016</dword>
+      <string name="Username">deploy</string>
+    </key>
+    <key name="internal-db">
+      <string name="Hostname">10.0.0.50</string>
+      <dword name="[SSH2] Port">0x00001538</dword>
+      <string name="Username">admin</string>
+      <string name="Firewall Name">bastion</string>
+    </key>
+  </key>
+</VanDyke>

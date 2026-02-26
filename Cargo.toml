@@ -51,6 +51,12 @@ tokio-stream = "0.1"
 # Serialization
 serde_json = "1"
 
+# Import parsers
+serde_yaml = "0.9"
+quick-xml = "0.37"
+csv = "1"
+percent-encoding = "2"
+
 # Other
 regex = "1"
 chrono = { version = "0.4", features = ["serde"] }

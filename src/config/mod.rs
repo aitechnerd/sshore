@@ -1,4 +1,10 @@
 pub mod env;
+pub mod import_csv;
+pub mod import_json;
+pub mod import_mobaxterm;
+pub mod import_putty;
+pub mod import_securecrt;
+pub mod import_tabby;
 pub mod model;
 pub mod ssh_import;
 pub mod writer;
@@ -94,6 +100,85 @@ fn check_permissions(path: &Path) {
 #[cfg(not(unix))]
 fn check_permissions(_path: &Path) {
     // No permission checking on non-Unix platforms
+}
+
+/// Supported import source formats.
+///
+/// This mirrors `cli::ImportSource` but lives in the library crate so the
+/// config module can route imports without depending on the CLI crate.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ImportSourceKind {
+    /// Auto-detect between ssh_config and sshore TOML (legacy behavior).
+    Auto,
+    /// OpenSSH config (~/.ssh/config).
+    SshConfig,
+    /// sshore TOML export file.
+    Sshore,
+    /// PuTTY registry export (.reg).
+    Putty,
+    /// MobaXterm session export (.mxtsessions).
+    Mobaxterm,
+    /// Tabby terminal config (config.yaml).
+    Tabby,
+    /// SecureCRT XML export.
+    Securecrt,
+    /// CSV file.
+    Csv,
+    /// JSON file.
+    Json,
+}
+
+/// Import bookmarks from a file using the specified source format.
+pub fn import_from_source(
+    path: &Path,
+    source: ImportSourceKind,
+    env_override: Option<&str>,
+    extra_tags: &[String],
+) -> Result<Vec<Bookmark>> {
+    match source {
+        ImportSourceKind::Auto => {
+            // Auto-detect: sshore TOML vs ssh_config (existing behavior)
+            ssh_import::import_from_file(path)
+        }
+        ImportSourceKind::SshConfig => ssh_import::parse_ssh_config(path),
+        ImportSourceKind::Sshore => {
+            let content = fs::read_to_string(path)
+                .with_context(|| format!("Failed to read import file: {}", path.display()))?;
+            let config: AppConfig =
+                toml::from_str(&content).context("Failed to parse sshore TOML export file")?;
+            Ok(config.bookmarks)
+        }
+        ImportSourceKind::Putty => {
+            let content = fs::read_to_string(path)
+                .with_context(|| format!("Failed to read import file: {}", path.display()))?;
+            import_putty::parse_putty_reg(&content, env_override, extra_tags)
+        }
+        ImportSourceKind::Mobaxterm => {
+            let content = fs::read_to_string(path)
+                .with_context(|| format!("Failed to read import file: {}", path.display()))?;
+            import_mobaxterm::parse_mxtsessions(&content, env_override, extra_tags)
+        }
+        ImportSourceKind::Tabby => {
+            let content = fs::read_to_string(path)
+                .with_context(|| format!("Failed to read import file: {}", path.display()))?;
+            import_tabby::parse_tabby_config(&content, env_override, extra_tags)
+        }
+        ImportSourceKind::Securecrt => {
+            let content = fs::read_to_string(path)
+                .with_context(|| format!("Failed to read import file: {}", path.display()))?;
+            import_securecrt::parse_securecrt_xml(&content, env_override, extra_tags)
+        }
+        ImportSourceKind::Csv => {
+            let content = fs::read_to_string(path)
+                .with_context(|| format!("Failed to read import file: {}", path.display()))?;
+            import_csv::parse_csv(&content, env_override, extra_tags)
+        }
+        ImportSourceKind::Json => {
+            let content = fs::read_to_string(path)
+                .with_context(|| format!("Failed to read import file: {}", path.display()))?;
+            import_json::parse_json_bookmarks(&content, env_override, extra_tags)
+        }
+    }
 }
 
 /// Export filtered bookmarks as a TOML string.

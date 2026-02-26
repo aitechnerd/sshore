@@ -12,7 +12,8 @@ use std::path::PathBuf;
 use anyhow::{Context, Result, bail};
 use clap::{CommandFactory, Parser};
 
-use cli::{Cli, Commands, PasswordAction, TunnelAction};
+use cli::{Cli, Commands, ImportSource, PasswordAction, TunnelAction};
+use config::ImportSourceKind;
 use config::model::Bookmark;
 use config::ssh_import::merge_imports;
 
@@ -86,12 +87,14 @@ async fn main() -> Result<()> {
 
     match cli.command {
         Some(Commands::Import {
+            from,
             file,
             overwrite,
             env,
+            tag,
             dry_run,
         }) => {
-            cmd_import(file, overwrite, env, dry_run, cfg_override)?;
+            cmd_import(from, file, overwrite, env, tag, dry_run, cfg_override)?;
         }
         Some(Commands::List { env, format: _ }) => {
             cmd_list(env, cfg_override)?;
@@ -157,17 +160,29 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-/// Import bookmarks from an SSH config or sshore TOML export file.
+/// Import bookmarks from various sources.
 fn cmd_import(
+    from: Option<ImportSource>,
     file: Option<String>,
     overwrite: bool,
     env_override: Option<String>,
+    extra_tags: Vec<String>,
     dry_run: bool,
     cfg_override: Option<&str>,
 ) -> Result<()> {
-    let import_path = file
-        .map(|f| shellexpand::tilde(&f).to_string().into())
-        .unwrap_or_else(default_ssh_config_path);
+    // Resolve the import file path
+    let import_path: PathBuf = if let Some(ref f) = file {
+        shellexpand::tilde(f).to_string().into()
+    } else if from.is_none() || matches!(from, Some(ImportSource::SshConfig)) {
+        // Default to ~/.ssh/config for ssh_config / no-source
+        default_ssh_config_path()
+    } else {
+        anyhow::bail!(
+            "File path is required for --from {}. Usage: sshore import --from {} --file <path>",
+            from.as_ref().map(|s| format!("{s:?}")).unwrap_or_default(),
+            from.as_ref().map(|s| format!("{s:?}")).unwrap_or_default(),
+        );
+    };
 
     if !import_path.exists() {
         anyhow::bail!(
@@ -179,13 +194,69 @@ fn cmd_import(
     let mut app_config =
         config::load_with_override(cfg_override).context("Failed to load sshore config")?;
 
-    let mut imported = config::ssh_import::import_from_file(&import_path)
-        .with_context(|| format!("Failed to parse {}", import_path.display()))?;
+    // Convert CLI ImportSource to config ImportSourceKind
+    let source_kind = match &from {
+        None => ImportSourceKind::Auto,
+        Some(ImportSource::SshConfig) => ImportSourceKind::SshConfig,
+        Some(ImportSource::Putty) => ImportSourceKind::Putty,
+        Some(ImportSource::Mobaxterm) => ImportSourceKind::Mobaxterm,
+        Some(ImportSource::Tabby) => ImportSourceKind::Tabby,
+        Some(ImportSource::Securecrt) => ImportSourceKind::Securecrt,
+        Some(ImportSource::Csv) => ImportSourceKind::Csv,
+        Some(ImportSource::Json) => ImportSourceKind::Json,
+        Some(ImportSource::Sshore) => ImportSourceKind::Sshore,
+    };
 
-    // Apply environment override if specified
-    if let Some(ref env) = env_override {
+    // Determine the source label for display
+    let source_label = match &source_kind {
+        ImportSourceKind::Auto => "auto-detect",
+        ImportSourceKind::SshConfig => "SSH config",
+        ImportSourceKind::Putty => "PuTTY",
+        ImportSourceKind::Mobaxterm => "MobaXterm",
+        ImportSourceKind::Tabby => "Tabby",
+        ImportSourceKind::Securecrt => "SecureCRT",
+        ImportSourceKind::Csv => "CSV",
+        ImportSourceKind::Json => "JSON",
+        ImportSourceKind::Sshore => "sshore TOML",
+    };
+
+    // Use the multi-source dispatcher
+    let is_passthrough = matches!(
+        source_kind,
+        ImportSourceKind::Auto | ImportSourceKind::SshConfig | ImportSourceKind::Sshore
+    );
+    let mut imported = config::import_from_source(
+        &import_path,
+        source_kind,
+        env_override.as_deref(),
+        &extra_tags,
+    )
+    .with_context(|| {
+        format!(
+            "Failed to parse {} from {}",
+            source_label,
+            import_path.display()
+        )
+    })?;
+
+    // Apply environment override for sources that don't handle it internally
+    // (ssh_config, auto, sshore TOML don't pass env_override to the parser)
+    if let Some(ref env) = env_override
+        && is_passthrough
+    {
         for bookmark in &mut imported {
             bookmark.env = env.clone();
+        }
+    }
+
+    // Apply extra tags for sources that don't handle them internally
+    if !extra_tags.is_empty() && is_passthrough {
+        for bookmark in &mut imported {
+            for tag in &extra_tags {
+                if !bookmark.tags.contains(tag) {
+                    bookmark.tags.push(tag.clone());
+                }
+            }
         }
     }
 
@@ -193,6 +264,8 @@ fn cmd_import(
 
     if dry_run {
         println!("Dry run — no changes will be written.\n");
+        println!("Source: {} ({})\n", source_label, import_path.display());
+
         let mut added = 0;
         let mut skipped = 0;
         let mut overwritten = 0;
@@ -234,31 +307,42 @@ fn cmd_import(
 
     config::save_with_override(&app_config, cfg_override).context("Failed to save config")?;
 
+    // Post-import summary
     println!(
-        "Imported {} bookmarks from {} ({} parsed, {} already existed)",
-        result.imported.len(),
-        import_path.display(),
-        total_parsed,
-        result.already_existed
+        "Import complete from {} ({})\n",
+        source_label,
+        import_path.display()
     );
-
-    if !result.imported.is_empty() {
-        println!("\nNew bookmarks:");
-        for b in &result.imported {
-            let env_tag = if b.env.is_empty() {
-                String::new()
-            } else {
-                format!(" [{}]", b.env)
-            };
-            println!(
-                "  {} → {}@{}:{}{}",
-                b.name,
-                b.user.as_deref().unwrap_or("?"),
-                b.host,
-                b.port,
-                env_tag
-            );
+    println!("  {} bookmarks imported", result.imported.len());
+    if result.already_existed > 0 {
+        if overwrite {
+            println!("  {} overwritten", result.already_existed);
+        } else {
+            println!("  {} skipped (already exist)", result.already_existed);
         }
+    }
+    println!("  {} total parsed from source", total_parsed);
+
+    // Environment breakdown
+    if !result.imported.is_empty() {
+        let mut env_counts: std::collections::HashMap<String, usize> =
+            std::collections::HashMap::new();
+        for b in &result.imported {
+            let env_key = if b.env.is_empty() {
+                "(unset)".to_string()
+            } else {
+                b.env.clone()
+            };
+            *env_counts.entry(env_key).or_insert(0) += 1;
+        }
+
+        println!("\n  Environment breakdown:");
+        for (env, count) in &env_counts {
+            let noun = if *count == 1 { "bookmark" } else { "bookmarks" };
+            println!("     {:<14} {} {}", env, count, noun);
+        }
+
+        println!("\n  Tip: Run 'sshore list' to see your imported bookmarks.");
     }
 
     Ok(())

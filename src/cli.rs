@@ -1,4 +1,4 @@
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 
 /// Terminal-native SSH connection manager with environment-aware safety.
 #[derive(Parser, Debug)]
@@ -22,10 +22,17 @@ pub struct Cli {
 
 #[derive(Subcommand, Debug)]
 pub enum Commands {
-    /// Import bookmarks from ~/.ssh/config or sshore TOML export file.
+    /// Import bookmarks from various sources.
     Import {
-        /// Path to ssh config or sshore TOML export file (default: ~/.ssh/config).
-        #[arg(short, long)]
+        /// Import source format.
+        /// If not specified, defaults to ssh_config (or sshore TOML auto-detect).
+        #[arg(long, value_enum)]
+        from: Option<ImportSource>,
+
+        /// Path to the source file.
+        /// For ssh_config: defaults to ~/.ssh/config if not specified.
+        /// For all other sources: required.
+        #[arg(short, long, value_name = "FILE")]
         file: Option<String>,
 
         /// Overwrite existing bookmarks with same name.
@@ -35,6 +42,10 @@ pub enum Commands {
         /// Override environment for all imported bookmarks.
         #[arg(long)]
         env: Option<String>,
+
+        /// Add tag(s) to all imported bookmarks.
+        #[arg(long, value_delimiter = ',')]
+        tag: Vec<String>,
 
         /// Show what would be imported without writing config.
         #[arg(long)]
@@ -204,6 +215,27 @@ pub enum TunnelAction {
     Status,
 }
 
+/// Source format for import.
+#[derive(Clone, Debug, ValueEnum)]
+pub enum ImportSource {
+    /// OpenSSH config (~/.ssh/config)
+    SshConfig,
+    /// PuTTY registry export (.reg file)
+    Putty,
+    /// MobaXterm session export (.mxtsessions file)
+    Mobaxterm,
+    /// Tabby terminal config (config.yaml)
+    Tabby,
+    /// SecureCRT XML export
+    Securecrt,
+    /// CSV file (name,host,user,port,env columns)
+    Csv,
+    /// JSON file (array of bookmark objects)
+    Json,
+    /// sshore TOML config (from another machine / team share)
+    Sshore,
+}
+
 #[cfg(test)]
 mod tests {
     use clap::Parser;
@@ -230,6 +262,7 @@ mod tests {
         assert!(matches!(
             cli.command,
             Some(Commands::Import {
+                from: None,
                 file: None,
                 overwrite: false,
                 ..
@@ -264,6 +297,71 @@ mod tests {
                 assert!(overwrite);
                 assert!(env.is_none());
                 assert!(!dry_run);
+            }
+            _ => panic!("Expected Import command"),
+        }
+    }
+
+    #[test]
+    fn test_parse_import_from_putty() {
+        let cli = Cli::try_parse_from([
+            "sshore",
+            "import",
+            "--from",
+            "putty",
+            "--file",
+            "sessions.reg",
+        ])
+        .unwrap();
+        match cli.command {
+            Some(Commands::Import { from, file, .. }) => {
+                assert!(matches!(from, Some(ImportSource::Putty)));
+                assert_eq!(file, Some("sessions.reg".into()));
+            }
+            _ => panic!("Expected Import command"),
+        }
+    }
+
+    #[test]
+    fn test_parse_import_from_csv_with_env_and_tag() {
+        let cli = Cli::try_parse_from([
+            "sshore",
+            "import",
+            "--from",
+            "csv",
+            "--file",
+            "hosts.csv",
+            "--env",
+            "staging",
+            "--tag",
+            "web,legacy",
+        ])
+        .unwrap();
+        match cli.command {
+            Some(Commands::Import {
+                from,
+                file,
+                env,
+                tag,
+                ..
+            }) => {
+                assert!(matches!(from, Some(ImportSource::Csv)));
+                assert_eq!(file, Some("hosts.csv".into()));
+                assert_eq!(env, Some("staging".into()));
+                assert_eq!(tag, vec!["web", "legacy"]);
+            }
+            _ => panic!("Expected Import command"),
+        }
+    }
+
+    #[test]
+    fn test_parse_import_backward_compat_file_only() {
+        // --file without --from should still work (backward compat)
+        let cli = Cli::try_parse_from(["sshore", "import", "--file", "~/.ssh/config"]).unwrap();
+        match cli.command {
+            Some(Commands::Import { from, file, .. }) => {
+                assert!(from.is_none());
+                assert_eq!(file, Some("~/.ssh/config".into()));
             }
             _ => panic!("Expected Import command"),
         }
@@ -572,6 +670,7 @@ mod tests {
                 overwrite,
                 env,
                 dry_run,
+                ..
             }) => {
                 assert_eq!(file, Some("servers.toml".into()));
                 assert!(!overwrite);

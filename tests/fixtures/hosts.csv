@@ -1,0 +1,6 @@
+name,host,user,port,env,tags,identity_file,proxy_jump,notes
+prod-web-01,10.0.1.5,deploy,22,production,"web,frontend",~/.ssh/id_ed25519,bastion,Primary web server
+prod-web-02,10.0.1.6,deploy,22,production,"web,frontend",~/.ssh/id_ed25519,bastion,Secondary web server
+staging-api,10.0.2.10,deploy,22,staging,api,,,API staging server
+dev-local,192.168.1.50,sergey,22,development,,,,Local dev VM
+test-runner,10.0.3.1,ci,22,testing,"ci,automation",,,CI runner

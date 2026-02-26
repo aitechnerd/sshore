@@ -1,0 +1,42 @@
+[
+  {
+    "name": "prod-web-01",
+    "host": "10.0.1.5",
+    "user": "deploy",
+    "port": 22,
+    "env": "production",
+    "tags": ["web", "frontend"],
+    "identity_file": "~/.ssh/id_ed25519",
+    "proxy_jump": "bastion",
+    "notes": "Primary web server"
+  },
+  {
+    "name": "staging-api",
+    "host": "10.0.2.10",
+    "user": "deploy",
+    "port": 22,
+    "env": "staging",
+    "tags": ["api"]
+  },
+  {
+    "name": "dev-local",
+    "host": "192.168.1.50",
+    "user": "sergey",
+    "port": 22,
+    "env": "development"
+  },
+  {
+    "name": "test-runner",
+    "host": "10.0.3.1",
+    "user": "ci",
+    "port": 22,
+    "env": "testing",
+    "tags": ["ci"]
+  },
+  {
+    "name": "bastion",
+    "host": "bastion.example.com",
+    "user": "admin",
+    "port": 22
+  }
+]

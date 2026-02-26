@@ -1,0 +1,32 @@
+profiles:
+  - type: ssh
+    name: bastion
+    group: Infrastructure
+    options:
+      host: bastion.example.com
+      port: 22
+      user: admin
+    id: "bastion-uuid-001"
+  - type: ssh
+    name: prod-web-01
+    group: Production
+    options:
+      host: 10.0.1.5
+      port: 22
+      user: deploy
+      privateKeys:
+        - "~/.ssh/id_ed25519"
+      jumpHost: "bastion-uuid-001"
+    id: "web-uuid-002"
+  - type: ssh
+    name: staging-api
+    group: Staging
+    options:
+      host: 10.0.2.10
+      port: 22
+      user: deploy
+    id: "api-uuid-003"
+  - type: local
+    name: Local Terminal
+    options: {}
+    id: "local-uuid-004"

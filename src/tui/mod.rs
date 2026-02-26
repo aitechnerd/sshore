@@ -17,6 +17,7 @@ use ratatui::widgets::{Block, Borders};
 
 use crate::config;
 use crate::config::model::AppConfig;
+use crate::ssh;
 use crate::tui::views::confirm::ConfirmState;
 use crate::tui::views::form::FormState;
 use crate::tui::views::{confirm, form, help, list};
@@ -51,6 +52,12 @@ const ENV_FILTER_MAP: &[&str] = &[
     "testing",     // 5
 ];
 
+/// Action returned by the event loop to signal leaving the TUI for SSH.
+enum LoopAction {
+    Quit,
+    Connect(usize),
+}
+
 /// Main application state.
 pub struct App {
     pub config: AppConfig,
@@ -64,6 +71,8 @@ pub struct App {
     pub status_message: Option<(String, Instant)>,
     pub form_state: Option<FormState>,
     pub confirm_state: Option<ConfirmState>,
+    /// Set when the user presses Enter to connect; signals the event loop to exit.
+    connect_request: Option<usize>,
     matcher: SkimMatcherV2,
 }
 
@@ -85,6 +94,7 @@ impl App {
             status_message: None,
             form_state: None,
             confirm_state: None,
+            connect_request: None,
             matcher,
         }
     }
@@ -129,16 +139,28 @@ impl App {
     }
 }
 
-/// Launch the TUI, blocking until the user quits.
-pub fn run(config: AppConfig) -> Result<()> {
-    // Set up terminal
+/// Enter the alternate screen and set up the terminal for TUI rendering.
+fn enter_tui() -> Result<Terminal<CrosstermBackend<std::io::Stdout>>> {
     terminal::enable_raw_mode().context("Failed to enable raw mode")?;
     let mut stdout = std::io::stdout();
     execute!(stdout, EnterAlternateScreen).context("Failed to enter alternate screen")?;
 
     let backend = CrosstermBackend::new(stdout);
-    let mut terminal = Terminal::new(backend).context("Failed to create terminal")?;
+    Terminal::new(backend).context("Failed to create terminal")
+}
 
+/// Leave the alternate screen and restore the terminal for normal I/O.
+fn leave_tui(terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>) -> Result<()> {
+    terminal::disable_raw_mode().context("Failed to disable raw mode")?;
+    execute!(terminal.backend_mut(), LeaveAlternateScreen)
+        .context("Failed to leave alternate screen")?;
+    terminal.show_cursor().context("Failed to show cursor")?;
+    Ok(())
+}
+
+/// Launch the TUI, blocking until the user quits.
+/// Loops: TUI -> SSH connect -> TUI, allowing repeated connections.
+pub async fn run(config: &mut AppConfig) -> Result<()> {
     // Install panic hook that restores terminal state
     let original_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
@@ -147,23 +169,46 @@ pub fn run(config: AppConfig) -> Result<()> {
         original_hook(info);
     }));
 
-    let mut app = App::new(config);
-    let result = event_loop(&mut terminal, &mut app);
+    let mut app = App::new(config.clone());
 
-    // Always restore terminal state
-    terminal::disable_raw_mode().context("Failed to disable raw mode")?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen)
-        .context("Failed to leave alternate screen")?;
-    terminal.show_cursor().context("Failed to show cursor")?;
+    loop {
+        let mut terminal = enter_tui()?;
+        let action = event_loop(&mut terminal, &mut app)?;
+        leave_tui(&mut terminal)?;
 
-    result
+        match action {
+            LoopAction::Quit => break,
+            LoopAction::Connect(bookmark_index) => {
+                if let Err(e) = ssh::connect(&mut app.config, bookmark_index).await {
+                    eprintln!("SSH error: {e:#}");
+                    eprintln!("Press Enter to return to sshore...");
+                    let _ = wait_for_enter();
+                }
+            }
+        }
+    }
+
+    // Write back updated config (connection stats may have changed)
+    *config = app.config;
+
+    Ok(())
 }
 
-/// Main event loop: draw, poll, handle.
+/// Wait for the user to press Enter (used after SSH error messages).
+fn wait_for_enter() -> Result<()> {
+    let mut buf = String::new();
+    std::io::stdin().read_line(&mut buf)?;
+    Ok(())
+}
+
+/// Main event loop: draw, poll, handle. Returns action when the loop exits.
 fn event_loop(
     terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
     app: &mut App,
-) -> Result<()> {
+) -> Result<LoopAction> {
+    // Reset connect request from any previous iteration
+    app.connect_request = None;
+
     loop {
         terminal
             .draw(|frame| draw(frame, app))
@@ -178,11 +223,13 @@ fn event_loop(
         app.tick();
 
         if app.should_quit {
-            break;
+            return Ok(LoopAction::Quit);
+        }
+
+        if let Some(idx) = app.connect_request.take() {
+            return Ok(LoopAction::Connect(idx));
         }
     }
-
-    Ok(())
 }
 
 /// Route drawing to the appropriate view based on current screen.
@@ -335,8 +382,8 @@ fn handle_list_key(app: &mut App, key: KeyEvent) {
 
         // Actions
         KeyCode::Enter => {
-            if !app.filtered_indices.is_empty() {
-                app.set_status("SSH connection not yet implemented (Phase 4)");
+            if let Some(idx) = app.selected_bookmark_index() {
+                app.connect_request = Some(idx);
             }
         }
         KeyCode::Char('a') => {

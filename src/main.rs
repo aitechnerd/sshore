@@ -1,5 +1,6 @@
 mod cli;
 mod config;
+mod ssh;
 mod tui;
 
 use std::io;
@@ -58,10 +59,10 @@ async fn main() -> Result<()> {
         }
         None => {
             if let Some(name) = cli.connect {
-                eprintln!("SSH connection to '{}' not yet implemented (Phase 4)", name);
+                cmd_connect(&name).await?;
             } else {
-                let app_config = config::load().context("Failed to load config")?;
-                tui::run(app_config)?;
+                let mut app_config = config::load().context("Failed to load config")?;
+                tui::run(&mut app_config).await?;
             }
         }
     }
@@ -160,6 +161,21 @@ fn cmd_list(env_filter: Option<String>) -> Result<()> {
     println!("\n  {} bookmark(s)", bookmarks.len());
 
     Ok(())
+}
+
+/// Connect to a bookmark by name directly (no TUI).
+async fn cmd_connect(name: &str) -> Result<()> {
+    let mut app_config = config::load().context("Failed to load config")?;
+
+    let bookmark_index = app_config
+        .bookmarks
+        .iter()
+        .position(|b| b.name.eq_ignore_ascii_case(name))
+        .with_context(|| {
+            format!("No bookmark named '{name}'. Use `sshore list` to see available bookmarks.")
+        })?;
+
+    ssh::connect(&mut app_config, bookmark_index).await
 }
 
 /// Generate shell completions to stdout.

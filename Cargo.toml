@@ -12,7 +12,7 @@ categories = ["command-line-utilities", "network-programming"]
 [dependencies]
 # TUI
 ratatui = "0.30"
-crossterm = "0.29"
+crossterm = { version = "0.29", features = ["event-stream"] }
 
 # SSH & SFTP
 russh = "0.57"
@@ -44,6 +44,9 @@ keyring = "3"
 
 # Error handling
 anyhow = "1"
+
+# Streaming
+tokio-stream = "0.1"
 
 # Other
 regex = "1"

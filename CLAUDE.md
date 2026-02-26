@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project
 
-sshore — Terminal-native SSH connection manager with environment-aware safety, built in Rust. Manages SSH bookmarks with color-coded environment tiers (production/staging/development/local/testing), interactive TUI, native SSH via `russh`, sudo password assist, SFTP/SCP shortcuts, persistent tunnels, per-bookmark snippets, quick remote exec, and config export.
+sshore — Terminal-native SSH connection manager with environment-aware safety, built in Rust. Manages SSH bookmarks with color-coded environment tiers (production/staging/development/local/testing), interactive TUI, native SSH via `russh`, sudo password assist, SFTP/SCP shortcuts with resumable transfers, dual-pane TUI file browser (mc-style), persistent tunnels, per-bookmark snippets, quick remote exec, config export, known_hosts verification, ad-hoc connect with save-as-bookmark, cross-machine config sync, and a `StorageBackend` trait for future S3/cloud support.
 
 See `CLAUDE.local.md` for the implementation plan (phase files, project overview, Cargo.toml spec). Follow phases in order.
 
@@ -23,6 +23,10 @@ cargo run                                  # launch TUI (default, no subcommand)
 cargo run -- prod-web-01                   # direct connect by bookmark name
 cargo run -- exec prod-web-01 "uptime"     # quick remote exec
 cargo run -- export --env production       # export bookmarks to TOML
+cargo run -- connect user@10.0.1.50        # ad-hoc connect without bookmark
+cargo run -- browse prod-web-01            # dual-pane file browser
+cargo run -- browse prod-web-01:/var/log   # browse starting at specific path
+cargo run -- --config ~/sync/sshore.toml list  # use custom config path
 
 # Install locally
 cargo install --path .
@@ -81,6 +85,7 @@ src/
 │   ├── terminal_theme.rs        # OSC escape codes: tab title, tab color
 │   ├── password.rs              # Sudo prompt detection + password injection
 │   ├── snippet.rs               # Escape sequence detector + inline snippet picker
+│   ├── known_hosts.rs           # Host key verification against ~/.ssh/known_hosts
 │   └── tunnel.rs                # Persistent tunnel management with auto-reconnect
 ├── sftp/
 │   ├── mod.rs                   # Public API: sftp_session(), transfer()
@@ -104,7 +109,7 @@ src/
 
 **Async runtime:** Tokio. Required by `russh`. All SSH, SFTP, and tunnel operations are async. TUI event loop uses `crossterm`'s async event stream.
 
-**Implementation phases:** Foundation (config/CLI) → TUI list → Bookmark CRUD → SSH connect → Sudo assist → SFTP/SCP → Tunnels → Polish/release → Snippets/exec/export.
+**Implementation phases:** Foundation (config/CLI) → TUI list → Bookmark CRUD → SSH connect → Sudo assist → SFTP/SCP → Tunnels → Polish/release → Snippets/exec/export → Hardening/reliability.
 
 ## Engineering Principles
 
@@ -113,6 +118,7 @@ src/
 - **Handle edge cases** — err on the side of handling more, not fewer.
 - **Engineered enough** — not under-engineered (fragile, hacky) and not over-engineered (premature abstraction, unnecessary complexity).
 - **Well-tested code is non-negotiable** — every logic change ships with tests.
+- **Offline-first** — sshore never makes network calls at startup or during TUI operation. All network activity is user-initiated: SSH connect, SFTP transfer, tunnel start. No update checks, no telemetry, no DNS resolution until the user presses Enter on a bookmark.
 
 ## Code Quality & Style
 
@@ -131,6 +137,7 @@ src/
 - **Input validation**: Reject hostnames with shell metacharacters (`;`, `|`, `&`, `$`, `` ` ``, `(`, `)`, `{`, `}`, `<`, `>`, `\n`, `\r`). Bookmark names: alphanumeric + `-_.` only. Identity file paths must resolve within the user's home directory.
 - **Passwords**: Stored exclusively in OS keychain (via `keyring` crate). Never written to config files, log output, or stdout. Password injection always requires explicit user confirmation (Enter press).
 - **Atomic writes**: All config modifications use tempfile-then-rename to prevent corruption on crash.
+- **SFTP channel isolation**: SFTP sessions MUST use a separate SSH channel from interactive shell sessions. Transfer errors must never corrupt or close an interactive SSH session.
 - **Never log credentials**: No SSH keys, passwords, or keychain contents in any output.
 
 ## Testing

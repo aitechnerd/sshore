@@ -19,6 +19,8 @@ fn sample_bookmark(name: &str, env: &str) -> Bookmark {
         connect_count: 10,
         on_connect: None,
         snippets: vec![],
+        connect_timeout_secs: None,
+        ssh_options: std::collections::HashMap::new(),
     }
 }
 
@@ -97,6 +99,8 @@ fn test_import_overwrite_vs_skip() {
         connect_count: 0,
         on_connect: None,
         snippets: vec![],
+        connect_timeout_secs: None,
+        ssh_options: std::collections::HashMap::new(),
     }];
 
     let imported = vec![
@@ -114,6 +118,8 @@ fn test_import_overwrite_vs_skip() {
             connect_count: 0,
             on_connect: None,
             snippets: vec![],
+            connect_timeout_secs: None,
+            ssh_options: std::collections::HashMap::new(),
         },
         Bookmark {
             name: "server-b".into(),
@@ -129,6 +135,8 @@ fn test_import_overwrite_vs_skip() {
             connect_count: 0,
             on_connect: None,
             snippets: vec![],
+            connect_timeout_secs: None,
+            ssh_options: std::collections::HashMap::new(),
         },
     ];
 
@@ -155,6 +163,8 @@ fn test_import_overwrite_vs_skip() {
         connect_count: 0,
         on_connect: None,
         snippets: vec![],
+        connect_timeout_secs: None,
+        ssh_options: std::collections::HashMap::new(),
     }];
 
     let result2 = merge_imports(&mut existing2, imported, true);

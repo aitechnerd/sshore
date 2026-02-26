@@ -232,6 +232,8 @@ impl FormState {
             connect_count: 0,
             on_connect,
             snippets: vec![],
+            connect_timeout_secs: None,
+            ssh_options: std::collections::HashMap::new(),
         })
     }
 }
@@ -497,6 +499,8 @@ mod tests {
             connect_count: 0,
             on_connect: None,
             snippets: vec![],
+            connect_timeout_secs: None,
+            ssh_options: std::collections::HashMap::new(),
         }
     }
 

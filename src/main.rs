@@ -3,6 +3,7 @@ mod config;
 mod keychain;
 mod sftp;
 mod ssh;
+mod storage;
 mod tui;
 
 use std::io::{self, Write};
@@ -55,9 +56,33 @@ fn format_bookmark_row(b: &Bookmark, settings: &config::model::Settings) -> Stri
     )
 }
 
+/// Install a panic hook that restores terminal state before printing the panic.
+/// This catches panics in any thread, preventing raw mode from persisting.
+fn setup_panic_hook() {
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        // Restore terminal FIRST, before printing the panic
+        let _ = io::stdout().flush();
+        let _ = crossterm::terminal::disable_raw_mode();
+        let _ = crossterm::execute!(
+            io::stdout(),
+            crossterm::cursor::Show,
+            crossterm::style::ResetColor,
+            crossterm::terminal::LeaveAlternateScreen,
+        );
+        ssh::terminal_theme::reset_theme();
+        let _ = io::stdout().flush();
+
+        // Now print the panic message to a clean terminal
+        default_hook(info);
+    }));
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
+    setup_panic_hook();
     let cli = Cli::parse();
+    let cfg_override = cli.config.as_deref();
 
     match cli.command {
         Some(Commands::Import {
@@ -66,28 +91,39 @@ async fn main() -> Result<()> {
             env,
             dry_run,
         }) => {
-            cmd_import(file, overwrite, env, dry_run)?;
+            cmd_import(file, overwrite, env, dry_run, cfg_override)?;
         }
         Some(Commands::List { env, format: _ }) => {
-            cmd_list(env)?;
+            cmd_list(env, cfg_override)?;
         }
         Some(Commands::Completions { shell }) => {
             cmd_completions(shell);
         }
+        Some(Commands::Connect { target }) => {
+            cmd_connect_adhoc(&target, cfg_override).await?;
+        }
         Some(Commands::Password { action }) => {
-            cmd_password(action)?;
+            cmd_password(action, cfg_override)?;
         }
         Some(Commands::Sftp { bookmark }) => {
-            cmd_sftp(&bookmark).await?;
+            cmd_sftp(&bookmark, cfg_override).await?;
         }
         Some(Commands::Scp {
             source,
             destination,
+            resume,
         }) => {
-            cmd_scp(&source, &destination).await?;
+            cmd_scp(&source, &destination, resume, cfg_override).await?;
+        }
+        Some(Commands::Browse {
+            target,
+            local,
+            show_hidden,
+        }) => {
+            cmd_browse(&target, local.as_deref(), show_hidden, cfg_override).await?;
         }
         Some(Commands::Tunnel { action }) => {
-            cmd_tunnel(action).await?;
+            cmd_tunnel(action, cfg_override).await?;
         }
         Some(Commands::Exec {
             bookmark,
@@ -96,7 +132,7 @@ async fn main() -> Result<()> {
             env,
             concurrency,
         }) => {
-            cmd_exec(bookmark, command, tag, env, concurrency).await?;
+            cmd_exec(bookmark, command, tag, env, concurrency, cfg_override).await?;
         }
         Some(Commands::Export {
             env,
@@ -105,14 +141,15 @@ async fn main() -> Result<()> {
             output,
             include_settings,
         }) => {
-            cmd_export(env, tag, name, output, include_settings)?;
+            cmd_export(env, tag, name, output, include_settings, cfg_override)?;
         }
         None => {
             if let Some(name) = cli.connect {
-                cmd_connect(&name).await?;
+                cmd_connect(&name, cfg_override).await?;
             } else {
-                let mut app_config = config::load().context("Failed to load config")?;
-                tui::run(&mut app_config).await?;
+                let mut app_config =
+                    config::load_with_override(cfg_override).context("Failed to load config")?;
+                tui::run(&mut app_config, cfg_override).await?;
             }
         }
     }
@@ -126,6 +163,7 @@ fn cmd_import(
     overwrite: bool,
     env_override: Option<String>,
     dry_run: bool,
+    cfg_override: Option<&str>,
 ) -> Result<()> {
     let import_path = file
         .map(|f| shellexpand::tilde(&f).to_string().into())
@@ -138,7 +176,8 @@ fn cmd_import(
         );
     }
 
-    let mut app_config = config::load().context("Failed to load sshore config")?;
+    let mut app_config =
+        config::load_with_override(cfg_override).context("Failed to load sshore config")?;
 
     let mut imported = config::ssh_import::import_from_file(&import_path)
         .with_context(|| format!("Failed to parse {}", import_path.display()))?;
@@ -193,7 +232,7 @@ fn cmd_import(
 
     let result = merge_imports(&mut app_config.bookmarks, imported, overwrite);
 
-    config::save(&app_config).context("Failed to save config")?;
+    config::save_with_override(&app_config, cfg_override).context("Failed to save config")?;
 
     println!(
         "Imported {} bookmarks from {} ({} parsed, {} already existed)",
@@ -226,8 +265,8 @@ fn cmd_import(
 }
 
 /// List bookmarks in a table format.
-fn cmd_list(env_filter: Option<String>) -> Result<()> {
-    let app_config = config::load().context("Failed to load config")?;
+fn cmd_list(env_filter: Option<String>, cfg_override: Option<&str>) -> Result<()> {
+    let app_config = config::load_with_override(cfg_override).context("Failed to load config")?;
 
     let bookmarks: Vec<&Bookmark> = app_config
         .bookmarks
@@ -276,38 +315,103 @@ fn find_bookmark_index(config: &config::model::AppConfig, name: &str) -> Result<
         })
 }
 
+/// Connect to an ad-hoc host (not a bookmark).
+async fn cmd_connect_adhoc(target: &str, cfg_override: Option<&str>) -> Result<()> {
+    let (user, host, port) = ssh::parse_connection_string(target)?;
+    let mut app_config =
+        config::load_with_override(cfg_override).context("Failed to load config")?;
+    ssh::connect_adhoc(&mut app_config, user, host, port, cfg_override).await
+}
+
 /// Connect to a bookmark by name directly (no TUI).
-async fn cmd_connect(name: &str) -> Result<()> {
-    let mut app_config = config::load().context("Failed to load config")?;
+async fn cmd_connect(name: &str, cfg_override: Option<&str>) -> Result<()> {
+    let mut app_config =
+        config::load_with_override(cfg_override).context("Failed to load config")?;
     let index = find_bookmark_index(&app_config, name)?;
-    ssh::connect(&mut app_config, index).await
+    ssh::connect(&mut app_config, index, cfg_override).await
 }
 
 /// Open an interactive SFTP session to a bookmark.
-async fn cmd_sftp(name: &str) -> Result<()> {
-    let config = config::load().context("Failed to load config")?;
+async fn cmd_sftp(name: &str, cfg_override: Option<&str>) -> Result<()> {
+    let config = config::load_with_override(cfg_override).context("Failed to load config")?;
     let index = find_bookmark_index(&config, name)?;
     sftp::open_session(&config, index).await
 }
 
 /// Copy files to/from a remote server (SCP-style).
-async fn cmd_scp(source: &str, destination: &str) -> Result<()> {
-    let config = config::load().context("Failed to load config")?;
-    sftp::shortcuts::scp_transfer(&config, source, destination).await
+async fn cmd_scp(
+    source: &str,
+    destination: &str,
+    resume: bool,
+    cfg_override: Option<&str>,
+) -> Result<()> {
+    let config = config::load_with_override(cfg_override).context("Failed to load config")?;
+    sftp::shortcuts::scp_transfer(&config, source, destination, resume).await
+}
+
+/// Open the dual-pane file browser.
+async fn cmd_browse(
+    target: &str,
+    local_start: Option<&str>,
+    show_hidden: bool,
+    cfg_override: Option<&str>,
+) -> Result<()> {
+    let config = config::load_with_override(cfg_override).context("Failed to load config")?;
+
+    // Parse target: "prod-web-01" or "prod-web-01:/var/log"
+    let (bookmark_name, remote_start_path) = if target.contains(':') {
+        let parts: Vec<&str> = target.splitn(2, ':').collect();
+        (parts[0], Some(parts[1]))
+    } else {
+        (target, None)
+    };
+
+    let index = find_bookmark_index(&config, bookmark_name)?;
+    let bookmark = &config.bookmarks[index];
+
+    // Apply terminal theming
+    ssh::terminal_theme::apply_theme(bookmark, &config.settings);
+
+    // Create backends
+    let remote_sftp = if let Some(path) = remote_start_path {
+        storage::sftp_backend::SftpBackend::with_path(&config, index, path).await?
+    } else {
+        storage::sftp_backend::SftpBackend::new(&config, index).await?
+    };
+    let mut remote_backend = storage::Backend::Sftp(remote_sftp);
+
+    let local_dir = local_start.unwrap_or(".");
+    let local_fs = storage::local_backend::LocalBackend::new(local_dir)
+        .context("Failed to open local directory")?;
+    let mut local_backend = storage::Backend::Local(local_fs);
+
+    // Launch browser TUI
+    tui::views::browser::run(
+        &mut local_backend,
+        &mut remote_backend,
+        &bookmark.name,
+        &bookmark.env,
+        show_hidden,
+    )
+    .await?;
+
+    // Reset theming on exit
+    ssh::terminal_theme::reset_theme();
+    Ok(())
 }
 
 /// Manage stored passwords in OS keychain.
-fn cmd_password(action: PasswordAction) -> Result<()> {
+fn cmd_password(action: PasswordAction, cfg_override: Option<&str>) -> Result<()> {
     match action {
-        PasswordAction::Set { bookmark } => cmd_password_set(&bookmark),
+        PasswordAction::Set { bookmark } => cmd_password_set(&bookmark, cfg_override),
         PasswordAction::Remove { bookmark } => cmd_password_remove(&bookmark),
-        PasswordAction::List => cmd_password_list(),
+        PasswordAction::List => cmd_password_list(cfg_override),
     }
 }
 
 /// Store a password for a bookmark in the OS keychain.
-fn cmd_password_set(bookmark_name: &str) -> Result<()> {
-    let app_config = config::load().context("Failed to load config")?;
+fn cmd_password_set(bookmark_name: &str, cfg_override: Option<&str>) -> Result<()> {
+    let app_config = config::load_with_override(cfg_override).context("Failed to load config")?;
 
     let bookmark = app_config
         .bookmarks
@@ -350,8 +454,8 @@ fn cmd_password_remove(bookmark_name: &str) -> Result<()> {
 }
 
 /// List bookmarks that have stored passwords.
-fn cmd_password_list() -> Result<()> {
-    let app_config = config::load().context("Failed to load config")?;
+fn cmd_password_list(cfg_override: Option<&str>) -> Result<()> {
+    let app_config = config::load_with_override(cfg_override).context("Failed to load config")?;
     let names = keychain::list_passwords(&app_config.bookmarks);
 
     if names.is_empty() {
@@ -415,8 +519,9 @@ async fn cmd_exec(
     tag: Vec<String>,
     env: Option<String>,
     concurrency: usize,
+    cfg_override: Option<&str>,
 ) -> Result<()> {
-    let config = config::load().context("Failed to load config")?;
+    let config = config::load_with_override(cfg_override).context("Failed to load config")?;
     let command_str = command.join(" ");
 
     if command_str.is_empty() {
@@ -478,8 +583,9 @@ fn cmd_export(
     name: Option<String>,
     output: Option<String>,
     include_settings: bool,
+    cfg_override: Option<&str>,
 ) -> Result<()> {
-    let app_config = config::load().context("Failed to load config")?;
+    let app_config = config::load_with_override(cfg_override).context("Failed to load config")?;
     let toml_output = config::export_bookmarks(
         &app_config,
         env.as_deref(),
@@ -500,7 +606,7 @@ fn cmd_export(
 }
 
 /// Dispatch tunnel subcommands.
-async fn cmd_tunnel(action: TunnelAction) -> Result<()> {
+async fn cmd_tunnel(action: TunnelAction, cfg_override: Option<&str>) -> Result<()> {
     match action {
         TunnelAction::Start {
             bookmark,
@@ -508,7 +614,17 @@ async fn cmd_tunnel(action: TunnelAction) -> Result<()> {
             remote_forward,
             persist,
             daemon,
-        } => cmd_tunnel_start(&bookmark, &local_forward, &remote_forward, persist, daemon).await,
+        } => {
+            cmd_tunnel_start(
+                &bookmark,
+                &local_forward,
+                &remote_forward,
+                persist,
+                daemon,
+                cfg_override,
+            )
+            .await
+        }
         TunnelAction::Stop { bookmark } => cmd_tunnel_stop(&bookmark),
         TunnelAction::Status => cmd_tunnel_status(),
     }
@@ -521,6 +637,7 @@ async fn cmd_tunnel_start(
     remote_specs: &[String],
     persist: bool,
     daemon: bool,
+    cfg_override: Option<&str>,
 ) -> Result<()> {
     use ssh::tunnel::{ForwardDirection, ForwardSpec, parse_forward_spec};
 
@@ -528,7 +645,7 @@ async fn cmd_tunnel_start(
         bail!("No forward specs provided. Use -L or -R to specify port forwards.");
     }
 
-    let config = config::load().context("Failed to load config")?;
+    let config = config::load_with_override(cfg_override).context("Failed to load config")?;
     let index = find_bookmark_index(&config, bookmark_name)?;
 
     // Parse all forward specs
@@ -544,13 +661,18 @@ async fn cmd_tunnel_start(
         // Re-exec as daemon: detach from terminal and run in background
         let exe = std::env::current_exe().context("Failed to get current executable path")?;
 
-        let mut args = vec![
+        let mut args = Vec::new();
+        if let Some(cfg) = cfg_override {
+            args.push("--config".to_string());
+            args.push(cfg.to_string());
+        }
+        args.extend([
             "tunnel".to_string(),
             "start".to_string(),
             bookmark_name.to_string(),
             "--persist".to_string(),
             "--daemon".to_string(),
-        ];
+        ]);
         for spec in local_specs {
             args.push("-L".to_string());
             args.push(spec.clone());

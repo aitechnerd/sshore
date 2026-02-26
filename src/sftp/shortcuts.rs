@@ -42,7 +42,12 @@ pub fn parse_remote_spec(spec: &str) -> Option<(&str, &str)> {
 }
 
 /// Execute an SCP-style file transfer.
-pub async fn scp_transfer(config: &AppConfig, source: &str, destination: &str) -> Result<()> {
+pub async fn scp_transfer(
+    config: &AppConfig,
+    source: &str,
+    destination: &str,
+    resume: bool,
+) -> Result<()> {
     let src_remote = parse_remote_spec(source);
     let dst_remote = parse_remote_spec(destination);
 
@@ -58,10 +63,13 @@ pub async fn scp_transfer(config: &AppConfig, source: &str, destination: &str) -
         (Some((bookmark_name, remote_path)), None) => {
             // Download: remote -> local
             let local_path = destination;
-            download(config, bookmark_name, remote_path, local_path).await
+            download(config, bookmark_name, remote_path, local_path, resume).await
         }
         (None, Some((bookmark_name, remote_path))) => {
             // Upload: local -> remote
+            if resume {
+                eprintln!("Warning: --resume is only supported for downloads, ignoring.");
+            }
             let local_path = source;
             upload(config, bookmark_name, local_path, remote_path).await
         }
@@ -112,11 +120,13 @@ async fn open_sftp(config: &AppConfig, bookmark_name: &str) -> Result<(SftpSessi
 }
 
 /// Download a file from a remote server.
+/// If `resume` is true and a partial local file exists, seek to its end and continue.
 async fn download(
     config: &AppConfig,
     bookmark_name: &str,
     remote_path: &str,
     local_path: &str,
+    resume: bool,
 ) -> Result<()> {
     let (sftp, index) = open_sftp(config, bookmark_name).await?;
     let display_name = &config.bookmarks[index].name;
@@ -133,12 +143,54 @@ async fn download(
         .await
         .with_context(|| format!("Failed to open {display_name}:{remote_path}"))?;
 
-    let mut local_file = tokio::fs::File::create(local_path)
-        .await
-        .with_context(|| format!("Failed to create local file {local_path}"))?;
+    // Resume support: if local file exists and --resume was specified, seek past it
+    let mut offset: u64 = 0;
+    let mut local_file = if resume {
+        if let Ok(local_meta) = tokio::fs::metadata(local_path).await {
+            let local_size = local_meta.len();
+            if local_size > 0 && local_size < total {
+                eprintln!("Resuming from {}", format_bytes(local_size));
+                // Seek the remote file past what we already have
+                use tokio::io::AsyncSeekExt;
+                remote_file
+                    .seek(std::io::SeekFrom::Start(local_size))
+                    .await
+                    .with_context(|| {
+                        format!("Failed to seek remote file to offset {local_size}")
+                    })?;
+                offset = local_size;
+                // Open in append mode
+                tokio::fs::OpenOptions::new()
+                    .append(true)
+                    .open(local_path)
+                    .await
+                    .with_context(|| format!("Failed to open local file {local_path} for append"))?
+            } else if local_size >= total {
+                eprintln!(
+                    "Local file is already complete ({}).",
+                    format_bytes(local_size)
+                );
+                terminal_theme::reset_theme();
+                return Ok(());
+            } else {
+                tokio::fs::File::create(local_path)
+                    .await
+                    .with_context(|| format!("Failed to create local file {local_path}"))?
+            }
+        } else {
+            tokio::fs::File::create(local_path)
+                .await
+                .with_context(|| format!("Failed to create local file {local_path}"))?
+        }
+    } else {
+        tokio::fs::File::create(local_path)
+            .await
+            .with_context(|| format!("Failed to create local file {local_path}"))?
+    };
 
     eprintln!("{display_name}:{remote_path}");
     let mut progress = ProgressBar::new(total);
+    progress.transferred = offset;
     let mut buf = vec![0u8; TRANSFER_CHUNK_SIZE];
 
     loop {

@@ -22,14 +22,25 @@ pub fn config_path() -> PathBuf {
     config_dir.join("sshore").join("config.toml")
 }
 
-/// Load config from the default XDG path.
-pub fn load() -> Result<AppConfig> {
-    load_from(&config_path())
+/// Load config with an optional custom path override.
+/// Priority: custom_path → XDG default.
+pub fn load_with_override(custom_path: Option<&str>) -> Result<AppConfig> {
+    let path = resolve_config_path(custom_path);
+    load_from(&path)
 }
 
-/// Save config to the default XDG path.
-pub fn save(config: &AppConfig) -> Result<()> {
-    save_to(config, &config_path())
+/// Save config with an optional custom path override.
+pub fn save_with_override(config: &AppConfig, custom_path: Option<&str>) -> Result<()> {
+    let path = resolve_config_path(custom_path);
+    save_to(config, &path)
+}
+
+/// Resolve the effective config path from an optional override.
+fn resolve_config_path(custom_path: Option<&str>) -> PathBuf {
+    match custom_path {
+        Some(p) => PathBuf::from(shellexpand::tilde(p).to_string()),
+        None => config_path(),
+    }
 }
 
 /// Load config from a specific path.
@@ -236,6 +247,8 @@ mod tests {
             connect_count: 0,
             on_connect: None,
             snippets: vec![],
+            connect_timeout_secs: None,
+            ssh_options: std::collections::HashMap::new(),
         });
         save_to(&config, &path).unwrap();
 
@@ -276,6 +289,8 @@ mod tests {
             connect_count: 5,
             on_connect: None,
             snippets: vec![],
+            connect_timeout_secs: None,
+            ssh_options: std::collections::HashMap::new(),
         }
     }
 
@@ -371,5 +386,75 @@ mod tests {
         assert!(glob_match("exact", "exact"));
         assert!(!glob_match("exact", "not-exact"));
         assert!(glob_match("*-web-*", "prod-web-01"));
+    }
+
+    /// Canary test: config load and bookmark filtering must never make network calls.
+    /// If this test hangs on CI (run with network disabled), a dependency added
+    /// a startup network call — that's a regression.
+    #[test]
+    fn test_no_network_at_startup() {
+        // Write a config to a temp file
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let config = AppConfig {
+            settings: Settings::default(),
+            bookmarks: vec![sample_bookmark("prod-web-01", "production", vec![])],
+        };
+        let toml_str = toml::to_string_pretty(&config).unwrap();
+        std::fs::write(&path, &toml_str).unwrap();
+
+        // Load config — should not make any network calls
+        let loaded = load_from(&path).unwrap();
+        assert_eq!(loaded.bookmarks.len(), 1);
+
+        // Filter bookmarks — should not make any network calls
+        let _filtered: Vec<&Bookmark> = loaded
+            .bookmarks
+            .iter()
+            .filter(|b| b.env == "production")
+            .collect();
+
+        // Export bookmarks — should not make any network calls
+        let _exported = export_bookmarks(&loaded, Some("production"), &[], None, false).unwrap();
+
+        // If we get here without hanging or DNS timeout, the test passes.
+    }
+
+    #[test]
+    fn test_load_with_override_uses_custom_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let custom_path = dir.path().join("custom.toml");
+
+        // First load creates the file
+        let config = load_with_override(Some(custom_path.to_str().unwrap())).unwrap();
+        assert!(custom_path.exists());
+        assert!(config.bookmarks.is_empty());
+    }
+
+    #[test]
+    fn test_save_load_with_override_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        let custom_path = dir.path().join("custom.toml");
+        let custom_str = custom_path.to_str().unwrap();
+
+        let mut config = AppConfig::default();
+        config.settings.default_user = Some("override_user".into());
+        save_with_override(&config, Some(custom_str)).unwrap();
+
+        let loaded = load_with_override(Some(custom_str)).unwrap();
+        assert_eq!(loaded.settings.default_user, Some("override_user".into()));
+    }
+
+    #[test]
+    fn test_resolve_config_path_none_uses_default() {
+        let path = resolve_config_path(None);
+        assert!(path.to_string_lossy().contains("sshore"));
+    }
+
+    #[test]
+    fn test_resolve_config_path_with_tilde() {
+        let path = resolve_config_path(Some("~/my-sshore.toml"));
+        assert!(!path.to_string_lossy().contains('~'));
+        assert!(path.to_string_lossy().ends_with("my-sshore.toml"));
     }
 }

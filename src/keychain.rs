@@ -113,6 +113,8 @@ mod tests {
                 connect_count: 0,
                 on_connect: None,
                 snippets: vec![],
+                connect_timeout_secs: None,
+                ssh_options: std::collections::HashMap::new(),
             },
             Bookmark {
                 name: unstored_name.into(),
@@ -128,6 +130,8 @@ mod tests {
                 connect_count: 0,
                 on_connect: None,
                 snippets: vec![],
+                connect_timeout_secs: None,
+                ssh_options: std::collections::HashMap::new(),
             },
         ];
 

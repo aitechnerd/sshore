@@ -1,4 +1,5 @@
 pub mod client;
+pub mod known_hosts;
 pub mod password;
 pub mod snippet;
 pub mod terminal_theme;
@@ -19,9 +20,8 @@ use crate::config;
 use crate::config::model::{AppConfig, Bookmark};
 use crate::keychain;
 
-use self::client::SshoreHandler;
+use self::client::{HostKeyCheckMode, SshoreHandler};
 use self::password::PasswordDetector;
-use self::snippet::{EscapeAction, EscapeDetector};
 
 /// Result of executing a single command on a remote host.
 pub struct ExecResult {
@@ -33,18 +33,162 @@ pub struct ExecResult {
 /// Default SSH key filenames to try, in priority order.
 const DEFAULT_KEY_NAMES: &[&str] = &["id_ed25519", "id_rsa", "id_ecdsa"];
 
-/// SSH connection timeout in seconds.
-const CONNECT_TIMEOUT_SECS: u64 = 30;
+/// Default SSH connection timeout in seconds.
+/// Can be overridden per-settings or per-bookmark.
+const DEFAULT_CONNECT_TIMEOUT_SECS: u64 = 15;
+
+/// Resolve the effective connection timeout for a bookmark.
+/// Priority: bookmark.connect_timeout_secs → settings.connect_timeout_secs → default (15s).
+fn effective_timeout(bookmark: &Bookmark, settings: &crate::config::model::Settings) -> u64 {
+    bookmark
+        .connect_timeout_secs
+        .or(settings.connect_timeout_secs)
+        .unwrap_or(DEFAULT_CONNECT_TIMEOUT_SECS)
+}
 
 /// Terminal cleanup guard — restores terminal state on drop.
-struct TerminalGuard;
+/// Tracks whether raw mode was enabled by us, so we only disable
+/// what we enabled.
+struct TerminalGuard {
+    was_raw: bool,
+}
+
+impl TerminalGuard {
+    fn new() -> Self {
+        Self {
+            was_raw: crossterm::terminal::is_raw_mode_enabled().unwrap_or(false),
+        }
+    }
+}
 
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
-        let _ = crossterm::terminal::disable_raw_mode();
+        // Flush stdout before disabling raw mode
+        let _ = std::io::stdout().flush();
+
+        // Only disable raw mode if WE enabled it (it wasn't already on)
+        if !self.was_raw {
+            let _ = crossterm::terminal::disable_raw_mode();
+        }
+
+        // Reset terminal theming
         terminal_theme::reset_theme();
-        let _ = crossterm::execute!(std::io::stdout(), crossterm::cursor::Show);
+
+        // Ensure cursor is visible and colors are reset
+        let _ = crossterm::execute!(
+            std::io::stdout(),
+            crossterm::cursor::Show,
+            crossterm::style::ResetColor,
+        );
+
+        // Final newline so the shell prompt starts clean
+        let _ = writeln!(std::io::stdout());
+        let _ = std::io::stdout().flush();
     }
+}
+
+/// Information about the current SSH session, used for save-as-bookmark.
+pub struct SessionInfo {
+    pub host: String,
+    pub user: String,
+    pub port: u16,
+    pub identity_file: Option<String>,
+    pub proxy_jump: Option<String>,
+    /// Whether this is an existing bookmark or an ad-hoc connection.
+    pub bookmark_name: Option<String>,
+}
+
+/// Parse a connection string: `[user@]host[:port]`
+///
+/// Returns (user, host, port) where user defaults to None and port defaults to 22.
+pub fn parse_connection_string(target: &str) -> Result<(Option<String>, String, u16)> {
+    let (user_part, host_port) = if target.contains('@') {
+        let parts: Vec<&str> = target.splitn(2, '@').collect();
+        if parts[0].is_empty() {
+            bail!("Empty username in connection string: {target}");
+        }
+        (Some(parts[0].to_string()), parts[1].to_string())
+    } else {
+        (None, target.to_string())
+    };
+
+    if host_port.is_empty() {
+        bail!("Empty hostname in connection string: {target}");
+    }
+
+    let (host, port) = if host_port.contains(':') {
+        let parts: Vec<&str> = host_port.rsplitn(2, ':').collect();
+        let port = parts[0]
+            .parse::<u16>()
+            .with_context(|| format!("Invalid port in connection string: {}", parts[0]))?;
+        (parts[1].to_string(), port)
+    } else {
+        (host_port, 22u16)
+    };
+
+    Ok((user_part, host, port))
+}
+
+/// Infer a bookmark name from a hostname or IP address.
+pub fn infer_bookmark_name(host: &str) -> String {
+    if host.contains('.') && host.chars().all(|c| c.is_ascii_digit() || c == '.') {
+        // IP address: 10.0.1.50 → server-10-0-1-50
+        format!("server-{}", host.replace('.', "-"))
+    } else if host.contains('.') {
+        // FQDN: web-prod-01.example.com → web-prod-01
+        host.split('.').next().unwrap_or(host).to_string()
+    } else {
+        host.to_string()
+    }
+}
+
+/// Connect to an ad-hoc target (not a bookmark) and run an interactive SSH session.
+/// Creates a temporary bookmark from the parsed connection string.
+pub async fn connect_adhoc(
+    config: &mut AppConfig,
+    user: Option<String>,
+    host: String,
+    port: u16,
+    cfg_override: Option<&str>,
+) -> Result<()> {
+    let _effective_user = user
+        .clone()
+        .or_else(|| config.settings.default_user.clone())
+        .unwrap_or_else(|| whoami::username().to_string());
+
+    let inferred_name = infer_bookmark_name(&host);
+    let env = crate::config::env::detect_env(&inferred_name, &host);
+
+    let bookmark = Bookmark {
+        name: inferred_name,
+        host: host.clone(),
+        user: user.clone(),
+        port,
+        env,
+        tags: vec![],
+        identity_file: None,
+        proxy_jump: None,
+        notes: None,
+        last_connected: None,
+        connect_count: 0,
+        on_connect: None,
+        snippets: vec![],
+        connect_timeout_secs: None,
+        ssh_options: std::collections::HashMap::new(),
+    };
+
+    // Temporarily add the bookmark for connection, then remove it
+    config.bookmarks.push(bookmark);
+    let index = config.bookmarks.len() - 1;
+
+    let result = connect(config, index, cfg_override).await;
+
+    // Remove the temporary bookmark (unless it was saved via ~b during the session)
+    if index < config.bookmarks.len() {
+        config.bookmarks.remove(index);
+    }
+
+    result
 }
 
 /// Establish an authenticated SSH session to a bookmark.
@@ -65,19 +209,34 @@ pub async fn establish_session(
     // Load SSH keys
     let keys = load_keys(bookmark)?;
 
-    // Connect to SSH server
+    // Build handler with host key checking
+    let check_mode = HostKeyCheckMode::from_str_setting(&settings.host_key_checking);
+    let handler = SshoreHandler::for_host(host, port, check_mode);
+
+    // Configurable connection timeout
+    let timeout_secs = effective_timeout(bookmark, settings);
+
+    // Connect to SSH server with timeout
     let ssh_config = russh::client::Config {
-        inactivity_timeout: Some(std::time::Duration::from_secs(CONNECT_TIMEOUT_SECS)),
+        inactivity_timeout: Some(std::time::Duration::from_secs(timeout_secs)),
         ..<_>::default()
     };
 
-    let mut session = russh::client::connect(
-        Arc::new(ssh_config),
-        (host.as_str(), port),
-        SshoreHandler::new(),
-    )
-    .await
-    .with_context(|| format!("Failed to connect to {host}:{port}"))?;
+    let connect_future =
+        russh::client::connect(Arc::new(ssh_config), (host.as_str(), port), handler);
+
+    let mut session =
+        match tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), connect_future)
+            .await
+        {
+            Ok(result) => result.with_context(|| format!("Failed to connect to {host}:{port}"))?,
+            Err(_) => {
+                bail!(
+                    "Connection to {host}:{port} timed out after {timeout_secs}s. \
+                 Adjust timeout with connect_timeout_secs in config.toml."
+                );
+            }
+        };
 
     // Authenticate
     let authenticated = authenticate(&mut session, &user, &keys).await?;
@@ -108,7 +267,8 @@ pub async fn establish_tunnel_session(
 
     let keys = load_keys(bookmark)?;
 
-    let handler = SshoreHandler::new();
+    let check_mode = HostKeyCheckMode::from_str_setting(&settings.host_key_checking);
+    let handler = SshoreHandler::for_host(host, port, check_mode);
     let remote_map = handler.remote_forwards.clone();
 
     let ssh_config = russh::client::Config {
@@ -120,9 +280,19 @@ pub async fn establish_tunnel_session(
         ..<_>::default()
     };
 
-    let mut session = russh::client::connect(Arc::new(ssh_config), (host.as_str(), port), handler)
-        .await
-        .with_context(|| format!("Failed to connect to {host}:{port}"))?;
+    let timeout_secs = effective_timeout(bookmark, settings);
+    let connect_future =
+        russh::client::connect(Arc::new(ssh_config), (host.as_str(), port), handler);
+
+    let mut session =
+        match tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), connect_future)
+            .await
+        {
+            Ok(result) => result.with_context(|| format!("Failed to connect to {host}:{port}"))?,
+            Err(_) => {
+                bail!("Tunnel connection to {host}:{port} timed out after {timeout_secs}s.");
+            }
+        };
 
     let authenticated = authenticate(&mut session, &user, &keys).await?;
     if !authenticated {
@@ -134,7 +304,11 @@ pub async fn establish_tunnel_session(
 
 /// Connect to a bookmark and run an interactive SSH session.
 /// Updates last_connected/connect_count after a successful session.
-pub async fn connect(config: &mut AppConfig, bookmark_index: usize) -> Result<()> {
+pub async fn connect(
+    config: &mut AppConfig,
+    bookmark_index: usize,
+    cfg_override: Option<&str>,
+) -> Result<()> {
     let session = establish_session(config, bookmark_index).await?;
 
     // Apply terminal theming
@@ -179,9 +353,21 @@ pub async fn connect(config: &mut AppConfig, bookmark_index: usize) -> Result<()
     }
 
     // Collect snippet info for escape detection
-    let bookmark_snippets = config.bookmarks[bookmark_index].snippets.clone();
+    let bookmark = &config.bookmarks[bookmark_index];
+    let bookmark_snippets = bookmark.snippets.clone();
     let global_snippets = config.settings.snippets.clone();
     let snippet_trigger = config.settings.snippet_trigger.clone();
+    let bookmark_trigger = config.settings.bookmark_trigger.clone();
+
+    // Build session info for save-as-bookmark
+    let session_info = SessionInfo {
+        host: bookmark.host.clone(),
+        user: bookmark.effective_user(&config.settings),
+        port: bookmark.port,
+        identity_file: bookmark.identity_file.clone(),
+        proxy_jump: bookmark.proxy_jump.clone(),
+        bookmark_name: Some(bookmark.name.clone()),
+    };
 
     // Run the interactive proxy loop
     run_proxy_loop(
@@ -191,13 +377,16 @@ pub async fn connect(config: &mut AppConfig, bookmark_index: usize) -> Result<()
         bookmark_snippets,
         global_snippets,
         snippet_trigger,
+        bookmark_trigger,
+        session_info,
+        cfg_override,
     )
     .await?;
 
     // Update bookmark stats
     config.bookmarks[bookmark_index].last_connected = Some(Utc::now());
     config.bookmarks[bookmark_index].connect_count += 1;
-    if let Err(e) = config::save(config) {
+    if let Err(e) = config::save_with_override(config, cfg_override) {
         eprintln!("Warning: failed to save connection stats: {e}");
     }
 
@@ -361,17 +550,33 @@ async fn exec_command_quiet(
 }
 
 /// Load SSH private keys for authentication.
-/// If bookmark has identity_file, load that. Otherwise try default keys.
+/// If bookmark has identity_file, load that (with env var expansion). Otherwise try default keys.
 fn load_keys(bookmark: &Bookmark) -> Result<Vec<PrivateKeyWithHashAlg>> {
     let mut keys = Vec::new();
 
-    if let Some(ref identity) = bookmark.identity_file {
-        let expanded = shellexpand::tilde(identity).to_string();
-        match load_key_from_path(&expanded) {
-            Ok(key) => keys.push(key),
-            Err(e) => {
-                eprintln!("Warning: failed to load key {expanded}: {e}");
+    if bookmark.identity_file.is_some() {
+        match bookmark.resolved_identity_file() {
+            Some(Ok(path)) => {
+                let expanded = PathBuf::from(&path);
+                if expanded.exists() {
+                    match load_key_from_path(&path) {
+                        Ok(key) => keys.push(key),
+                        Err(e) => {
+                            eprintln!("Warning: failed to load key {path}: {e}");
+                        }
+                    }
+                } else {
+                    eprintln!(
+                        "Warning: identity file not found: {} (expanded from {:?})",
+                        path,
+                        bookmark.identity_file.as_deref().unwrap_or("")
+                    );
+                }
             }
+            Some(Err(e)) => {
+                eprintln!("Warning: {e}");
+            }
+            None => {}
         }
     } else {
         // Try default key locations
@@ -458,10 +663,45 @@ fn prompt_password(user: &str) -> Result<String> {
 /// Capacity for the stdin mpsc channel.
 const STDIN_CHANNEL_SIZE: usize = 64;
 
+/// Set up signal handlers for graceful SSH session shutdown.
+#[cfg(unix)]
+async fn setup_ssh_signal_handlers() -> Result<tokio::sync::watch::Receiver<bool>> {
+    use tokio::signal::unix::{SignalKind, signal};
+
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+
+    // SIGTERM — kill <pid>
+    let tx = shutdown_tx.clone();
+    tokio::spawn(async move {
+        if let Ok(mut sig) = signal(SignalKind::terminate()) {
+            sig.recv().await;
+            let _ = tx.send(true);
+        }
+    });
+
+    // SIGHUP — terminal closed
+    let tx = shutdown_tx.clone();
+    tokio::spawn(async move {
+        if let Ok(mut sig) = signal(SignalKind::hangup()) {
+            sig.recv().await;
+            let _ = tx.send(true);
+        }
+    });
+
+    Ok(shutdown_rx)
+}
+
+#[cfg(not(unix))]
+async fn setup_ssh_signal_handlers() -> Result<tokio::sync::watch::Receiver<bool>> {
+    let (_tx, rx) = tokio::sync::watch::channel(false);
+    Ok(rx)
+}
+
 /// Run the interactive terminal proxy loop.
 /// Routes stdin through the main `tokio::select!` loop to enable password injection
 /// without race conditions. When a password prompt is detected in SSH output,
 /// the user can press Enter to inject the stored password or Esc to skip.
+#[allow(clippy::too_many_arguments)]
 async fn run_proxy_loop(
     channel: russh::Channel<russh::client::Msg>,
     mut detector: PasswordDetector,
@@ -469,10 +709,13 @@ async fn run_proxy_loop(
     bookmark_snippets: Vec<crate::config::model::Snippet>,
     global_snippets: Vec<crate::config::model::Snippet>,
     snippet_trigger: String,
+    bookmark_trigger: String,
+    session_info: SessionInfo,
+    cfg_override: Option<&str>,
 ) -> Result<()> {
     // Put terminal in raw mode with cleanup guard
+    let _guard = TerminalGuard::new();
     crossterm::terminal::enable_raw_mode().context("Failed to enable raw mode")?;
-    let _guard = TerminalGuard;
 
     let (mut channel_rx, channel_tx) = channel.split();
 
@@ -491,17 +734,37 @@ async fn run_proxy_loop(
     let mut stdout = std::io::stdout();
     let mut awaiting_confirm = false;
 
-    // Escape detector for snippet trigger
-    let mut escape_detector = EscapeDetector::new(&snippet_trigger);
+    // Combined escape handler for snippets and bookmark save
+    use self::snippet::{SessionAction, SessionEscapeHandler};
+    let mut escape_handler = SessionEscapeHandler::new(&snippet_trigger, &bookmark_trigger);
     let has_snippets = !bookmark_snippets.is_empty() || !global_snippets.is_empty();
+    let has_escape_triggers = has_snippets || !bookmark_trigger.is_empty();
+
+    // Signal handlers for graceful shutdown
+    let mut shutdown_rx = setup_ssh_signal_handlers().await?;
 
     loop {
         tokio::select! {
+            _ = shutdown_rx.changed() => {
+                if *shutdown_rx.borrow() {
+                    // Graceful shutdown — TerminalGuard will clean up on drop
+                    break;
+                }
+            }
             msg = channel_rx.wait() => {
                 match msg {
                     Some(ChannelMsg::Data { ref data }) => {
-                        stdout.write_all(data)?;
-                        stdout.flush()?;
+                        match stdout.write_all(data) {
+                            Ok(()) => { let _ = stdout.flush(); }
+                            Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => {
+                                // Terminal is gone (window closed). Exit cleanly.
+                                break;
+                            }
+                            Err(e) => {
+                                eprintln!("stdout write error: {e}");
+                                break;
+                            }
+                        }
 
                         // Feed data to password detector
                         if !awaiting_confirm && detector.feed(data) {
@@ -535,19 +798,19 @@ async fn run_proxy_loop(
                     }
                     awaiting_confirm = false;
                     detector.clear();
-                } else if has_snippets {
-                    // Snippet escape detection: feed bytes one at a time
+                } else if has_escape_triggers {
+                    // Escape detection: feed bytes through combined handler
                     for &byte in &bytes {
-                        match escape_detector.feed(byte) {
-                            EscapeAction::Forward(fwd) => {
+                        match escape_handler.feed(byte) {
+                            SessionAction::Forward(fwd) => {
                                 if tokio::io::AsyncWriteExt::write_all(&mut writer, &fwd).await.is_err() {
                                     break;
                                 }
                             }
-                            EscapeAction::Buffer => {
+                            SessionAction::Buffer => {
                                 // Hold — might be start of escape sequence
                             }
-                            EscapeAction::Trigger => {
+                            SessionAction::ShowSnippets => {
                                 // Show snippet picker, inject selected command
                                 if let Ok(Some(command)) = snippet::show_snippet_picker(
                                     &mut stdout,
@@ -561,10 +824,38 @@ async fn run_proxy_loop(
                                     .await;
                                 }
                             }
+                            SessionAction::ShowSaveBookmark => {
+                                // Show save-as-bookmark form
+                                if let Ok(Some(new_bookmark)) = snippet::show_save_bookmark_form(
+                                    &mut stdout,
+                                    &session_info,
+                                ) {
+                                    // Load, merge, save
+                                    match config::load_with_override(cfg_override) {
+                                        Ok(mut app_config) => {
+                                            let bm_name = new_bookmark.name.clone();
+                                            if let Some(idx) = app_config.bookmarks.iter().position(|b| b.name == bm_name) {
+                                                app_config.bookmarks[idx] = new_bookmark;
+                                                let _ = write!(stdout, "\x1b[32mBookmark '{}' updated\x1b[0m\r\n", bm_name);
+                                            } else {
+                                                app_config.bookmarks.push(new_bookmark);
+                                                let _ = write!(stdout, "\x1b[32mBookmark '{}' saved\x1b[0m\r\n", bm_name);
+                                            }
+                                            if let Err(e) = config::save_with_override(&app_config, cfg_override) {
+                                                let _ = write!(stdout, "\x1b[31mError saving: {e}\x1b[0m\r\n");
+                                            }
+                                        }
+                                        Err(e) => {
+                                            let _ = write!(stdout, "\x1b[31mError loading config: {e}\x1b[0m\r\n");
+                                        }
+                                    }
+                                    let _ = stdout.flush();
+                                }
+                            }
                         }
                     }
                 } else {
-                    // No snippets configured — fast path, skip escape detection
+                    // No escape triggers configured — fast path, skip detection
                     if tokio::io::AsyncWriteExt::write_all(&mut writer, &bytes).await.is_err() {
                         break;
                     }
@@ -609,5 +900,87 @@ async fn handle_resize(channel_tx: russh::ChannelWriteHalf<russh::client::Msg>) 
                 .window_change(cols as u32, rows as u32, 0, 0)
                 .await;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // --- parse_connection_string ---
+
+    #[test]
+    fn test_parse_connection_string_full() {
+        let (user, host, port) = parse_connection_string("deploy@10.0.1.50:2222").unwrap();
+        assert_eq!(user, Some("deploy".to_string()));
+        assert_eq!(host, "10.0.1.50");
+        assert_eq!(port, 2222);
+    }
+
+    #[test]
+    fn test_parse_connection_string_user_host() {
+        let (user, host, port) = parse_connection_string("root@web-server.example.com").unwrap();
+        assert_eq!(user, Some("root".to_string()));
+        assert_eq!(host, "web-server.example.com");
+        assert_eq!(port, 22);
+    }
+
+    #[test]
+    fn test_parse_connection_string_host_only() {
+        let (user, host, port) = parse_connection_string("10.0.1.50").unwrap();
+        assert_eq!(user, None);
+        assert_eq!(host, "10.0.1.50");
+        assert_eq!(port, 22);
+    }
+
+    #[test]
+    fn test_parse_connection_string_host_port() {
+        let (user, host, port) = parse_connection_string("myserver:2222").unwrap();
+        assert_eq!(user, None);
+        assert_eq!(host, "myserver");
+        assert_eq!(port, 2222);
+    }
+
+    #[test]
+    fn test_parse_connection_string_empty_user_errors() {
+        let result = parse_connection_string("@host");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_connection_string_empty_host_errors() {
+        let result = parse_connection_string("user@");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_connection_string_invalid_port() {
+        let result = parse_connection_string("host:notaport");
+        assert!(result.is_err());
+    }
+
+    // --- infer_bookmark_name ---
+
+    #[test]
+    fn test_infer_bookmark_name_ip() {
+        assert_eq!(infer_bookmark_name("10.0.1.50"), "server-10-0-1-50");
+    }
+
+    #[test]
+    fn test_infer_bookmark_name_fqdn() {
+        assert_eq!(
+            infer_bookmark_name("web-prod-01.example.com"),
+            "web-prod-01"
+        );
+    }
+
+    #[test]
+    fn test_infer_bookmark_name_short() {
+        assert_eq!(infer_bookmark_name("myserver"), "myserver");
+    }
+
+    #[test]
+    fn test_infer_bookmark_name_fqdn_with_subdomain() {
+        assert_eq!(infer_bookmark_name("db.staging.internal.corp"), "db");
     }
 }

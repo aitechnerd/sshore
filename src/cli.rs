@@ -4,6 +4,11 @@ use clap::{Parser, Subcommand};
 #[derive(Parser, Debug)]
 #[command(name = "sshore", version, about)]
 pub struct Cli {
+    /// Path to config file (default: ~/.config/sshore/config.toml).
+    /// Also settable via SSHORE_CONFIG env var.
+    #[arg(long, global = true, env = "SSHORE_CONFIG")]
+    pub config: Option<String>,
+
     /// Connect directly to a bookmark by name (skip TUI).
     ///
     /// Note: bookmark names that collide with subcommand names (e.g., "import")
@@ -42,6 +47,12 @@ pub enum Commands {
         action: PasswordAction,
     },
 
+    /// Connect to a host directly (without a bookmark).
+    Connect {
+        /// Connection string: [user@]host[:port]
+        target: String,
+    },
+
     /// Open SFTP session to a bookmark.
     Sftp {
         /// Bookmark name.
@@ -54,6 +65,23 @@ pub enum Commands {
         source: String,
         /// Destination path (bookmark:path or local path).
         destination: String,
+        /// Resume a partially downloaded file instead of starting over.
+        #[arg(long)]
+        resume: bool,
+    },
+
+    /// Open dual-pane file browser to a bookmark.
+    Browse {
+        /// Bookmark name, optionally with remote path (e.g. "prod-web-01:/var/log").
+        target: String,
+
+        /// Local starting directory (default: current directory).
+        #[arg(short, long)]
+        local: Option<String>,
+
+        /// Show hidden files.
+        #[arg(short = 'a', long)]
+        show_hidden: bool,
     },
 
     /// Manage persistent SSH tunnels.
@@ -289,11 +317,42 @@ mod tests {
             Some(Commands::Scp {
                 source,
                 destination,
+                resume,
             }) => {
                 assert_eq!(source, "myhost:/tmp/file");
                 assert_eq!(destination, "/local/path");
+                assert!(!resume);
             }
             _ => panic!("Expected Scp command"),
+        }
+    }
+
+    #[test]
+    fn test_parse_scp_with_resume() {
+        let cli = Cli::try_parse_from([
+            "sshore",
+            "scp",
+            "myhost:/tmp/file",
+            "/local/path",
+            "--resume",
+        ])
+        .unwrap();
+        match cli.command {
+            Some(Commands::Scp { resume, .. }) => {
+                assert!(resume);
+            }
+            _ => panic!("Expected Scp command"),
+        }
+    }
+
+    #[test]
+    fn test_parse_connect() {
+        let cli = Cli::try_parse_from(["sshore", "connect", "user@host:2222"]).unwrap();
+        match cli.command {
+            Some(Commands::Connect { target }) => {
+                assert_eq!(target, "user@host:2222");
+            }
+            _ => panic!("Expected Connect command"),
         }
     }
 

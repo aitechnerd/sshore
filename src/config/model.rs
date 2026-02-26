@@ -4,7 +4,7 @@
 
 use std::collections::HashMap;
 
-use anyhow::{Result, bail};
+use anyhow::{Result, anyhow, bail};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
@@ -85,6 +85,22 @@ pub struct Settings {
     /// Global snippets available in all SSH sessions.
     #[serde(default)]
     pub snippets: Vec<Snippet>,
+
+    /// Escape sequence to trigger save-as-bookmark during SSH session.
+    /// Default: "~b" (tilde-b, following OpenSSH's ~ escape convention).
+    #[serde(default = "default_bookmark_trigger")]
+    pub bookmark_trigger: String,
+
+    /// Host key checking mode: "strict" (default), "accept-new", "off".
+    /// - "strict": reject changed keys, prompt for unknown
+    /// - "accept-new": auto-accept unknown keys, reject changed keys
+    /// - "off": accept all keys (insecure, for testing only)
+    #[serde(default = "default_host_key_checking")]
+    pub host_key_checking: String,
+
+    /// SSH connection timeout in seconds. Default: 15.
+    /// Set higher for slow networks, lower for fast local connections.
+    pub connect_timeout_secs: Option<u64>,
 }
 
 /// Color and badge configuration for an environment tier.
@@ -148,6 +164,15 @@ pub struct Bookmark {
     /// Named command shortcuts for this bookmark.
     #[serde(default)]
     pub snippets: Vec<Snippet>,
+
+    /// Connection timeout override for this specific bookmark (seconds).
+    /// Falls back to settings.connect_timeout_secs, then 15s default.
+    pub connect_timeout_secs: Option<u64>,
+
+    /// Additional SSH options parsed from ssh_config but not modeled as
+    /// dedicated fields. Applied at connection time.
+    #[serde(default)]
+    pub ssh_options: HashMap<String, String>,
 }
 
 impl Default for Settings {
@@ -160,8 +185,11 @@ impl Default for Settings {
             theme: default_theme(),
             env_colors: default_env_colors(),
             snippet_trigger: default_snippet_trigger(),
+            bookmark_trigger: default_bookmark_trigger(),
             on_connect_delay_ms: default_on_connect_delay_ms(),
             snippets: Vec::new(),
+            host_key_checking: default_host_key_checking(),
+            connect_timeout_secs: None,
         }
     }
 }
@@ -175,12 +203,28 @@ impl Bookmark {
             .unwrap_or_else(|| whoami::username().to_string())
     }
 
-    /// Resolve identity file path with tilde expansion.
-    pub fn resolved_identity_file(&self) -> Option<String> {
-        self.identity_file
-            .as_ref()
-            .map(|p| shellexpand::tilde(p).to_string())
+    /// Resolve identity file path with tilde AND environment variable expansion.
+    /// Supports: ~/path, $HOME/path, ${SSHKEY}, $VAR/subpath
+    /// Returns None if the field is not set.
+    /// Returns Err if env var expansion fails (undefined variable).
+    pub fn resolved_identity_file(&self) -> Option<Result<String>> {
+        self.identity_file.as_ref().map(|p| {
+            shellexpand::full(p)
+                .map(|expanded| expanded.to_string())
+                .map_err(|e| anyhow!("Failed to expand identity file path '{}': {}", p, e))
+        })
     }
+}
+
+/// Expand shell variables and tilde in a string.
+/// Returns the original string unchanged if expansion fails (with a warning to stderr).
+pub fn expand_path(input: &str) -> String {
+    shellexpand::full(input)
+        .map(|s| s.to_string())
+        .unwrap_or_else(|e| {
+            eprintln!("Warning: variable expansion failed for '{}': {}", input, e);
+            input.to_string()
+        })
 }
 
 /// Validate that a bookmark name contains only alphanumeric chars, hyphens, underscores, and dots.
@@ -239,8 +283,16 @@ fn default_snippet_trigger() -> String {
     "~~".to_string()
 }
 
+fn default_bookmark_trigger() -> String {
+    "~b".to_string()
+}
+
 fn default_on_connect_delay_ms() -> u64 {
     200
+}
+
+fn default_host_key_checking() -> String {
+    "strict".to_string()
 }
 
 fn default_env_colors() -> EnvColorMap {
@@ -312,6 +364,8 @@ mod tests {
             connect_count: 0,
             on_connect: None,
             snippets: vec![],
+            connect_timeout_secs: None,
+            ssh_options: std::collections::HashMap::new(),
         }
     }
 
@@ -404,7 +458,7 @@ mod tests {
             identity_file: Some("~/.ssh/id_ed25519".into()),
             ..sample_bookmark()
         };
-        let resolved = bookmark.resolved_identity_file().unwrap();
+        let resolved = bookmark.resolved_identity_file().unwrap().unwrap();
         assert!(!resolved.starts_with('~'));
         assert!(resolved.ends_with("/.ssh/id_ed25519"));
     }
@@ -416,6 +470,49 @@ mod tests {
             ..sample_bookmark()
         };
         assert!(bookmark.resolved_identity_file().is_none());
+    }
+
+    #[test]
+    fn test_resolved_identity_file_env_var() {
+        // $HOME should always be set
+        let bookmark = Bookmark {
+            identity_file: Some("$HOME/.ssh/id_ed25519".into()),
+            ..sample_bookmark()
+        };
+        let resolved = bookmark.resolved_identity_file().unwrap().unwrap();
+        assert!(!resolved.starts_with('$'));
+        assert!(resolved.ends_with("/.ssh/id_ed25519"));
+    }
+
+    #[test]
+    fn test_resolved_identity_file_undefined_var_returns_error() {
+        let bookmark = Bookmark {
+            identity_file: Some("${SSHORE_NONEXISTENT_VAR_12345}/key".into()),
+            ..sample_bookmark()
+        };
+        let result = bookmark.resolved_identity_file().unwrap();
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_expand_path_tilde() {
+        let result = expand_path("~/test");
+        assert!(!result.starts_with('~'));
+        assert!(result.ends_with("/test"));
+    }
+
+    #[test]
+    fn test_expand_path_env_var() {
+        let result = expand_path("$HOME/test");
+        assert!(!result.starts_with('$'));
+        assert!(result.ends_with("/test"));
+    }
+
+    #[test]
+    fn test_expand_path_undefined_var_returns_original() {
+        let result = expand_path("${SSHORE_NONEXISTENT_VAR_12345}/test");
+        // Falls back to original on error
+        assert_eq!(result, "${SSHORE_NONEXISTENT_VAR_12345}/test");
     }
 
     #[test]

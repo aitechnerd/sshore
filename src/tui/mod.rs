@@ -78,6 +78,8 @@ pub struct App {
     pub tunnel_bookmarks: HashSet<String>,
     /// Set when the user presses Enter to connect; signals the event loop to exit.
     connect_request: Option<usize>,
+    /// Config file path override (from --config flag or SSHORE_CONFIG env var).
+    config_path_override: Option<String>,
     matcher: SkimMatcherV2,
 }
 
@@ -104,8 +106,20 @@ impl App {
             confirm_state: None,
             tunnel_bookmarks,
             connect_request: None,
+            config_path_override: None,
             matcher,
         }
+    }
+
+    /// Set the config path override for saving.
+    pub fn with_config_override(mut self, path: Option<&str>) -> Self {
+        self.config_path_override = path.map(|s| s.to_string());
+        self
+    }
+
+    /// Save the config, respecting any path override.
+    fn save_config(&self) -> anyhow::Result<()> {
+        config::save_with_override(&self.config, self.config_path_override.as_deref())
     }
 
     /// Set a temporary status message that auto-clears.
@@ -169,7 +183,7 @@ fn leave_tui(terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>) -> Resu
 
 /// Launch the TUI, blocking until the user quits.
 /// Loops: TUI -> SSH connect -> TUI, allowing repeated connections.
-pub async fn run(config: &mut AppConfig) -> Result<()> {
+pub async fn run(config: &mut AppConfig, cfg_override: Option<&str>) -> Result<()> {
     // Install panic hook that restores terminal state
     let original_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
@@ -178,7 +192,7 @@ pub async fn run(config: &mut AppConfig) -> Result<()> {
         original_hook(info);
     }));
 
-    let mut app = App::new(config.clone());
+    let mut app = App::new(config.clone()).with_config_override(cfg_override);
 
     loop {
         let mut terminal = enter_tui()?;
@@ -188,7 +202,13 @@ pub async fn run(config: &mut AppConfig) -> Result<()> {
         match action {
             LoopAction::Quit => break,
             LoopAction::Connect(bookmark_index) => {
-                if let Err(e) = ssh::connect(&mut app.config, bookmark_index).await {
+                if let Err(e) = ssh::connect(
+                    &mut app.config,
+                    bookmark_index,
+                    app.config_path_override.as_deref(),
+                )
+                .await
+                {
                     eprintln!("SSH error: {e:#}");
                     eprintln!("Press Enter to return to sshore...");
                     let _ = wait_for_enter();
@@ -488,7 +508,7 @@ fn try_save_form(app: &mut App) {
             }
 
             // Save to disk
-            if let Err(e) = config::save(&app.config) {
+            if let Err(e) = app.save_config() {
                 app.set_status(format!("Error saving config: {e}"));
             } else {
                 app.set_status(format!("Bookmark '{name}' saved"));
@@ -524,7 +544,7 @@ fn handle_confirm_key(app: &mut App, key: KeyEvent) {
                 let name = app.config.bookmarks[idx].name.clone();
                 app.config.bookmarks.remove(idx);
 
-                if let Err(e) = config::save(&app.config) {
+                if let Err(e) = app.save_config() {
                     app.set_status(format!("Error saving config: {e}"));
                 } else {
                     app.set_status(format!("Bookmark '{name}' deleted"));
@@ -621,6 +641,8 @@ mod tests {
             connect_count: 0,
             on_connect: None,
             snippets: vec![],
+            connect_timeout_secs: None,
+            ssh_options: std::collections::HashMap::new(),
         }
     }
 
@@ -839,6 +861,8 @@ mod tests {
             connect_count: 0,
             on_connect: None,
             snippets: vec![],
+            connect_timeout_secs: None,
+            ssh_options: std::collections::HashMap::new(),
         };
         app.config.bookmarks.push(new_bookmark);
         app.refilter();

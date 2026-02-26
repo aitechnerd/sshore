@@ -29,6 +29,9 @@ struct HostBlock {
     port: Option<u16>,
     identity_file: Option<String>,
     proxy_jump: Option<String>,
+    on_connect: Option<String>,
+    connect_timeout_secs: Option<u64>,
+    ssh_options: std::collections::HashMap<String, String>,
 }
 
 impl HostBlock {
@@ -50,8 +53,10 @@ impl HostBlock {
             notes: None,
             last_connected: None,
             connect_count: 0,
-            on_connect: None,
+            on_connect: self.on_connect,
             snippets: vec![],
+            connect_timeout_secs: self.connect_timeout_secs,
+            ssh_options: self.ssh_options,
         })
     }
 }
@@ -168,6 +173,32 @@ fn parse_ssh_config_recursive(
             "proxyjump" => {
                 if let Some(ref mut block) = current_block {
                     block.proxy_jump = Some(value.to_string());
+                }
+            }
+            // Phase 10: additional directives
+            "connecttimeout" => {
+                if let Some(ref mut block) = current_block {
+                    block.connect_timeout_secs = value.parse().ok();
+                }
+            }
+            "remotecommand" => {
+                if let Some(ref mut block) = current_block {
+                    block.on_connect = Some(value.to_string());
+                }
+            }
+            "localforward"
+            | "remoteforward"
+            | "serveraliveinterval"
+            | "serveralivecountmax"
+            | "addkeystoagent"
+            | "forwardagent"
+            | "compression"
+            | "stricthostkeychecking"
+            | "requesttty" => {
+                if let Some(ref mut block) = current_block {
+                    block
+                        .ssh_options
+                        .insert(directive.to_string(), value.to_string());
                 }
             }
             "include" => {
@@ -671,6 +702,8 @@ Host relative-host
             connect_count: 0,
             on_connect: None,
             snippets: vec![],
+            connect_timeout_secs: None,
+            ssh_options: std::collections::HashMap::new(),
         }];
 
         let imported = vec![
@@ -688,6 +721,8 @@ Host relative-host
                 connect_count: 0,
                 on_connect: None,
                 snippets: vec![],
+                connect_timeout_secs: None,
+                ssh_options: std::collections::HashMap::new(),
             },
             Bookmark {
                 name: "server-b".into(),
@@ -703,6 +738,8 @@ Host relative-host
                 connect_count: 0,
                 on_connect: None,
                 snippets: vec![],
+                connect_timeout_secs: None,
+                ssh_options: std::collections::HashMap::new(),
             },
         ];
 
@@ -730,6 +767,8 @@ Host relative-host
             connect_count: 0,
             on_connect: None,
             snippets: vec![],
+            connect_timeout_secs: None,
+            ssh_options: std::collections::HashMap::new(),
         }];
 
         let imported = vec![Bookmark {
@@ -746,6 +785,8 @@ Host relative-host
             connect_count: 0,
             on_connect: None,
             snippets: vec![],
+            connect_timeout_secs: None,
+            ssh_options: std::collections::HashMap::new(),
         }];
 
         let result = merge_imports(&mut existing, imported, true);
@@ -872,5 +913,100 @@ env = ""
         let bookmarks = import_from_file(&path).unwrap();
         assert_eq!(bookmarks.len(), 1);
         assert_eq!(bookmarks[0].name, "from-ssh");
+    }
+
+    #[test]
+    fn test_parse_connect_timeout() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_temp_ssh_config(
+            dir.path(),
+            "config",
+            r#"
+Host slow-vpn
+    HostName slow.example.com
+    ConnectTimeout 30
+"#,
+        );
+
+        let bookmarks = parse_ssh_config(&path).unwrap();
+        assert_eq!(bookmarks[0].connect_timeout_secs, Some(30));
+    }
+
+    #[test]
+    fn test_parse_remote_command_maps_to_on_connect() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_temp_ssh_config(
+            dir.path(),
+            "config",
+            r#"
+Host dev-server
+    HostName dev.example.com
+    RemoteCommand cd /var/www && exec $SHELL
+"#,
+        );
+
+        let bookmarks = parse_ssh_config(&path).unwrap();
+        assert_eq!(
+            bookmarks[0].on_connect,
+            Some("cd /var/www && exec $SHELL".into())
+        );
+    }
+
+    #[test]
+    fn test_parse_additional_ssh_options() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_temp_ssh_config(
+            dir.path(),
+            "config",
+            r#"
+Host myhost
+    HostName example.com
+    ServerAliveInterval 60
+    ServerAliveCountMax 3
+    Compression yes
+    ForwardAgent yes
+    LocalForward 5432:localhost:5432
+"#,
+        );
+
+        let bookmarks = parse_ssh_config(&path).unwrap();
+        let opts = &bookmarks[0].ssh_options;
+        assert_eq!(
+            opts.get("ServerAliveInterval").map(String::as_str),
+            Some("60")
+        );
+        assert_eq!(
+            opts.get("ServerAliveCountMax").map(String::as_str),
+            Some("3")
+        );
+        assert_eq!(opts.get("Compression").map(String::as_str), Some("yes"));
+        assert_eq!(opts.get("ForwardAgent").map(String::as_str), Some("yes"));
+        assert_eq!(
+            opts.get("LocalForward").map(String::as_str),
+            Some("5432:localhost:5432")
+        );
+    }
+
+    #[test]
+    fn test_parse_strict_host_key_checking_option() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_temp_ssh_config(
+            dir.path(),
+            "config",
+            r#"
+Host myhost
+    HostName example.com
+    StrictHostKeyChecking accept-new
+"#,
+        );
+
+        let bookmarks = parse_ssh_config(&path).unwrap();
+        assert_eq!(
+            bookmarks[0]
+                .ssh_options
+                .get("StrictHostKeyChecking")
+                .map(String::as_str),
+            Some("accept-new")
+        );
     }
 }

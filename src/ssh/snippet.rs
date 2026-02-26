@@ -4,7 +4,8 @@ use std::io::Write;
 use anyhow::Result;
 use crossterm::event::{Event, KeyCode};
 
-use crate::config::model::Snippet;
+use crate::config::model::{Bookmark, Snippet};
+use crate::ssh::SessionInfo;
 
 /// Result of feeding a byte to the escape detector.
 pub enum EscapeAction {
@@ -161,6 +162,296 @@ fn read_snippet_selection(max: usize) -> Result<Option<usize>> {
     }
 }
 
+/// Action returned by SessionEscapeHandler.
+pub enum SessionAction {
+    /// Forward these bytes to the SSH channel unchanged.
+    Forward(Vec<u8>),
+    /// Hold — we're in the middle of a potential match.
+    Buffer,
+    /// Show the snippet picker.
+    ShowSnippets,
+    /// Show the save-as-bookmark form.
+    ShowSaveBookmark,
+}
+
+/// Combined escape handler for snippet trigger and bookmark trigger.
+/// Handles two independent escape sequences during an SSH session.
+pub struct SessionEscapeHandler {
+    snippet_detector: EscapeDetector,
+    bookmark_detector: EscapeDetector,
+}
+
+impl SessionEscapeHandler {
+    /// Create a new handler with the given trigger strings.
+    pub fn new(snippet_trigger: &str, bookmark_trigger: &str) -> Self {
+        Self {
+            snippet_detector: EscapeDetector::new(snippet_trigger),
+            bookmark_detector: EscapeDetector::new(bookmark_trigger),
+        }
+    }
+
+    /// Feed a single byte from stdin. Returns what action to take.
+    ///
+    /// The snippet detector gets first pass. If it buffers or triggers, the
+    /// bookmark detector doesn't see the byte. When the snippet detector
+    /// forwards (either immediately or by flushing a failed partial match),
+    /// those forwarded bytes are then checked by the bookmark detector.
+    pub fn feed(&mut self, byte: u8) -> SessionAction {
+        match self.snippet_detector.feed(byte) {
+            EscapeAction::Trigger => SessionAction::ShowSnippets,
+            EscapeAction::Buffer => {
+                // Snippet detector is buffering — don't forward to bookmark detector yet.
+                // If the snippet match fails later, the flushed bytes will go through
+                // the bookmark detector at that point.
+                SessionAction::Buffer
+            }
+            EscapeAction::Forward(bytes) => {
+                // Snippet detector forwarded these bytes — now check bookmark trigger
+                let mut final_forward = Vec::new();
+                for &b in &bytes {
+                    match self.bookmark_detector.feed(b) {
+                        EscapeAction::Trigger => return SessionAction::ShowSaveBookmark,
+                        EscapeAction::Buffer => {} // absorbed by bookmark detector
+                        EscapeAction::Forward(fwd) => final_forward.extend(fwd),
+                    }
+                }
+                if final_forward.is_empty() {
+                    SessionAction::Buffer
+                } else {
+                    SessionAction::Forward(final_forward)
+                }
+            }
+        }
+    }
+}
+
+/// Save-as-bookmark fields that can be edited inline.
+enum BookmarkField {
+    Name,
+    Tags,
+    Notes,
+}
+
+const BOOKMARK_FIELDS: [BookmarkField; 3] = [
+    BookmarkField::Name,
+    BookmarkField::Tags,
+    BookmarkField::Notes,
+];
+
+/// Show the save-as-bookmark inline form during an SSH session.
+/// Returns Some(Bookmark) if saved, None if cancelled.
+pub fn show_save_bookmark_form(
+    stdout: &mut std::io::Stdout,
+    session_info: &SessionInfo,
+) -> Result<Option<Bookmark>> {
+    let is_existing = session_info.bookmark_name.is_some();
+
+    // Pre-fill fields
+    let mut name = session_info
+        .bookmark_name
+        .clone()
+        .unwrap_or_else(|| crate::ssh::infer_bookmark_name(&session_info.host));
+    let env = crate::config::env::detect_env(&name, &session_info.host);
+    let mut tags = String::new();
+    let mut notes = String::new();
+    let mut field_idx: usize = 0;
+
+    // Draw the form
+    let draw = |stdout: &mut std::io::Stdout,
+                name: &str,
+                tags: &str,
+                notes: &str,
+                env: &str,
+                field_idx: usize,
+                is_existing: bool,
+                info: &SessionInfo|
+     -> Result<()> {
+        let title = if is_existing {
+            format!("Update Bookmark: {}", name)
+        } else {
+            "Save as Bookmark".to_string()
+        };
+        write!(stdout, "\r\n\x1b[1m── {} ──\x1b[0m\r\n", title)?;
+        write!(
+            stdout,
+            "  Host: \x1b[36m{}@{}:{}\x1b[0m\r\n",
+            info.user, info.host, info.port
+        )?;
+        if !env.is_empty() {
+            write!(stdout, "  Env:  \x1b[33m{}\x1b[0m (auto-detected)\r\n", env)?;
+        }
+
+        let name_cursor = if field_idx == 0 { "\x1b[7m" } else { "" };
+        let tags_cursor = if field_idx == 1 { "\x1b[7m" } else { "" };
+        let notes_cursor = if field_idx == 2 { "\x1b[7m" } else { "" };
+        let reset = "\x1b[0m";
+
+        if !is_existing {
+            write!(
+                stdout,
+                "  Name:  {}{}{}\r\n",
+                name_cursor,
+                if name.is_empty() { " " } else { name },
+                reset
+            )?;
+        }
+        write!(
+            stdout,
+            "  Tags:  {}{}{}\r\n",
+            tags_cursor,
+            if tags.is_empty() { " " } else { tags },
+            reset
+        )?;
+        write!(
+            stdout,
+            "  Notes: {}{}{}\r\n",
+            notes_cursor,
+            if notes.is_empty() { " " } else { notes },
+            reset
+        )?;
+        write!(
+            stdout,
+            "\x1b[2m  Enter=Save  Tab=Next  Esc=Cancel\x1b[0m\r\n"
+        )?;
+        stdout.flush()?;
+        Ok(())
+    };
+
+    // For existing bookmarks, skip the Name field
+    if is_existing {
+        field_idx = 1; // start at Tags
+    }
+
+    draw(
+        stdout,
+        &name,
+        &tags,
+        &notes,
+        &env,
+        field_idx,
+        is_existing,
+        session_info,
+    )?;
+
+    let total_lines = if is_existing { 5 } else { 6 }; // lines drawn by the form
+
+    // Event loop
+    loop {
+        if let Event::Key(key) = crossterm::event::read()? {
+            match key.code {
+                KeyCode::Esc => {
+                    clear_lines(stdout, total_lines)?;
+                    return Ok(None);
+                }
+                KeyCode::Enter => {
+                    clear_lines(stdout, total_lines)?;
+
+                    if name.is_empty() {
+                        write!(stdout, "\x1b[31mBookmark name cannot be empty\x1b[0m\r\n")?;
+                        stdout.flush()?;
+                        return Ok(None);
+                    }
+
+                    let bookmark = Bookmark {
+                        name: name.clone(),
+                        host: session_info.host.clone(),
+                        user: if session_info.user.is_empty() {
+                            None
+                        } else {
+                            Some(session_info.user.clone())
+                        },
+                        port: session_info.port,
+                        env: env.clone(),
+                        tags: tags
+                            .split(',')
+                            .map(|t| t.trim().to_string())
+                            .filter(|t| !t.is_empty())
+                            .collect(),
+                        identity_file: session_info.identity_file.clone(),
+                        proxy_jump: session_info.proxy_jump.clone(),
+                        notes: if notes.is_empty() { None } else { Some(notes) },
+                        last_connected: Some(chrono::Utc::now()),
+                        connect_count: 1,
+                        on_connect: None,
+                        snippets: vec![],
+                        connect_timeout_secs: None,
+                        ssh_options: std::collections::HashMap::new(),
+                    };
+                    return Ok(Some(bookmark));
+                }
+                KeyCode::Tab => {
+                    let start = if is_existing { 1 } else { 0 };
+                    let count = BOOKMARK_FIELDS.len() - start;
+                    field_idx = start + ((field_idx - start + 1) % count);
+                    clear_lines(stdout, total_lines)?;
+                    draw(
+                        stdout,
+                        &name,
+                        &tags,
+                        &notes,
+                        &env,
+                        field_idx,
+                        is_existing,
+                        session_info,
+                    )?;
+                }
+                KeyCode::Char(c) => {
+                    match BOOKMARK_FIELDS[field_idx] {
+                        BookmarkField::Name => name.push(c),
+                        BookmarkField::Tags => tags.push(c),
+                        BookmarkField::Notes => notes.push(c),
+                    }
+                    clear_lines(stdout, total_lines)?;
+                    draw(
+                        stdout,
+                        &name,
+                        &tags,
+                        &notes,
+                        &env,
+                        field_idx,
+                        is_existing,
+                        session_info,
+                    )?;
+                }
+                KeyCode::Backspace => {
+                    match BOOKMARK_FIELDS[field_idx] {
+                        BookmarkField::Name => {
+                            name.pop();
+                        }
+                        BookmarkField::Tags => {
+                            tags.pop();
+                        }
+                        BookmarkField::Notes => {
+                            notes.pop();
+                        }
+                    }
+                    clear_lines(stdout, total_lines)?;
+                    draw(
+                        stdout,
+                        &name,
+                        &tags,
+                        &notes,
+                        &env,
+                        field_idx,
+                        is_existing,
+                        session_info,
+                    )?;
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
+/// Clear `n` lines above the cursor (used to redraw inline forms).
+fn clear_lines(stdout: &mut std::io::Stdout, n: usize) -> Result<()> {
+    for _ in 0..n {
+        write!(stdout, "\x1b[A\x1b[2K")?;
+    }
+    stdout.flush()?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -272,5 +563,55 @@ mod tests {
         assert!(matches!(detector.feed(b'a'), EscapeAction::Buffer));
         assert!(matches!(detector.feed(b'b'), EscapeAction::Buffer));
         assert!(matches!(detector.feed(b'c'), EscapeAction::Trigger));
+    }
+
+    // --- SessionEscapeHandler ---
+
+    #[test]
+    fn test_session_handler_snippet_trigger() {
+        let mut handler = SessionEscapeHandler::new("~~", "~b");
+
+        assert!(matches!(handler.feed(b'~'), SessionAction::Buffer));
+        assert!(matches!(handler.feed(b'~'), SessionAction::ShowSnippets));
+    }
+
+    #[test]
+    fn test_session_handler_bookmark_trigger() {
+        let mut handler = SessionEscapeHandler::new("~~", "~b");
+
+        assert!(matches!(handler.feed(b'~'), SessionAction::Buffer));
+        // After snippet detector flushes '~' + 'b', bookmark detector should catch it
+        match handler.feed(b'b') {
+            SessionAction::ShowSaveBookmark => {} // expected
+            other => panic!(
+                "Expected ShowSaveBookmark, got {:?}",
+                match other {
+                    SessionAction::Forward(ref f) => format!("Forward({:?})", f),
+                    SessionAction::Buffer => "Buffer".to_string(),
+                    SessionAction::ShowSnippets => "ShowSnippets".to_string(),
+                    SessionAction::ShowSaveBookmark => "ShowSaveBookmark".to_string(),
+                }
+            ),
+        }
+    }
+
+    #[test]
+    fn test_session_handler_normal_text() {
+        let mut handler = SessionEscapeHandler::new("~~", "~b");
+
+        match handler.feed(b'h') {
+            SessionAction::Forward(bytes) => assert_eq!(bytes, vec![b'h']),
+            _ => panic!("Expected Forward"),
+        }
+    }
+
+    #[test]
+    fn test_session_handler_both_disabled() {
+        let mut handler = SessionEscapeHandler::new("", "");
+
+        match handler.feed(b'~') {
+            SessionAction::Forward(bytes) => assert_eq!(bytes, vec![b'~']),
+            _ => panic!("Expected Forward for disabled triggers"),
+        }
     }
 }

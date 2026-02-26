@@ -149,6 +149,8 @@ Host server-b
         connect_count: 10,
         on_connect: None,
         snippets: vec![],
+        connect_timeout_secs: None,
+        ssh_options: std::collections::HashMap::new(),
     }];
 
     let result = merge_imports(&mut existing, imported, false);

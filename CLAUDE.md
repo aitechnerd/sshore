@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project
 
-sshore — Terminal-native SSH connection manager with environment-aware safety, built in Rust. Manages SSH bookmarks with color-coded environment tiers (production/staging/development/local/testing), interactive TUI, native SSH via `russh`, sudo password assist, SFTP/SCP shortcuts, and persistent tunnels.
+sshore — Terminal-native SSH connection manager with environment-aware safety, built in Rust. Manages SSH bookmarks with color-coded environment tiers (production/staging/development/local/testing), interactive TUI, native SSH via `russh`, sudo password assist, SFTP/SCP shortcuts, persistent tunnels, per-bookmark snippets, quick remote exec, and config export.
 
 See `CLAUDE.local.md` for the implementation plan (phase files, project overview, Cargo.toml spec). Follow phases in order.
 
@@ -21,6 +21,8 @@ cargo run -- list                          # list bookmarks (non-interactive)
 cargo run -- import                        # import from ~/.ssh/config
 cargo run                                  # launch TUI (default, no subcommand)
 cargo run -- prod-web-01                   # direct connect by bookmark name
+cargo run -- exec prod-web-01 "uptime"     # quick remote exec
+cargo run -- export --env production       # export bookmarks to TOML
 
 # Install locally
 cargo install --path .
@@ -74,10 +76,11 @@ src/
 │   ├── env.rs                   # Environment auto-detection heuristic from hostname/name
 │   └── writer.rs                # Atomic config writes: serialize → tempfile → rename
 ├── ssh/
-│   ├── mod.rs                   # Public API: connect(), SSH session lifecycle
+│   ├── mod.rs                   # Public API: connect(), exec_command(), SSH session lifecycle
 │   ├── client.rs                # russh client::Handler implementation
 │   ├── terminal_theme.rs        # OSC escape codes: tab title, tab color
 │   ├── password.rs              # Sudo prompt detection + password injection
+│   ├── snippet.rs               # Escape sequence detector + inline snippet picker
 │   └── tunnel.rs                # Persistent tunnel management with auto-reconnect
 ├── sftp/
 │   ├── mod.rs                   # Public API: sftp_session(), transfer()
@@ -101,7 +104,7 @@ src/
 
 **Async runtime:** Tokio. Required by `russh`. All SSH, SFTP, and tunnel operations are async. TUI event loop uses `crossterm`'s async event stream.
 
-**Implementation phases:** Foundation (config/CLI) → TUI list → Bookmark CRUD → SSH connect → Sudo assist → SFTP/SCP → Tunnels → Polish/release.
+**Implementation phases:** Foundation (config/CLI) → TUI list → Bookmark CRUD → SSH connect → Sudo assist → SFTP/SCP → Tunnels → Polish/release → Snippets/exec/export.
 
 ## Engineering Principles
 

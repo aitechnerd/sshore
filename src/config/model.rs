@@ -474,14 +474,18 @@ mod tests {
 
     #[test]
     fn test_resolved_identity_file_env_var() {
-        // $HOME should always be set
+        // Set explicitly — $HOME is not guaranteed on Windows CI
+        // SAFETY: test-only, no concurrent access to this variable
+        unsafe { std::env::set_var("SSHORE_TEST_HOME", "/mock/home") };
         let bookmark = Bookmark {
-            identity_file: Some("$HOME/.ssh/id_ed25519".into()),
+            identity_file: Some("$SSHORE_TEST_HOME/.ssh/id_ed25519".into()),
             ..sample_bookmark()
         };
         let resolved = bookmark.resolved_identity_file().unwrap().unwrap();
         assert!(!resolved.starts_with('$'));
         assert!(resolved.ends_with("/.ssh/id_ed25519"));
+        assert!(resolved.starts_with("/mock/home"));
+        unsafe { std::env::remove_var("SSHORE_TEST_HOME") };
     }
 
     #[test]
@@ -503,9 +507,14 @@ mod tests {
 
     #[test]
     fn test_expand_path_env_var() {
-        let result = expand_path("$HOME/test");
+        // Set explicitly — $HOME is not guaranteed on Windows CI
+        // SAFETY: test-only, no concurrent access to this variable
+        unsafe { std::env::set_var("SSHORE_TEST_HOME", "/mock/home") };
+        let result = expand_path("$SSHORE_TEST_HOME/test");
         assert!(!result.starts_with('$'));
         assert!(result.ends_with("/test"));
+        assert!(result.starts_with("/mock/home"));
+        unsafe { std::env::remove_var("SSHORE_TEST_HOME") };
     }
 
     #[test]

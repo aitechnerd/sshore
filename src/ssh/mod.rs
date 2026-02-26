@@ -1,6 +1,7 @@
 pub mod client;
 pub mod password;
 pub mod terminal_theme;
+pub mod tunnel;
 
 use std::io::Write;
 use std::path::PathBuf;
@@ -61,10 +62,13 @@ pub async fn establish_session(
         ..<_>::default()
     };
 
-    let mut session =
-        russh::client::connect(Arc::new(ssh_config), (host.as_str(), port), SshoreHandler)
-            .await
-            .with_context(|| format!("Failed to connect to {host}:{port}"))?;
+    let mut session = russh::client::connect(
+        Arc::new(ssh_config),
+        (host.as_str(), port),
+        SshoreHandler::new(),
+    )
+    .await
+    .with_context(|| format!("Failed to connect to {host}:{port}"))?;
 
     // Authenticate
     let authenticated = authenticate(&mut session, &user, &keys).await?;
@@ -73,6 +77,50 @@ pub async fn establish_session(
     }
 
     Ok(session)
+}
+
+/// Establish an SSH session configured for tunnel keepalives.
+/// Returns the session handle and the remote forward map for -R support.
+pub async fn establish_tunnel_session(
+    config: &AppConfig,
+    bookmark_index: usize,
+) -> Result<(
+    russh::client::Handle<SshoreHandler>,
+    client::RemoteForwardMap,
+)> {
+    let bookmark = &config.bookmarks[bookmark_index];
+    let settings = &config.settings;
+
+    let user = bookmark.effective_user(settings);
+    let host = &bookmark.host;
+    let port = bookmark.port;
+
+    eprintln!("Connecting tunnel to {user}@{host}:{port}...");
+
+    let keys = load_keys(bookmark)?;
+
+    let handler = SshoreHandler::new();
+    let remote_map = handler.remote_forwards.clone();
+
+    let ssh_config = russh::client::Config {
+        inactivity_timeout: None, // Tunnels stay open indefinitely
+        keepalive_interval: Some(std::time::Duration::from_secs(
+            tunnel::TUNNEL_KEEPALIVE_INTERVAL_SECS,
+        )),
+        keepalive_max: tunnel::TUNNEL_KEEPALIVE_MAX,
+        ..<_>::default()
+    };
+
+    let mut session = russh::client::connect(Arc::new(ssh_config), (host.as_str(), port), handler)
+        .await
+        .with_context(|| format!("Failed to connect to {host}:{port}"))?;
+
+    let authenticated = authenticate(&mut session, &user, &keys).await?;
+    if !authenticated {
+        bail!("Authentication failed for {user}@{host}:{port}");
+    }
+
+    Ok((session, remote_map))
 }
 
 /// Connect to a bookmark and run an interactive SSH session.

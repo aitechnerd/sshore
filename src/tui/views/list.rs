@@ -25,6 +25,7 @@ pub fn render_list(frame: &mut Frame, area: Rect, app: &App) {
 
     let header = Row::new(vec![
         Cell::from("Env").style(Style::default().fg(tc.fg).add_modifier(Modifier::BOLD)),
+        Cell::from("").style(Style::default()), // Tunnel indicator column (no header)
         Cell::from("Name").style(Style::default().fg(tc.fg).add_modifier(Modifier::BOLD)),
         Cell::from("Host").style(Style::default().fg(tc.fg).add_modifier(Modifier::BOLD)),
         Cell::from("Tags").style(Style::default().fg(tc.fg).add_modifier(Modifier::BOLD)),
@@ -42,6 +43,16 @@ pub fn render_list(frame: &mut Frame, area: Rect, app: &App) {
 
             let env_span = env_badge::env_badge_span(&bookmark.env, &app.config.settings);
             let env_cell = Cell::from(Line::from(vec![env_span]));
+
+            // Tunnel indicator: "T" if this bookmark has an active tunnel
+            let tunnel_cell = if app.tunnel_bookmarks.contains(&bookmark.name) {
+                Cell::from(Span::styled(
+                    "T",
+                    Style::default().fg(tc.accent).add_modifier(Modifier::BOLD),
+                ))
+            } else {
+                Cell::from("")
+            };
 
             let name_style = if is_selected {
                 Style::default()
@@ -72,12 +83,16 @@ pub fn render_list(frame: &mut Frame, area: Rect, app: &App) {
             };
             let tags_cell = Cell::from(tags_text).style(tags_style);
 
-            Row::new(vec![env_cell, name_cell, host_cell, tags_cell])
+            Row::new(vec![env_cell, tunnel_cell, name_cell, host_cell, tags_cell])
         })
         .collect();
 
+    /// Width of the tunnel indicator column.
+    const TUNNEL_COL_WIDTH: u16 = 2;
+
     let widths = [
         Constraint::Length(env_badge::ENV_BADGE_WIDTH),
+        Constraint::Length(TUNNEL_COL_WIDTH),
         Constraint::Percentage(30),
         Constraint::Percentage(35),
         Constraint::Percentage(35),

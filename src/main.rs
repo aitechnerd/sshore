@@ -11,7 +11,7 @@ use std::path::PathBuf;
 use anyhow::{Context, Result, bail};
 use clap::{CommandFactory, Parser};
 
-use cli::{Cli, Commands, PasswordAction};
+use cli::{Cli, Commands, PasswordAction, TunnelAction};
 use config::model::Bookmark;
 use config::ssh_import::{merge_imports, parse_ssh_config};
 
@@ -59,8 +59,8 @@ async fn main() -> Result<()> {
         }) => {
             cmd_scp(&source, &destination).await?;
         }
-        Some(Commands::Tunnel { .. }) => {
-            eprintln!("Not yet implemented (Phase 7)");
+        Some(Commands::Tunnel { action }) => {
+            cmd_tunnel(action).await?;
         }
         None => {
             if let Some(name) = cli.connect {
@@ -309,6 +309,203 @@ fn read_password_from_tty(prompt: &str) -> Result<String> {
     eprintln!(); // Newline after password entry
 
     Ok(password)
+}
+
+/// Dispatch tunnel subcommands.
+async fn cmd_tunnel(action: TunnelAction) -> Result<()> {
+    match action {
+        TunnelAction::Start {
+            bookmark,
+            local_forward,
+            remote_forward,
+            persist,
+            daemon,
+        } => cmd_tunnel_start(&bookmark, &local_forward, &remote_forward, persist, daemon).await,
+        TunnelAction::Stop { bookmark } => cmd_tunnel_stop(&bookmark),
+        TunnelAction::Status => cmd_tunnel_status(),
+    }
+}
+
+/// Start a tunnel to a bookmark.
+async fn cmd_tunnel_start(
+    bookmark_name: &str,
+    local_specs: &[String],
+    remote_specs: &[String],
+    persist: bool,
+    daemon: bool,
+) -> Result<()> {
+    use ssh::tunnel::{ForwardDirection, ForwardSpec, parse_forward_spec};
+
+    if local_specs.is_empty() && remote_specs.is_empty() {
+        bail!("No forward specs provided. Use -L or -R to specify port forwards.");
+    }
+
+    let config = config::load().context("Failed to load config")?;
+    let index = find_bookmark_index(&config, bookmark_name)?;
+
+    // Parse all forward specs
+    let mut forwards: Vec<ForwardSpec> = Vec::new();
+    for spec in local_specs {
+        forwards.push(parse_forward_spec(spec, ForwardDirection::Local)?);
+    }
+    for spec in remote_specs {
+        forwards.push(parse_forward_spec(spec, ForwardDirection::Remote)?);
+    }
+
+    if persist && !daemon {
+        // Re-exec as daemon: detach from terminal and run in background
+        let exe = std::env::current_exe().context("Failed to get current executable path")?;
+
+        let mut args = vec![
+            "tunnel".to_string(),
+            "start".to_string(),
+            bookmark_name.to_string(),
+            "--persist".to_string(),
+            "--daemon".to_string(),
+        ];
+        for spec in local_specs {
+            args.push("-L".to_string());
+            args.push(spec.clone());
+        }
+        for spec in remote_specs {
+            args.push("-R".to_string());
+            args.push(spec.clone());
+        }
+
+        let child = std::process::Command::new(exe)
+            .args(&args)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .context("Failed to spawn daemon process")?;
+
+        println!(
+            "Persistent tunnel started for '{}' (PID {})",
+            bookmark_name,
+            child.id()
+        );
+        return Ok(());
+    }
+
+    if daemon {
+        // Running as daemon process
+        ssh::tunnel::run_daemon_loop(&config, index, &forwards).await
+    } else {
+        // Foreground mode
+        ssh::tunnel::run_foreground(&config, index, &forwards).await
+    }
+}
+
+/// Stop a tunnel for a bookmark.
+fn cmd_tunnel_stop(bookmark_name: &str) -> Result<()> {
+    use ssh::tunnel::{cleanup_stale_tunnels, load_tunnel_state, save_tunnel_state};
+
+    let mut state = load_tunnel_state().context("Failed to load tunnel state")?;
+    cleanup_stale_tunnels(&mut state);
+
+    let entry = state
+        .tunnels
+        .iter()
+        .find(|t| t.bookmark.eq_ignore_ascii_case(bookmark_name));
+
+    let Some(entry) = entry else {
+        println!("No active tunnel for '{bookmark_name}'.");
+        return Ok(());
+    };
+
+    let pid = entry.pid;
+
+    // Send SIGTERM to the tunnel process
+    let kill_result = std::process::Command::new("kill")
+        .arg(pid.to_string())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
+
+    match kill_result {
+        Ok(status) if status.success() => {
+            println!("Stopped tunnel for '{bookmark_name}' (PID {pid}).");
+        }
+        _ => {
+            eprintln!("Warning: failed to send signal to PID {pid}, removing stale entry.");
+        }
+    }
+
+    // Remove from state file
+    state
+        .tunnels
+        .retain(|t| !t.bookmark.eq_ignore_ascii_case(bookmark_name));
+    save_tunnel_state(&state).context("Failed to update tunnel state")?;
+
+    Ok(())
+}
+
+/// Show status of all active tunnels.
+fn cmd_tunnel_status() -> Result<()> {
+    use ssh::tunnel::{TunnelStatus, cleanup_stale_tunnels, load_tunnel_state, save_tunnel_state};
+
+    let mut state = load_tunnel_state().context("Failed to load tunnel state")?;
+    cleanup_stale_tunnels(&mut state);
+    save_tunnel_state(&state).context("Failed to update tunnel state")?;
+
+    if state.tunnels.is_empty() {
+        println!("No active tunnels.");
+        return Ok(());
+    }
+
+    println!(
+        "  {:<20} {:<30} {:<14} {:<10} RECONNECTS",
+        "BOOKMARK", "FORWARDS", "STATUS", "UPTIME"
+    );
+    println!("  {}", "-".repeat(86));
+
+    for entry in &state.tunnels {
+        let forwards_str: Vec<String> = entry.forwards.iter().map(|f| f.to_string()).collect();
+        let forwards_display = forwards_str.join(", ");
+
+        let status_display = match entry.status {
+            TunnelStatus::Connected => "connected",
+            TunnelStatus::Reconnecting => "reconnecting",
+            TunnelStatus::Stopped => "stopped",
+        };
+
+        let uptime = chrono::Utc::now()
+            .signed_duration_since(entry.started_at)
+            .num_seconds();
+        let uptime_display = format_uptime(uptime);
+
+        println!(
+            "  {:<20} {:<30} {:<14} {:<10} {}",
+            entry.bookmark, forwards_display, status_display, uptime_display, entry.reconnect_count
+        );
+    }
+
+    println!("\n  {} tunnel(s)", state.tunnels.len());
+
+    Ok(())
+}
+
+/// Format seconds into a human-readable uptime string (e.g., "2h 15m", "3d 1h").
+fn format_uptime(total_secs: i64) -> String {
+    if total_secs < 0 {
+        return "0s".to_string();
+    }
+
+    let days = total_secs / 86400;
+    let hours = (total_secs % 86400) / 3600;
+    let minutes = (total_secs % 3600) / 60;
+    let secs = total_secs % 60;
+
+    if days > 0 {
+        format!("{days}d {hours}h")
+    } else if hours > 0 {
+        format!("{hours}h {minutes}m")
+    } else if minutes > 0 {
+        format!("{minutes}m {secs}s")
+    } else {
+        format!("{secs}s")
+    }
 }
 
 /// Generate shell completions to stdout.

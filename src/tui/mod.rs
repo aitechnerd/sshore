@@ -2,6 +2,7 @@ pub mod theme;
 pub mod views;
 pub mod widgets;
 
+use std::collections::HashSet;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
@@ -73,6 +74,8 @@ pub struct App {
     pub status_message: Option<(String, Instant)>,
     pub form_state: Option<FormState>,
     pub confirm_state: Option<ConfirmState>,
+    /// Bookmark names that have active tunnels (for TUI indicator).
+    pub tunnel_bookmarks: HashSet<String>,
     /// Set when the user presses Enter to connect; signals the event loop to exit.
     connect_request: Option<usize>,
     matcher: SkimMatcherV2,
@@ -84,6 +87,7 @@ impl App {
         let matcher = SkimMatcherV2::default();
         let filtered_indices = search_bar::filter_bookmarks(&matcher, &config.bookmarks, "", None);
         let theme = resolve_theme(&config.settings.theme);
+        let tunnel_bookmarks = crate::ssh::tunnel::active_tunnel_bookmarks();
 
         Self {
             config,
@@ -98,6 +102,7 @@ impl App {
             status_message: None,
             form_state: None,
             confirm_state: None,
+            tunnel_bookmarks,
             connect_request: None,
             matcher,
         }

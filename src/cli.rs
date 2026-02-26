@@ -106,6 +106,10 @@ pub enum TunnelAction {
         /// Keep tunnel alive across disconnects.
         #[arg(long)]
         persist: bool,
+
+        /// Internal: run as daemon process (used by --persist re-exec).
+        #[arg(long, hide = true)]
+        daemon: bool,
     },
 
     /// Stop a tunnel.
@@ -227,5 +231,118 @@ mod tests {
             }
             _ => panic!("Expected Scp command"),
         }
+    }
+
+    #[test]
+    fn test_parse_tunnel_start() {
+        let cli = Cli::try_parse_from([
+            "sshore",
+            "tunnel",
+            "start",
+            "myhost",
+            "-L",
+            "5432:localhost:5432",
+        ])
+        .unwrap();
+        match cli.command {
+            Some(Commands::Tunnel {
+                action:
+                    TunnelAction::Start {
+                        bookmark,
+                        local_forward,
+                        remote_forward,
+                        persist,
+                        daemon,
+                    },
+            }) => {
+                assert_eq!(bookmark, "myhost");
+                assert_eq!(local_forward, vec!["5432:localhost:5432"]);
+                assert!(remote_forward.is_empty());
+                assert!(!persist);
+                assert!(!daemon);
+            }
+            _ => panic!("Expected Tunnel Start command"),
+        }
+    }
+
+    #[test]
+    fn test_parse_tunnel_start_persist() {
+        let cli = Cli::try_parse_from([
+            "sshore",
+            "tunnel",
+            "start",
+            "myhost",
+            "-L",
+            "5432:localhost:5432",
+            "--persist",
+        ])
+        .unwrap();
+        match cli.command {
+            Some(Commands::Tunnel {
+                action:
+                    TunnelAction::Start {
+                        persist, daemon, ..
+                    },
+            }) => {
+                assert!(persist);
+                assert!(!daemon);
+            }
+            _ => panic!("Expected Tunnel Start command"),
+        }
+    }
+
+    #[test]
+    fn test_parse_tunnel_start_multiple_forwards() {
+        let cli = Cli::try_parse_from([
+            "sshore",
+            "tunnel",
+            "start",
+            "myhost",
+            "-L",
+            "5432:localhost:5432",
+            "-L",
+            "8080:localhost:80",
+            "-R",
+            "3000:localhost:3000",
+        ])
+        .unwrap();
+        match cli.command {
+            Some(Commands::Tunnel {
+                action:
+                    TunnelAction::Start {
+                        local_forward,
+                        remote_forward,
+                        ..
+                    },
+            }) => {
+                assert_eq!(local_forward.len(), 2);
+                assert_eq!(remote_forward.len(), 1);
+            }
+            _ => panic!("Expected Tunnel Start command"),
+        }
+    }
+
+    #[test]
+    fn test_parse_tunnel_stop() {
+        let cli = Cli::try_parse_from(["sshore", "tunnel", "stop", "myhost"]).unwrap();
+        match cli.command {
+            Some(Commands::Tunnel {
+                action: TunnelAction::Stop { bookmark },
+            }) => {
+                assert_eq!(bookmark, "myhost");
+            }
+            _ => panic!("Expected Tunnel Stop command"),
+        }
+    }
+
+    #[test]
+    fn test_parse_tunnel_status() {
+        let cli = Cli::try_parse_from(["sshore", "tunnel", "status"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Tunnel {
+                action: TunnelAction::Status
+            })
+        ));
     }
 }

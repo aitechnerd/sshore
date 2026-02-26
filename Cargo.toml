@@ -48,6 +48,9 @@ anyhow = "1"
 # Streaming
 tokio-stream = "0.1"
 
+# Serialization
+serde_json = "1"
+
 # Other
 regex = "1"
 chrono = { version = "0.4", features = ["serde"] }

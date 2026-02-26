@@ -55,6 +55,7 @@ fn build_help_sections(theme: &ThemeColors) -> Vec<Line<'static>> {
     key_hint(&mut lines, "a", "Add new bookmark", theme);
     key_hint(&mut lines, "e", "Edit selected bookmark", theme);
     key_hint(&mut lines, "d", "Delete selected bookmark", theme);
+    key_hint(&mut lines, "~~ (in session)", "Open snippet picker", theme);
     lines.push(Line::from(""));
 
     section_header(&mut lines, "Search & Filter", theme);

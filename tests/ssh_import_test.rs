@@ -147,6 +147,8 @@ Host server-b
         notes: Some("Keep this".into()),
         last_connected: None,
         connect_count: 10,
+        on_connect: None,
+        snippets: vec![],
     }];
 
     let result = merge_imports(&mut existing, imported, false);

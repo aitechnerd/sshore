@@ -111,6 +111,8 @@ mod tests {
                 notes: None,
                 last_connected: None,
                 connect_count: 0,
+                on_connect: None,
+                snippets: vec![],
             },
             Bookmark {
                 name: unstored_name.into(),
@@ -124,6 +126,8 @@ mod tests {
                 notes: None,
                 last_connected: None,
                 connect_count: 0,
+                on_connect: None,
+                snippets: vec![],
             },
         ];
 

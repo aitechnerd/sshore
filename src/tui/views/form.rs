@@ -15,7 +15,7 @@ use crate::tui::theme::ThemeColors;
 use crate::tui::widgets::env_badge;
 
 /// Number of editable fields in the form.
-const FIELD_COUNT: usize = 9;
+const FIELD_COUNT: usize = 10;
 
 /// Environment options for the cycle selector.
 const ENV_OPTIONS: &[&str] = &[
@@ -37,6 +37,7 @@ const FIELD_TAGS: usize = 5;
 const FIELD_IDENTITY: usize = 6;
 const FIELD_PROXY: usize = 7;
 const FIELD_NOTES: usize = 8;
+const FIELD_ON_CONNECT: usize = 9;
 
 /// Form state for add/edit bookmark.
 pub struct FormState {
@@ -80,6 +81,7 @@ impl FormState {
         fields[FIELD_IDENTITY] = bookmark.identity_file.clone().unwrap_or_default();
         fields[FIELD_PROXY] = bookmark.proxy_jump.clone().unwrap_or_default();
         fields[FIELD_NOTES] = bookmark.notes.clone().unwrap_or_default();
+        fields[FIELD_ON_CONNECT] = bookmark.on_connect.clone().unwrap_or_default();
 
         let env_index = ENV_OPTIONS
             .iter()
@@ -213,6 +215,7 @@ impl FormState {
         let user = non_empty_option(&self.fields[FIELD_USER]);
         let proxy_jump = non_empty_option(&self.fields[FIELD_PROXY]);
         let notes = non_empty_option(&self.fields[FIELD_NOTES]);
+        let on_connect = non_empty_option(&self.fields[FIELD_ON_CONNECT]);
         let env = self.selected_env().to_string();
 
         Ok(Bookmark {
@@ -227,6 +230,8 @@ impl FormState {
             notes,
             last_connected: None,
             connect_count: 0,
+            on_connect,
+            snippets: vec![],
         })
     }
 }
@@ -291,6 +296,7 @@ pub fn render_form(
         "Identity File",
         "Proxy Jump",
         "Notes",
+        "On-Connect",
     ];
 
     for (i, &label) in field_labels.iter().enumerate() {
@@ -489,6 +495,8 @@ mod tests {
             notes: Some("Primary web server".into()),
             last_connected: None,
             connect_count: 0,
+            on_connect: None,
+            snippets: vec![],
         }
     }
 

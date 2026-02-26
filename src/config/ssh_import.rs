@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 
 use crate::config::env::detect_env;
-use crate::config::model::Bookmark;
+use crate::config::model::{AppConfig, Bookmark};
 
 /// Default SSH port.
 const DEFAULT_SSH_PORT: u16 = 22;
@@ -50,8 +50,35 @@ impl HostBlock {
             notes: None,
             last_connected: None,
             connect_count: 0,
+            on_connect: None,
+            snippets: vec![],
         })
     }
+}
+
+/// Import bookmarks from a file, auto-detecting format.
+/// Supports: `~/.ssh/config` format (SSH config) and sshore TOML export files.
+pub fn import_from_file(path: &Path) -> Result<Vec<Bookmark>> {
+    let content = fs::read_to_string(path)
+        .with_context(|| format!("Failed to read import file: {}", path.display()))?;
+
+    if is_sshore_toml(&content) {
+        import_from_toml(&content)
+    } else {
+        parse_ssh_config(path)
+    }
+}
+
+/// Detect whether the file content is a sshore TOML export (vs ssh_config).
+fn is_sshore_toml(content: &str) -> bool {
+    content.contains("[[bookmarks]]")
+}
+
+/// Parse a sshore TOML export file into bookmarks.
+fn import_from_toml(content: &str) -> Result<Vec<Bookmark>> {
+    let config: AppConfig =
+        toml::from_str(content).context("Failed to parse sshore TOML export file")?;
+    Ok(config.bookmarks)
 }
 
 /// Parse an SSH config file into a list of bookmarks.
@@ -642,6 +669,8 @@ Host relative-host
             notes: None,
             last_connected: None,
             connect_count: 0,
+            on_connect: None,
+            snippets: vec![],
         }];
 
         let imported = vec![
@@ -657,6 +686,8 @@ Host relative-host
                 notes: None,
                 last_connected: None,
                 connect_count: 0,
+                on_connect: None,
+                snippets: vec![],
             },
             Bookmark {
                 name: "server-b".into(),
@@ -670,6 +701,8 @@ Host relative-host
                 notes: None,
                 last_connected: None,
                 connect_count: 0,
+                on_connect: None,
+                snippets: vec![],
             },
         ];
 
@@ -695,6 +728,8 @@ Host relative-host
             notes: None,
             last_connected: None,
             connect_count: 0,
+            on_connect: None,
+            snippets: vec![],
         }];
 
         let imported = vec![Bookmark {
@@ -709,6 +744,8 @@ Host relative-host
             notes: None,
             last_connected: None,
             connect_count: 0,
+            on_connect: None,
+            snippets: vec![],
         }];
 
         let result = merge_imports(&mut existing, imported, true);
@@ -744,5 +781,96 @@ Host *
 
         let bookmarks = parse_ssh_config(&path).unwrap();
         assert!(bookmarks.is_empty());
+    }
+
+    #[test]
+    fn test_import_detects_toml_format() {
+        assert!(is_sshore_toml("[[bookmarks]]\nname = \"test\""));
+        assert!(!is_sshore_toml("Host myhost\n    HostName example.com"));
+        assert!(!is_sshore_toml("# Just a comment"));
+    }
+
+    #[test]
+    fn test_import_toml_parses_bookmarks() {
+        let toml_content = r#"
+[settings]
+
+[[bookmarks]]
+name = "web-server"
+host = "10.0.1.5"
+user = "deploy"
+port = 22
+env = "production"
+tags = ["web"]
+on_connect = "cd /var/www && exec $SHELL"
+
+[[bookmarks.snippets]]
+name = "Tail log"
+command = "tail -f /var/log/app.log"
+
+[[bookmarks.snippets]]
+name = "Disk usage"
+command = "df -h"
+auto_execute = false
+
+[[bookmarks]]
+name = "db-server"
+host = "10.0.1.6"
+port = 5432
+env = "staging"
+"#;
+
+        let bookmarks = import_from_toml(toml_content).unwrap();
+        assert_eq!(bookmarks.len(), 2);
+
+        let web = &bookmarks[0];
+        assert_eq!(web.name, "web-server");
+        assert_eq!(web.on_connect, Some("cd /var/www && exec $SHELL".into()));
+        assert_eq!(web.snippets.len(), 2);
+        assert_eq!(web.snippets[0].name, "Tail log");
+        assert!(web.snippets[0].auto_execute);
+        assert_eq!(web.snippets[1].name, "Disk usage");
+        assert!(!web.snippets[1].auto_execute);
+
+        let db = &bookmarks[1];
+        assert_eq!(db.name, "db-server");
+        assert_eq!(db.port, 5432);
+        assert!(db.snippets.is_empty());
+        assert!(db.on_connect.is_none());
+    }
+
+    #[test]
+    fn test_import_from_file_auto_detects_toml() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("export.toml");
+        fs::write(
+            &path,
+            r#"
+[[bookmarks]]
+name = "from-toml"
+host = "example.com"
+port = 22
+env = ""
+"#,
+        )
+        .unwrap();
+
+        let bookmarks = import_from_file(&path).unwrap();
+        assert_eq!(bookmarks.len(), 1);
+        assert_eq!(bookmarks[0].name, "from-toml");
+    }
+
+    #[test]
+    fn test_import_from_file_auto_detects_ssh_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_temp_ssh_config(
+            dir.path(),
+            "config",
+            "Host from-ssh\n    HostName example.com\n",
+        );
+
+        let bookmarks = import_from_file(&path).unwrap();
+        assert_eq!(bookmarks.len(), 1);
+        assert_eq!(bookmarks[0].name, "from-ssh");
     }
 }

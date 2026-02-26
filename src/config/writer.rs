@@ -92,6 +92,8 @@ mod tests {
             notes: None,
             last_connected: None,
             connect_count: 5,
+            on_connect: None,
+            snippets: vec![],
         });
 
         atomic_write(&config, &path).unwrap();

@@ -8,6 +8,21 @@ use anyhow::{Result, bail};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
+/// A named command shortcut for a bookmark.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Snippet {
+    /// Display name shown in the picker (e.g. "Tail app log").
+    pub name: String,
+
+    /// The command to execute (e.g. "tail -f /var/log/app/production.log").
+    pub command: String,
+
+    /// If true, press Enter automatically after injecting the command.
+    /// Default: true. Set to false for commands the user may want to edit first.
+    #[serde(default = "default_true")]
+    pub auto_execute: bool,
+}
+
 /// Characters forbidden in hostnames to prevent shell injection.
 const SHELL_METACHARACTERS: &[char] = &[
     ';', '|', '&', '$', '`', '(', ')', '{', '}', '<', '>', '\n', '\r',
@@ -55,6 +70,21 @@ pub struct Settings {
     /// Custom environment color definitions.
     #[serde(default = "default_env_colors")]
     pub env_colors: EnvColorMap,
+
+    /// Escape sequence to trigger snippet picker during SSH session.
+    /// Default: "~~" (double tilde).
+    #[serde(default = "default_snippet_trigger")]
+    pub snippet_trigger: String,
+
+    /// Delay in milliseconds before sending on_connect command.
+    /// Allows remote shell to initialize before injection.
+    /// Default: 200
+    #[serde(default = "default_on_connect_delay_ms")]
+    pub on_connect_delay_ms: u64,
+
+    /// Global snippets available in all SSH sessions.
+    #[serde(default)]
+    pub snippets: Vec<Snippet>,
 }
 
 /// Color and badge configuration for an environment tier.
@@ -109,6 +139,15 @@ pub struct Bookmark {
     /// Connection count (auto-updated).
     #[serde(default)]
     pub connect_count: u32,
+
+    /// Command to run automatically after SSH session starts.
+    /// Runs before interactive shell — the shell remains interactive after.
+    /// Example: "cd /var/www/app && exec $SHELL"
+    pub on_connect: Option<String>,
+
+    /// Named command shortcuts for this bookmark.
+    #[serde(default)]
+    pub snippets: Vec<Snippet>,
 }
 
 impl Default for Settings {
@@ -120,6 +159,9 @@ impl Default for Settings {
             show_env_column: default_true(),
             theme: default_theme(),
             env_colors: default_env_colors(),
+            snippet_trigger: default_snippet_trigger(),
+            on_connect_delay_ms: default_on_connect_delay_ms(),
+            snippets: Vec::new(),
         }
     }
 }
@@ -193,6 +235,14 @@ fn default_tab_title_template() -> String {
     "{badge} {label} — {name}".to_string()
 }
 
+fn default_snippet_trigger() -> String {
+    "~~".to_string()
+}
+
+fn default_on_connect_delay_ms() -> u64 {
+    200
+}
+
 fn default_env_colors() -> EnvColorMap {
     let mut map = EnvColorMap::new();
     map.insert(
@@ -260,6 +310,8 @@ mod tests {
             notes: Some("Primary web server".into()),
             last_connected: None,
             connect_count: 0,
+            on_connect: None,
+            snippets: vec![],
         }
     }
 
@@ -429,5 +481,106 @@ mod tests {
         "#;
         let bookmark: Bookmark = toml::from_str(toml_str).expect("deserialize");
         assert_eq!(bookmark.port, 22);
+    }
+
+    #[test]
+    fn test_snippet_serde_roundtrip() {
+        let snippet = Snippet {
+            name: "Tail app log".into(),
+            command: "tail -f /var/log/app/production.log".into(),
+            auto_execute: true,
+        };
+        let toml_str = toml::to_string_pretty(&snippet).expect("serialize");
+        let deserialized: Snippet = toml::from_str(&toml_str).expect("deserialize");
+        assert_eq!(snippet, deserialized);
+    }
+
+    #[test]
+    fn test_bookmark_with_snippets_roundtrip() {
+        let bookmark = Bookmark {
+            on_connect: Some("cd /var/www/app && exec $SHELL".into()),
+            snippets: vec![
+                Snippet {
+                    name: "Tail log".into(),
+                    command: "tail -f /var/log/app.log".into(),
+                    auto_execute: true,
+                },
+                Snippet {
+                    name: "Git status".into(),
+                    command: "cd /var/www/app && git status".into(),
+                    auto_execute: false,
+                },
+            ],
+            ..sample_bookmark()
+        };
+        let toml_str = toml::to_string_pretty(&bookmark).expect("serialize");
+        let deserialized: Bookmark = toml::from_str(&toml_str).expect("deserialize");
+        assert_eq!(bookmark, deserialized);
+    }
+
+    #[test]
+    fn test_bookmark_without_snippets_defaults() {
+        let toml_str = r#"
+            name = "test"
+            host = "example.com"
+        "#;
+        let bookmark: Bookmark = toml::from_str(toml_str).expect("deserialize");
+        assert!(bookmark.snippets.is_empty());
+        assert!(bookmark.on_connect.is_none());
+    }
+
+    #[test]
+    fn test_settings_with_global_snippets_roundtrip() {
+        let settings = Settings {
+            snippet_trigger: "~~".into(),
+            on_connect_delay_ms: 300,
+            snippets: vec![Snippet {
+                name: "System info".into(),
+                command: "uname -a && uptime".into(),
+                auto_execute: true,
+            }],
+            ..Settings::default()
+        };
+        let toml_str = toml::to_string_pretty(&settings).expect("serialize");
+        let deserialized: Settings = toml::from_str(&toml_str).expect("deserialize");
+        assert_eq!(settings, deserialized);
+    }
+
+    #[test]
+    fn test_settings_without_new_fields_defaults() {
+        let toml_str = r#"
+            sort_by_name = true
+        "#;
+        let settings: Settings = toml::from_str(toml_str).expect("deserialize");
+        assert_eq!(settings.snippet_trigger, "~~");
+        assert_eq!(settings.on_connect_delay_ms, 200);
+        assert!(settings.snippets.is_empty());
+    }
+
+    #[test]
+    fn test_snippet_auto_execute_defaults_true() {
+        let toml_str = r#"
+            name = "Test"
+            command = "uptime"
+        "#;
+        let snippet: Snippet = toml::from_str(toml_str).expect("deserialize");
+        assert!(snippet.auto_execute);
+    }
+
+    #[test]
+    fn test_deserialize_with_missing_fields_includes_snippet_defaults() {
+        let minimal_toml = r#"
+            [settings]
+
+            [[bookmarks]]
+            name = "test"
+            host = "example.com"
+        "#;
+        let config: AppConfig = toml::from_str(minimal_toml).expect("deserialize minimal");
+        assert!(config.bookmarks[0].snippets.is_empty());
+        assert!(config.bookmarks[0].on_connect.is_none());
+        assert_eq!(config.settings.snippet_trigger, "~~");
+        assert_eq!(config.settings.on_connect_delay_ms, 200);
+        assert!(config.settings.snippets.is_empty());
     }
 }

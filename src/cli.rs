@@ -17,15 +17,23 @@ pub struct Cli {
 
 #[derive(Subcommand, Debug)]
 pub enum Commands {
-    /// Import bookmarks from ~/.ssh/config.
+    /// Import bookmarks from ~/.ssh/config or sshore TOML export file.
     Import {
-        /// Path to ssh config file (default: ~/.ssh/config).
+        /// Path to ssh config or sshore TOML export file (default: ~/.ssh/config).
         #[arg(short, long)]
         file: Option<String>,
 
         /// Overwrite existing bookmarks with same name.
         #[arg(long)]
         overwrite: bool,
+
+        /// Override environment for all imported bookmarks.
+        #[arg(long)]
+        env: Option<String>,
+
+        /// Show what would be imported without writing config.
+        #[arg(long)]
+        dry_run: bool,
     },
 
     /// Manage stored passwords in OS keychain.
@@ -69,6 +77,52 @@ pub enum Commands {
     Completions {
         /// Shell to generate for.
         shell: clap_complete::Shell,
+    },
+
+    /// Execute a command on one or more bookmarks without interactive session.
+    Exec {
+        /// Bookmark name (for single-host exec).
+        #[arg(value_name = "BOOKMARK")]
+        bookmark: Option<String>,
+
+        /// Command to execute on the remote host(s).
+        #[arg(last = true)]
+        command: Vec<String>,
+
+        /// Filter by tag (can be specified multiple times, AND logic).
+        #[arg(short, long)]
+        tag: Vec<String>,
+
+        /// Filter by environment.
+        #[arg(short, long)]
+        env: Option<String>,
+
+        /// Maximum concurrent SSH connections for multi-host exec.
+        #[arg(long, default_value = "10")]
+        concurrency: usize,
+    },
+
+    /// Export bookmarks to a portable TOML file.
+    Export {
+        /// Filter by environment.
+        #[arg(short, long)]
+        env: Option<String>,
+
+        /// Filter by tag (can be specified multiple times, AND logic).
+        #[arg(short, long)]
+        tag: Vec<String>,
+
+        /// Filter by name pattern (glob-style: "prod-*").
+        #[arg(short, long)]
+        name: Option<String>,
+
+        /// Output file path (default: stdout).
+        #[arg(short, long)]
+        output: Option<String>,
+
+        /// Include settings (env_colors, global snippets) in export.
+        #[arg(long)]
+        include_settings: bool,
     },
 }
 
@@ -149,7 +203,8 @@ mod tests {
             cli.command,
             Some(Commands::Import {
                 file: None,
-                overwrite: false
+                overwrite: false,
+                ..
             })
         ));
     }
@@ -158,7 +213,9 @@ mod tests {
     fn test_parse_import_with_file() {
         let cli = Cli::try_parse_from(["sshore", "import", "--file", "/path/to/config"]).unwrap();
         match cli.command {
-            Some(Commands::Import { file, overwrite }) => {
+            Some(Commands::Import {
+                file, overwrite, ..
+            }) => {
                 assert_eq!(file, Some("/path/to/config".into()));
                 assert!(!overwrite);
             }
@@ -170,8 +227,15 @@ mod tests {
     fn test_parse_import_with_overwrite() {
         let cli = Cli::try_parse_from(["sshore", "import", "--overwrite"]).unwrap();
         match cli.command {
-            Some(Commands::Import { overwrite, .. }) => {
+            Some(Commands::Import {
+                overwrite,
+                env,
+                dry_run,
+                ..
+            }) => {
                 assert!(overwrite);
+                assert!(env.is_none());
+                assert!(!dry_run);
             }
             _ => panic!("Expected Import command"),
         }
@@ -344,5 +408,118 @@ mod tests {
                 action: TunnelAction::Status
             })
         ));
+    }
+
+    #[test]
+    fn test_parse_exec_single_host() {
+        let cli = Cli::try_parse_from(["sshore", "exec", "myhost", "--", "uptime"]).unwrap();
+        match cli.command {
+            Some(Commands::Exec {
+                bookmark,
+                command,
+                tag,
+                env,
+                concurrency,
+            }) => {
+                assert_eq!(bookmark, Some("myhost".into()));
+                assert_eq!(command, vec!["uptime"]);
+                assert!(tag.is_empty());
+                assert!(env.is_none());
+                assert_eq!(concurrency, 10);
+            }
+            _ => panic!("Expected Exec command"),
+        }
+    }
+
+    #[test]
+    fn test_parse_exec_multi_host() {
+        let cli = Cli::try_parse_from([
+            "sshore",
+            "exec",
+            "--env",
+            "production",
+            "--tag",
+            "web",
+            "--concurrency",
+            "5",
+            "--",
+            "df",
+            "-h",
+        ])
+        .unwrap();
+        match cli.command {
+            Some(Commands::Exec {
+                bookmark,
+                command,
+                tag,
+                env,
+                concurrency,
+            }) => {
+                assert!(bookmark.is_none());
+                assert_eq!(command, vec!["df", "-h"]);
+                assert_eq!(tag, vec!["web"]);
+                assert_eq!(env, Some("production".into()));
+                assert_eq!(concurrency, 5);
+            }
+            _ => panic!("Expected Exec command"),
+        }
+    }
+
+    #[test]
+    fn test_parse_export() {
+        let cli = Cli::try_parse_from([
+            "sshore",
+            "export",
+            "--env",
+            "production",
+            "--output",
+            "servers.toml",
+            "--include-settings",
+        ])
+        .unwrap();
+        match cli.command {
+            Some(Commands::Export {
+                env,
+                tag,
+                name,
+                output,
+                include_settings,
+            }) => {
+                assert_eq!(env, Some("production".into()));
+                assert!(tag.is_empty());
+                assert!(name.is_none());
+                assert_eq!(output, Some("servers.toml".into()));
+                assert!(include_settings);
+            }
+            _ => panic!("Expected Export command"),
+        }
+    }
+
+    #[test]
+    fn test_parse_import_with_env_override() {
+        let cli = Cli::try_parse_from([
+            "sshore",
+            "import",
+            "--file",
+            "servers.toml",
+            "--env",
+            "staging",
+            "--dry-run",
+        ])
+        .unwrap();
+        match cli.command {
+            Some(Commands::Import {
+                file,
+                overwrite,
+                env,
+                dry_run,
+            }) => {
+                assert_eq!(file, Some("servers.toml".into()));
+                assert!(!overwrite);
+                assert_eq!(env, Some("staging".into()));
+                assert!(dry_run);
+            }
+            _ => panic!("Expected Import command"),
+        }
     }
 }

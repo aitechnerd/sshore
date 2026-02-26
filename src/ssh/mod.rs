@@ -1,5 +1,6 @@
 pub mod client;
 pub mod password;
+pub mod snippet;
 pub mod terminal_theme;
 pub mod tunnel;
 
@@ -20,6 +21,14 @@ use crate::keychain;
 
 use self::client::SshoreHandler;
 use self::password::PasswordDetector;
+use self::snippet::{EscapeAction, EscapeDetector};
+
+/// Result of executing a single command on a remote host.
+pub struct ExecResult {
+    pub stdout: String,
+    pub stderr: String,
+    pub exit_code: u32,
+}
 
 /// Default SSH key filenames to try, in priority order.
 const DEFAULT_KEY_NAMES: &[&str] = &["id_ed25519", "id_rsa", "id_ecdsa"];
@@ -158,8 +167,32 @@ pub async fn connect(config: &mut AppConfig, bookmark_index: usize) -> Result<()
     });
     let detector = PasswordDetector::new(stored_password.is_some());
 
+    // Send on_connect command if configured
+    let bookmark = &config.bookmarks[bookmark_index];
+    if let Some(ref on_connect) = bookmark.on_connect {
+        let delay = config.settings.on_connect_delay_ms;
+        tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+        channel
+            .data(format!("{on_connect}\n").as_bytes())
+            .await
+            .context("Failed to send on_connect command")?;
+    }
+
+    // Collect snippet info for escape detection
+    let bookmark_snippets = config.bookmarks[bookmark_index].snippets.clone();
+    let global_snippets = config.settings.snippets.clone();
+    let snippet_trigger = config.settings.snippet_trigger.clone();
+
     // Run the interactive proxy loop
-    run_proxy_loop(channel, detector, stored_password).await?;
+    run_proxy_loop(
+        channel,
+        detector,
+        stored_password,
+        bookmark_snippets,
+        global_snippets,
+        snippet_trigger,
+    )
+    .await?;
 
     // Update bookmark stats
     config.bookmarks[bookmark_index].last_connected = Some(Utc::now());
@@ -169,6 +202,162 @@ pub async fn connect(config: &mut AppConfig, bookmark_index: usize) -> Result<()
     }
 
     Ok(())
+}
+
+/// Execute a single command on a bookmark and return the result.
+/// Does NOT allocate a PTY — runs as an exec channel.
+pub async fn exec_command(
+    config: &AppConfig,
+    bookmark_index: usize,
+    command: &str,
+) -> Result<ExecResult> {
+    let session = establish_session(config, bookmark_index).await?;
+
+    let channel = session
+        .channel_open_session()
+        .await
+        .context("Failed to open exec channel")?;
+
+    channel
+        .exec(true, command)
+        .await
+        .context("Failed to execute remote command")?;
+
+    let mut stdout_buf = Vec::new();
+    let mut stderr_buf = Vec::new();
+    let mut exit_code: Option<u32> = None;
+
+    let (mut channel_rx, _channel_tx) = channel.split();
+
+    loop {
+        match channel_rx.wait().await {
+            Some(ChannelMsg::Data { ref data }) => {
+                stdout_buf.extend_from_slice(data);
+                std::io::stdout().write_all(data)?;
+                std::io::stdout().flush()?;
+            }
+            Some(ChannelMsg::ExtendedData { data, ext: 1 }) => {
+                stderr_buf.extend_from_slice(&data);
+                std::io::stderr().write_all(&data)?;
+                std::io::stderr().flush()?;
+            }
+            Some(ChannelMsg::ExitStatus { exit_status }) => {
+                exit_code = Some(exit_status);
+            }
+            Some(ChannelMsg::Eof | ChannelMsg::Close) => break,
+            Some(_) => {}
+            None => break,
+        }
+    }
+
+    Ok(ExecResult {
+        stdout: String::from_utf8_lossy(&stdout_buf).to_string(),
+        stderr: String::from_utf8_lossy(&stderr_buf).to_string(),
+        exit_code: exit_code.unwrap_or(1),
+    })
+}
+
+/// Execute a command on multiple bookmarks concurrently.
+/// Output is printed with per-host headers, interleaved as results arrive.
+pub async fn exec_multi(
+    config: &AppConfig,
+    indices: &[usize],
+    command: &str,
+    concurrency: usize,
+) -> Result<()> {
+    use tokio::sync::Semaphore;
+
+    let semaphore = Arc::new(Semaphore::new(concurrency));
+    let mut handles = Vec::new();
+
+    for &idx in indices {
+        let sem = semaphore.clone();
+        let config = config.clone();
+        let command = command.to_string();
+
+        let handle = tokio::spawn(async move {
+            let _permit = sem.acquire().await.unwrap();
+
+            let bookmark = &config.bookmarks[idx];
+            let header = format!("\x1b[1m── {} ──\x1b[0m", bookmark.name);
+
+            match exec_command_quiet(&config, idx, &command).await {
+                Ok(result) => {
+                    let mut output = format!("{header}\n{}", result.stdout);
+                    if !result.stderr.is_empty() {
+                        output.push_str(&format!("\x1b[31m{}\x1b[0m", result.stderr));
+                    }
+                    if result.exit_code != 0 {
+                        output.push_str(&format!(
+                            "\x1b[31m(exit code: {})\x1b[0m\n",
+                            result.exit_code
+                        ));
+                    }
+                    print!("{output}");
+                }
+                Err(e) => {
+                    eprintln!("{header}\n\x1b[31mError: {e}\x1b[0m\n");
+                }
+            }
+        });
+
+        handles.push(handle);
+    }
+
+    for handle in handles {
+        handle.await?;
+    }
+
+    Ok(())
+}
+
+/// Execute a single command on a bookmark without streaming to stdout.
+/// Used by `exec_multi` to collect output atomically per host.
+async fn exec_command_quiet(
+    config: &AppConfig,
+    bookmark_index: usize,
+    command: &str,
+) -> Result<ExecResult> {
+    let session = establish_session(config, bookmark_index).await?;
+
+    let channel = session
+        .channel_open_session()
+        .await
+        .context("Failed to open exec channel")?;
+
+    channel
+        .exec(true, command)
+        .await
+        .context("Failed to execute remote command")?;
+
+    let mut stdout_buf = Vec::new();
+    let mut stderr_buf = Vec::new();
+    let mut exit_code: Option<u32> = None;
+
+    let (mut channel_rx, _channel_tx) = channel.split();
+
+    loop {
+        match channel_rx.wait().await {
+            Some(ChannelMsg::Data { ref data }) => {
+                stdout_buf.extend_from_slice(data);
+            }
+            Some(ChannelMsg::ExtendedData { data, ext: 1 }) => {
+                stderr_buf.extend_from_slice(&data);
+            }
+            Some(ChannelMsg::ExitStatus { exit_status }) => {
+                exit_code = Some(exit_status);
+            }
+            Some(ChannelMsg::Eof | ChannelMsg::Close) => break,
+            Some(_) => {}
+            None => break,
+        }
+    }
+
+    Ok(ExecResult {
+        stdout: String::from_utf8_lossy(&stdout_buf).to_string(),
+        stderr: String::from_utf8_lossy(&stderr_buf).to_string(),
+        exit_code: exit_code.unwrap_or(1),
+    })
 }
 
 /// Load SSH private keys for authentication.
@@ -277,6 +466,9 @@ async fn run_proxy_loop(
     channel: russh::Channel<russh::client::Msg>,
     mut detector: PasswordDetector,
     stored_password: Option<String>,
+    bookmark_snippets: Vec<crate::config::model::Snippet>,
+    global_snippets: Vec<crate::config::model::Snippet>,
+    snippet_trigger: String,
 ) -> Result<()> {
     // Put terminal in raw mode with cleanup guard
     crossterm::terminal::enable_raw_mode().context("Failed to enable raw mode")?;
@@ -298,6 +490,10 @@ async fn run_proxy_loop(
 
     let mut stdout = std::io::stdout();
     let mut awaiting_confirm = false;
+
+    // Escape detector for snippet trigger
+    let mut escape_detector = EscapeDetector::new(&snippet_trigger);
+    let has_snippets = !bookmark_snippets.is_empty() || !global_snippets.is_empty();
 
     loop {
         tokio::select! {
@@ -339,8 +535,36 @@ async fn run_proxy_loop(
                     }
                     awaiting_confirm = false;
                     detector.clear();
+                } else if has_snippets {
+                    // Snippet escape detection: feed bytes one at a time
+                    for &byte in &bytes {
+                        match escape_detector.feed(byte) {
+                            EscapeAction::Forward(fwd) => {
+                                if tokio::io::AsyncWriteExt::write_all(&mut writer, &fwd).await.is_err() {
+                                    break;
+                                }
+                            }
+                            EscapeAction::Buffer => {
+                                // Hold — might be start of escape sequence
+                            }
+                            EscapeAction::Trigger => {
+                                // Show snippet picker, inject selected command
+                                if let Ok(Some(command)) = snippet::show_snippet_picker(
+                                    &mut stdout,
+                                    &bookmark_snippets,
+                                    &global_snippets,
+                                ) {
+                                    let _ = tokio::io::AsyncWriteExt::write_all(
+                                        &mut writer,
+                                        command.as_bytes(),
+                                    )
+                                    .await;
+                                }
+                            }
+                        }
+                    }
                 } else {
-                    // Normal mode: forward stdin to SSH channel
+                    // No snippets configured — fast path, skip escape detection
                     if tokio::io::AsyncWriteExt::write_all(&mut writer, &bytes).await.is_err() {
                         break;
                     }

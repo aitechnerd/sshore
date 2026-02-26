@@ -62,7 +62,12 @@ pub fn render_list(frame: &mut Frame, area: Rect, app: &App) {
             } else {
                 Style::default().fg(tc.fg)
             };
-            let name_cell = Cell::from(bookmark.name.as_str()).style(name_style);
+            let name_display = if bookmark.snippets.is_empty() {
+                bookmark.name.clone()
+            } else {
+                format!("{} ({}S)", bookmark.name, bookmark.snippets.len())
+            };
+            let name_cell = Cell::from(name_display).style(name_style);
 
             let host_style = if is_selected {
                 Style::default().fg(tc.fg).bg(tc.highlight)

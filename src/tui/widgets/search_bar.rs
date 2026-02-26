@@ -105,6 +105,8 @@ mod tests {
             notes: None,
             last_connected: None,
             connect_count: 0,
+            on_connect: None,
+            snippets: vec![],
         }
     }
 

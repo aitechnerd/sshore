@@ -47,6 +47,11 @@ pub struct Settings {
     #[serde(default = "default_true")]
     pub show_env_column: bool,
 
+    /// TUI color theme. Built-in: "tokyo-night", "catppuccin-mocha", "dracula", "default".
+    /// Custom themes are loaded from `~/.config/sshore/themes/<name>.toml`.
+    #[serde(default = "default_theme")]
+    pub theme: String,
+
     /// Custom environment color definitions.
     #[serde(default = "default_env_colors")]
     pub env_colors: EnvColorMap,
@@ -113,6 +118,7 @@ impl Default for Settings {
             sort_by_name: default_true(),
             tab_title_template: default_tab_title_template(),
             show_env_column: default_true(),
+            theme: default_theme(),
             env_colors: default_env_colors(),
         }
     }
@@ -177,6 +183,10 @@ fn default_port() -> u16 {
 
 fn default_true() -> bool {
     true
+}
+
+fn default_theme() -> String {
+    "tokyo-night".to_string()
 }
 
 fn default_tab_title_template() -> String {

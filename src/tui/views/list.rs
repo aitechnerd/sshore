@@ -1,30 +1,33 @@
 use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Rect};
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Cell, Paragraph, Row, Table, TableState};
 
 use crate::tui::App;
 use crate::tui::theme;
+use crate::tui::theme::ThemeColors;
 use crate::tui::widgets::env_badge;
 
 /// Render the main bookmark list table.
 pub fn render_list(frame: &mut Frame, area: Rect, app: &App) {
+    let tc = &app.theme;
+
     if app.config.bookmarks.is_empty() {
-        render_empty_state(frame, area);
+        render_empty_state(frame, area, tc);
         return;
     }
 
     if app.filtered_indices.is_empty() {
-        render_no_matches(frame, area);
+        render_no_matches(frame, area, tc);
         return;
     }
 
     let header = Row::new(vec![
-        Cell::from("Env").style(Style::default().add_modifier(Modifier::BOLD)),
-        Cell::from("Name").style(Style::default().add_modifier(Modifier::BOLD)),
-        Cell::from("Host").style(Style::default().add_modifier(Modifier::BOLD)),
-        Cell::from("Tags").style(Style::default().add_modifier(Modifier::BOLD)),
+        Cell::from("Env").style(Style::default().fg(tc.fg).add_modifier(Modifier::BOLD)),
+        Cell::from("Name").style(Style::default().fg(tc.fg).add_modifier(Modifier::BOLD)),
+        Cell::from("Host").style(Style::default().fg(tc.fg).add_modifier(Modifier::BOLD)),
+        Cell::from("Tags").style(Style::default().fg(tc.fg).add_modifier(Modifier::BOLD)),
     ])
     .height(1)
     .bottom_margin(1);
@@ -43,17 +46,17 @@ pub fn render_list(frame: &mut Frame, area: Rect, app: &App) {
             let name_style = if is_selected {
                 Style::default()
                     .add_modifier(Modifier::BOLD)
-                    .fg(Color::White)
-                    .bg(Color::DarkGray)
+                    .fg(tc.fg)
+                    .bg(tc.highlight)
             } else {
-                Style::default()
+                Style::default().fg(tc.fg)
             };
             let name_cell = Cell::from(bookmark.name.as_str()).style(name_style);
 
             let host_style = if is_selected {
-                Style::default().fg(Color::White).bg(Color::DarkGray)
+                Style::default().fg(tc.fg).bg(tc.highlight)
             } else {
-                Style::default()
+                Style::default().fg(tc.fg)
             };
             let host_cell = Cell::from(bookmark.host.as_str()).style(host_style);
 
@@ -63,9 +66,9 @@ pub fn render_list(frame: &mut Frame, area: Rect, app: &App) {
                 bookmark.tags.join(", ")
             };
             let tags_style = if is_selected {
-                Style::default().fg(Color::Gray).bg(Color::DarkGray)
+                Style::default().fg(tc.fg_dim).bg(tc.highlight)
             } else {
-                Style::default().fg(Color::DarkGray)
+                Style::default().fg(tc.fg_muted)
             };
             let tags_cell = Cell::from(tags_text).style(tags_style);
 
@@ -92,23 +95,29 @@ pub fn render_list(frame: &mut Frame, area: Rect, app: &App) {
 }
 
 /// Render empty state when no bookmarks exist.
-fn render_empty_state(frame: &mut Frame, area: Rect) {
+fn render_empty_state(frame: &mut Frame, area: Rect, theme: &ThemeColors) {
     let text = Text::from(vec![
         Line::from(""),
         Line::from(""),
         Line::from(Span::styled(
             "No bookmarks yet.",
             Style::default()
-                .fg(Color::Yellow)
+                .fg(theme.warning)
                 .add_modifier(Modifier::BOLD),
         )),
         Line::from(""),
-        Line::from("Press 'a' to add one, or run:"),
+        Line::from(Span::styled(
+            "Press 'a' to add one, or run:",
+            Style::default().fg(theme.fg),
+        )),
         Line::from(Span::styled(
             "  sshore import",
-            Style::default().fg(Color::Cyan),
+            Style::default().fg(theme.accent),
         )),
-        Line::from("to import from ~/.ssh/config"),
+        Line::from(Span::styled(
+            "to import from ~/.ssh/config",
+            Style::default().fg(theme.fg),
+        )),
     ]);
 
     let paragraph = Paragraph::new(text).alignment(Alignment::Center);
@@ -116,15 +125,18 @@ fn render_empty_state(frame: &mut Frame, area: Rect) {
 }
 
 /// Render message when search/filter yields no results.
-fn render_no_matches(frame: &mut Frame, area: Rect) {
+fn render_no_matches(frame: &mut Frame, area: Rect, theme: &ThemeColors) {
     let text = Text::from(vec![
         Line::from(""),
         Line::from(""),
         Line::from(Span::styled(
             "No matching bookmarks.",
-            Style::default().fg(Color::Yellow),
+            Style::default().fg(theme.warning),
         )),
-        Line::from("Press Esc to clear search, or 0 to clear filter."),
+        Line::from(Span::styled(
+            "Press Esc to clear search, or 0 to clear filter.",
+            Style::default().fg(theme.fg),
+        )),
     ]);
 
     let paragraph = Paragraph::new(text).alignment(Alignment::Center);
@@ -137,14 +149,15 @@ pub fn render_env_filter_indicator(
     area: Rect,
     env: &str,
     settings: &crate::config::model::Settings,
+    tc: &ThemeColors,
 ) {
     let (badge, label) = theme::env_badge_label(env, settings);
     let (fg, bg) = theme::env_style(env, settings);
 
     let line = Line::from(vec![
-        Span::styled(" Filter: ", Style::default().fg(Color::Gray)),
+        Span::styled(" Filter: ", Style::default().fg(tc.fg_dim)),
         Span::styled(format!("{badge} {label}"), Style::new().fg(fg).bg(bg)),
-        Span::styled(" (press 0 to clear) ", Style::default().fg(Color::DarkGray)),
+        Span::styled(" (press 0 to clear) ", Style::default().fg(tc.fg_muted)),
     ]);
 
     let widget = Paragraph::new(line);

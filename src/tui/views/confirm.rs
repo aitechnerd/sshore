@@ -1,11 +1,12 @@
 use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 
 use crate::config::model::{Bookmark, Settings};
 use crate::tui::theme;
+use crate::tui::theme::ThemeColors;
 use crate::tui::widgets::env_badge;
 
 /// State for the delete confirmation dialog.
@@ -54,7 +55,13 @@ impl ConfirmState {
 }
 
 /// Render the delete confirmation dialog as a centered overlay.
-pub fn render_confirm(frame: &mut Frame, area: Rect, state: &ConfirmState, settings: &Settings) {
+pub fn render_confirm(
+    frame: &mut Frame,
+    area: Rect,
+    state: &ConfirmState,
+    settings: &Settings,
+    tc: &ThemeColors,
+) {
     let popup = centered_rect(55, 40, area);
     frame.render_widget(Clear, popup);
 
@@ -62,7 +69,7 @@ pub fn render_confirm(frame: &mut Frame, area: Rect, state: &ConfirmState, setti
         let (_, bg) = theme::env_style("production", settings);
         (bg, " \u{26a0}\u{fe0f}  Delete PRODUCTION Bookmark ")
     } else {
-        (Color::Yellow, " Delete Bookmark ")
+        (tc.warning, " Delete Bookmark ")
     };
 
     let block = Block::default()
@@ -70,7 +77,7 @@ pub fn render_confirm(frame: &mut Frame, area: Rect, state: &ConfirmState, setti
         .title_alignment(Alignment::Center)
         .borders(Borders::ALL)
         .border_style(Style::default().fg(border_color))
-        .style(Style::default().bg(Color::Black));
+        .style(Style::default().bg(tc.surface));
 
     let inner = block.inner(popup);
     frame.render_widget(block, popup);
@@ -81,7 +88,7 @@ pub fn render_confirm(frame: &mut Frame, area: Rect, state: &ConfirmState, setti
     if state.is_production {
         lines.push(Line::from(Span::styled(
             "  You are about to delete a PRODUCTION server:",
-            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+            Style::default().fg(tc.error).add_modifier(Modifier::BOLD),
         )));
         lines.push(Line::from(""));
 
@@ -92,28 +99,28 @@ pub fn render_confirm(frame: &mut Frame, area: Rect, state: &ConfirmState, setti
             Span::raw("  "),
             Span::styled(
                 state.bookmark_name.clone(),
-                Style::default().add_modifier(Modifier::BOLD),
+                Style::default().fg(tc.fg).add_modifier(Modifier::BOLD),
             ),
         ]));
     } else {
         let badge_span = env_badge::env_badge_span(&state.bookmark_env, settings);
         lines.push(Line::from(vec![
-            Span::raw("  Delete \""),
+            Span::styled("  Delete \"", Style::default().fg(tc.fg)),
             Span::styled(
                 state.bookmark_name.clone(),
-                Style::default().add_modifier(Modifier::BOLD),
+                Style::default().fg(tc.fg).add_modifier(Modifier::BOLD),
             ),
-            Span::raw("\" ("),
+            Span::styled("\" (", Style::default().fg(tc.fg)),
             badge_span,
-            Span::raw(")?"),
+            Span::styled(")?", Style::default().fg(tc.fg)),
         ]));
     }
 
     lines.push(Line::from(vec![
-        Span::raw("  Host: "),
+        Span::styled("  Host: ", Style::default().fg(tc.fg)),
         Span::styled(
             state.bookmark_host.clone(),
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(tc.fg_muted),
         ),
     ]));
     lines.push(Line::from(""));
@@ -122,38 +129,36 @@ pub fn render_confirm(frame: &mut Frame, area: Rect, state: &ConfirmState, setti
         lines.push(Line::from(vec![
             Span::styled(
                 "  Type \"yes\" to confirm: ",
-                Style::default().fg(Color::Yellow),
+                Style::default().fg(tc.warning),
             ),
             Span::styled(
                 format!("{}_", state.input),
-                Style::default()
-                    .fg(Color::White)
-                    .add_modifier(Modifier::BOLD),
+                Style::default().fg(tc.fg).add_modifier(Modifier::BOLD),
             ),
         ]));
         lines.push(Line::from(""));
         lines.push(Line::from(Span::styled(
             "  [Esc] Cancel",
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(tc.fg_muted),
         )));
     } else {
         lines.push(Line::from(vec![
             Span::styled(
                 " Enter ",
                 Style::default()
-                    .fg(Color::Black)
-                    .bg(Color::DarkGray)
+                    .fg(tc.hint_key_fg)
+                    .bg(tc.hint_key_bg)
                     .add_modifier(Modifier::BOLD),
             ),
-            Span::styled(" Confirm    ", Style::default().fg(Color::Gray)),
+            Span::styled(" Confirm    ", Style::default().fg(tc.fg_dim)),
             Span::styled(
                 " Esc ",
                 Style::default()
-                    .fg(Color::Black)
-                    .bg(Color::DarkGray)
+                    .fg(tc.hint_key_fg)
+                    .bg(tc.hint_key_bg)
                     .add_modifier(Modifier::BOLD),
             ),
-            Span::styled(" Cancel", Style::default().fg(Color::Gray)),
+            Span::styled(" Cancel", Style::default().fg(tc.fg_dim)),
         ]));
     }
 

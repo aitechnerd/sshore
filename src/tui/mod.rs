@@ -12,12 +12,13 @@ use fuzzy_matcher::skim::SkimMatcherV2;
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Layout};
-use ratatui::style::{Color, Style};
+use ratatui::style::Style;
 use ratatui::widgets::{Block, Borders};
 
 use crate::config;
 use crate::config::model::AppConfig;
 use crate::ssh;
+use crate::tui::theme::{ThemeColors, resolve_theme};
 use crate::tui::views::confirm::ConfirmState;
 use crate::tui::views::form::FormState;
 use crate::tui::views::{confirm, form, help, list};
@@ -61,6 +62,7 @@ enum LoopAction {
 /// Main application state.
 pub struct App {
     pub config: AppConfig,
+    pub theme: ThemeColors,
     pub screen: Screen,
     pub search_query: String,
     pub search_active: bool,
@@ -81,9 +83,11 @@ impl App {
     pub fn new(config: AppConfig) -> Self {
         let matcher = SkimMatcherV2::default();
         let filtered_indices = search_bar::filter_bookmarks(&matcher, &config.bookmarks, "", None);
+        let theme = resolve_theme(&config.settings.theme);
 
         Self {
             config,
+            theme,
             screen: Screen::List,
             search_query: String::new(),
             search_active: false,
@@ -234,10 +238,12 @@ fn event_loop(
 
 /// Route drawing to the appropriate view based on current screen.
 fn draw(frame: &mut ratatui::Frame, app: &App) {
+    let theme = &app.theme;
+
     let outer_block = Block::default()
         .title(" sshore ")
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Cyan));
+        .border_style(Style::default().fg(theme.border));
 
     let inner = outer_block.inner(frame.area());
     frame.render_widget(outer_block, frame.area());
@@ -272,13 +278,20 @@ fn draw(frame: &mut ratatui::Frame, app: &App) {
             chunks[chunk_idx],
             &app.search_query,
             app.search_active,
+            theme,
         );
         chunk_idx += 1;
     }
 
     // Env filter indicator
     if let Some(ref env) = app.env_filter {
-        list::render_env_filter_indicator(frame, chunks[chunk_idx], env, &app.config.settings);
+        list::render_env_filter_indicator(
+            frame,
+            chunks[chunk_idx],
+            env,
+            &app.config.settings,
+            theme,
+        );
         chunk_idx += 1;
     }
 
@@ -293,7 +306,7 @@ fn draw(frame: &mut ratatui::Frame, app: &App) {
     {
         let status_line = ratatui::text::Line::from(ratatui::text::Span::styled(
             format!(" {msg}"),
-            Style::default().fg(Color::Yellow),
+            Style::default().fg(theme.warning),
         ));
         frame.render_widget(
             ratatui::widgets::Paragraph::new(status_line),
@@ -303,21 +316,27 @@ fn draw(frame: &mut ratatui::Frame, app: &App) {
     }
 
     // Status bar (keybinding hints) — always last
-    status_bar::render_status_bar(frame, chunks[chunk_idx], &app.screen, app.search_active);
+    status_bar::render_status_bar(
+        frame,
+        chunks[chunk_idx],
+        &app.screen,
+        app.search_active,
+        theme,
+    );
 
     // Overlays on top of everything
     match app.screen {
         Screen::Help => {
-            help::render_help(frame, frame.area());
+            help::render_help(frame, frame.area(), theme);
         }
         Screen::AddForm | Screen::EditForm(_) => {
             if let Some(ref state) = app.form_state {
-                form::render_form(frame, frame.area(), state, &app.config.settings);
+                form::render_form(frame, frame.area(), state, &app.config.settings, theme);
             }
         }
         Screen::DeleteConfirm(_) => {
             if let Some(ref state) = app.confirm_state {
-                confirm::render_confirm(frame, frame.area(), state, &app.config.settings);
+                confirm::render_confirm(frame, frame.area(), state, &app.config.settings, theme);
             }
         }
         Screen::List => {}

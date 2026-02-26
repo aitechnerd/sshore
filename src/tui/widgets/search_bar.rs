@@ -2,11 +2,12 @@ use fuzzy_matcher::FuzzyMatcher;
 use fuzzy_matcher::skim::SkimMatcherV2;
 use ratatui::Frame;
 use ratatui::layout::Rect;
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
 use crate::config::model::Bookmark;
+use crate::tui::theme::ThemeColors;
 
 /// Fuzzy-match a query against a bookmark's searchable fields.
 /// Returns Some(score) if matched, None if no match.
@@ -62,13 +63,19 @@ pub fn filter_bookmarks(
 }
 
 /// Render the search bar at the given area.
-pub fn render_search_bar(frame: &mut Frame, area: Rect, query: &str, active: bool) {
+pub fn render_search_bar(
+    frame: &mut Frame,
+    area: Rect,
+    query: &str,
+    active: bool,
+    theme: &ThemeColors,
+) {
     let style = if active {
         Style::default()
-            .fg(Color::Yellow)
+            .fg(theme.warning)
             .add_modifier(Modifier::BOLD)
     } else {
-        Style::default().fg(Color::DarkGray)
+        Style::default().fg(theme.fg_muted)
     };
 
     let cursor_char = if active { "_" } else { "" };

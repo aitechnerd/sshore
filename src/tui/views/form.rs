@@ -3,7 +3,7 @@ use std::path::Path;
 use anyhow::Result;
 use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 
@@ -11,6 +11,7 @@ use crate::config::env::detect_env;
 use crate::config::model::{
     AppConfig, Bookmark, Settings, validate_bookmark_name, validate_hostname,
 };
+use crate::tui::theme::ThemeColors;
 use crate::tui::widgets::env_badge;
 
 /// Number of editable fields in the form.
@@ -241,7 +242,13 @@ fn non_empty_option(s: &str) -> Option<String> {
 }
 
 /// Render the add/edit form as a centered overlay.
-pub fn render_form(frame: &mut Frame, area: Rect, state: &FormState, settings: &Settings) {
+pub fn render_form(
+    frame: &mut Frame,
+    area: Rect,
+    state: &FormState,
+    settings: &Settings,
+    tc: &ThemeColors,
+) {
     let popup = centered_rect(65, 80, area);
     frame.render_widget(Clear, popup);
 
@@ -255,8 +262,8 @@ pub fn render_form(frame: &mut Frame, area: Rect, state: &FormState, settings: &
         .title(title)
         .title_alignment(Alignment::Center)
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Cyan))
-        .style(Style::default().bg(Color::Black));
+        .border_style(Style::default().fg(tc.border))
+        .style(Style::default().bg(tc.surface));
 
     let inner = block.inner(popup);
     frame.render_widget(block, popup);
@@ -287,19 +294,18 @@ pub fn render_form(frame: &mut Frame, area: Rect, state: &FormState, settings: &
     ];
 
     for (i, &label) in field_labels.iter().enumerate() {
-        let is_focused = i == state.focused;
-        render_field(frame, chunks[i], label, i, state, settings, is_focused);
+        render_field(frame, chunks[i], label, i, state, settings, tc);
     }
 
     // Error message
     let mut hint_idx = FIELD_COUNT;
     if let Some(ref err) = state.error {
-        let style = if err.starts_with("Warning:") {
-            Style::default().fg(Color::Yellow)
+        let color = if err.starts_with("Warning:") {
+            tc.warning
         } else {
-            Style::default().fg(Color::Red)
+            tc.error
         };
-        let line = Line::from(Span::styled(format!(" {err}"), style));
+        let line = Line::from(Span::styled(format!(" {err}"), Style::default().fg(color)));
         frame.render_widget(Paragraph::new(line), chunks[hint_idx]);
         hint_idx += 1;
     }
@@ -312,35 +318,35 @@ pub fn render_form(frame: &mut Frame, area: Rect, state: &FormState, settings: &
         Span::styled(
             " Tab/\u{2193} ",
             Style::default()
-                .fg(Color::Black)
-                .bg(Color::DarkGray)
+                .fg(tc.hint_key_fg)
+                .bg(tc.hint_key_bg)
                 .add_modifier(Modifier::BOLD),
         ),
-        Span::styled(" Next  ", Style::default().fg(Color::Gray)),
+        Span::styled(" Next  ", Style::default().fg(tc.fg_dim)),
         Span::styled(
             " S-Tab/\u{2191} ",
             Style::default()
-                .fg(Color::Black)
-                .bg(Color::DarkGray)
+                .fg(tc.hint_key_fg)
+                .bg(tc.hint_key_bg)
                 .add_modifier(Modifier::BOLD),
         ),
-        Span::styled(" Prev  ", Style::default().fg(Color::Gray)),
+        Span::styled(" Prev  ", Style::default().fg(tc.fg_dim)),
         Span::styled(
             " Enter ",
             Style::default()
-                .fg(Color::Black)
-                .bg(Color::DarkGray)
+                .fg(tc.hint_key_fg)
+                .bg(tc.hint_key_bg)
                 .add_modifier(Modifier::BOLD),
         ),
-        Span::styled(" Save  ", Style::default().fg(Color::Gray)),
+        Span::styled(" Save  ", Style::default().fg(tc.fg_dim)),
         Span::styled(
             " Esc ",
             Style::default()
-                .fg(Color::Black)
-                .bg(Color::DarkGray)
+                .fg(tc.hint_key_fg)
+                .bg(tc.hint_key_bg)
                 .add_modifier(Modifier::BOLD),
         ),
-        Span::styled(" Cancel", Style::default().fg(Color::Gray)),
+        Span::styled(" Cancel", Style::default().fg(tc.fg_dim)),
     ]);
     if hint_idx < chunks.len() {
         frame.render_widget(Paragraph::new(hints), chunks[hint_idx]);
@@ -355,18 +361,17 @@ fn render_field(
     field_idx: usize,
     state: &FormState,
     settings: &Settings,
-    is_focused: bool,
+    tc: &ThemeColors,
 ) {
+    let is_focused = field_idx == state.focused;
     let [label_area, input_area] =
         Layout::vertical([Constraint::Length(1), Constraint::Length(1)]).areas(area);
 
     // Label
     let label_style = if is_focused {
-        Style::default()
-            .fg(Color::Cyan)
-            .add_modifier(Modifier::BOLD)
+        Style::default().fg(tc.accent).add_modifier(Modifier::BOLD)
     } else {
-        Style::default().fg(Color::Gray)
+        Style::default().fg(tc.fg_dim)
     };
     let required = matches!(field_idx, FIELD_NAME | FIELD_HOST);
     let marker = if required { " *" } else { "" };
@@ -375,14 +380,14 @@ fn render_field(
 
     // Input value — special case for env field
     if field_idx == FIELD_ENV {
-        render_env_selector(frame, input_area, state, settings, is_focused);
+        render_env_selector(frame, input_area, state, settings, is_focused, tc);
     } else {
         let cursor = if is_focused { "_" } else { "" };
         let value = &state.fields[field_idx];
         let input_style = if is_focused {
-            Style::default().fg(Color::White)
+            Style::default().fg(tc.fg)
         } else {
-            Style::default().fg(Color::DarkGray)
+            Style::default().fg(tc.fg_muted)
         };
         let prefix = if is_focused { "  > " } else { "    " };
         let line = Line::from(Span::styled(
@@ -400,6 +405,7 @@ fn render_env_selector(
     state: &FormState,
     settings: &Settings,
     is_focused: bool,
+    tc: &ThemeColors,
 ) {
     let mut spans: Vec<Span> = vec![Span::raw(if is_focused { "  > " } else { "    " })];
 
@@ -410,10 +416,10 @@ fn render_env_selector(
             // "(none)" option
             let style = if is_selected {
                 Style::default()
-                    .fg(Color::White)
+                    .fg(tc.fg)
                     .add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
             } else {
-                Style::default().fg(Color::DarkGray)
+                Style::default().fg(tc.fg_muted)
             };
             spans.push(Span::styled("(none)", style));
         } else {
@@ -427,7 +433,7 @@ fn render_env_selector(
                 // Dim unselected options when not focused
                 spans.push(Span::styled(
                     span.content.to_string(),
-                    Style::default().fg(Color::DarkGray),
+                    Style::default().fg(tc.fg_muted),
                 ));
             } else {
                 spans.push(span);
@@ -439,7 +445,7 @@ fn render_env_selector(
     if is_focused {
         spans.push(Span::styled(
             " \u{2190}/\u{2192} to cycle",
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(tc.fg_muted),
         ));
     }
 

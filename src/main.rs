@@ -1,5 +1,6 @@
 mod cli;
 mod config;
+mod tui;
 
 use std::io;
 use std::path::PathBuf;
@@ -59,8 +60,8 @@ async fn main() -> Result<()> {
             if let Some(name) = cli.connect {
                 eprintln!("SSH connection to '{}' not yet implemented (Phase 4)", name);
             } else {
-                eprintln!("TUI not yet implemented (Phase 2)");
-                eprintln!("Try: sshore list, sshore import, sshore --help");
+                let app_config = config::load().context("Failed to load config")?;
+                tui::run(app_config)?;
             }
         }
     }

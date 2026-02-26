@@ -15,8 +15,11 @@ use ratatui::layout::{Constraint, Layout};
 use ratatui::style::{Color, Style};
 use ratatui::widgets::{Block, Borders};
 
+use crate::config;
 use crate::config::model::AppConfig;
-use crate::tui::views::{help, list};
+use crate::tui::views::confirm::ConfirmState;
+use crate::tui::views::form::FormState;
+use crate::tui::views::{confirm, form, help, list};
 use crate::tui::widgets::{search_bar, status_bar};
 
 /// Duration before status messages auto-clear.
@@ -30,7 +33,6 @@ const PAGE_JUMP: usize = 10;
 
 /// TUI screen states.
 #[derive(Debug, Clone, PartialEq)]
-#[allow(dead_code)] // AddForm, EditForm, DeleteConfirm used in Phase 3
 pub enum Screen {
     List,
     AddForm,
@@ -60,6 +62,8 @@ pub struct App {
     pub env_filter: Option<String>,
     pub should_quit: bool,
     pub status_message: Option<(String, Instant)>,
+    pub form_state: Option<FormState>,
+    pub confirm_state: Option<ConfirmState>,
     matcher: SkimMatcherV2,
 }
 
@@ -79,6 +83,8 @@ impl App {
             env_filter: None,
             should_quit: false,
             status_message: None,
+            form_state: None,
+            confirm_state: None,
             matcher,
         }
     }
@@ -101,6 +107,15 @@ impl App {
             self.selected_index = 0;
         } else if self.selected_index >= self.filtered_indices.len() {
             self.selected_index = self.filtered_indices.len() - 1;
+        }
+    }
+
+    /// Get the bookmark index in config.bookmarks for the currently selected filtered item.
+    fn selected_bookmark_index(&self) -> Option<usize> {
+        if self.filtered_indices.is_empty() {
+            None
+        } else {
+            Some(self.filtered_indices[self.selected_index])
         }
     }
 
@@ -220,18 +235,10 @@ fn draw(frame: &mut ratatui::Frame, app: &App) {
         chunk_idx += 1;
     }
 
-    // Main content area
+    // Main content area — always render the list as background
     let content_area = chunks[chunk_idx];
     chunk_idx += 1;
-
-    match app.screen {
-        Screen::List | Screen::AddForm | Screen::EditForm(_) | Screen::DeleteConfirm(_) => {
-            list::render_list(frame, content_area, app);
-        }
-        Screen::Help => {
-            list::render_list(frame, content_area, app);
-        }
-    }
+    list::render_list(frame, content_area, app);
 
     // Status message
     if let Some((ref msg, _)) = app.status_message
@@ -251,9 +258,22 @@ fn draw(frame: &mut ratatui::Frame, app: &App) {
     // Status bar (keybinding hints) — always last
     status_bar::render_status_bar(frame, chunks[chunk_idx], &app.screen, app.search_active);
 
-    // Help overlay on top of everything
-    if app.screen == Screen::Help {
-        help::render_help(frame, frame.area());
+    // Overlays on top of everything
+    match app.screen {
+        Screen::Help => {
+            help::render_help(frame, frame.area());
+        }
+        Screen::AddForm | Screen::EditForm(_) => {
+            if let Some(ref state) = app.form_state {
+                form::render_form(frame, frame.area(), state, &app.config.settings);
+            }
+        }
+        Screen::DeleteConfirm(_) => {
+            if let Some(ref state) = app.confirm_state {
+                confirm::render_confirm(frame, frame.area(), state, &app.config.settings);
+            }
+        }
+        Screen::List => {}
     }
 }
 
@@ -269,12 +289,8 @@ fn handle_key_event(app: &mut App, key: KeyEvent) {
         Screen::Help => handle_help_key(app, key),
         Screen::List if app.search_active => handle_search_key(app, key),
         Screen::List => handle_list_key(app, key),
-        // Phase 3 screens — Esc goes back to list for now
-        Screen::AddForm | Screen::EditForm(_) | Screen::DeleteConfirm(_) => {
-            if key.code == KeyCode::Esc {
-                app.screen = Screen::List;
-            }
-        }
+        Screen::AddForm | Screen::EditForm(_) => handle_form_key(app, key),
+        Screen::DeleteConfirm(_) => handle_confirm_key(app, key),
     }
 }
 
@@ -324,22 +340,136 @@ fn handle_list_key(app: &mut App, key: KeyEvent) {
             }
         }
         KeyCode::Char('a') => {
-            app.set_status("Add bookmark not yet implemented (Phase 3)");
+            app.form_state = Some(FormState::new_add(&app.config.settings));
+            app.screen = Screen::AddForm;
         }
         KeyCode::Char('e') => {
-            if !app.filtered_indices.is_empty() {
-                app.set_status("Edit bookmark not yet implemented (Phase 3)");
+            if let Some(idx) = app.selected_bookmark_index() {
+                let bookmark = &app.config.bookmarks[idx];
+                app.form_state = Some(FormState::new_edit(bookmark));
+                app.screen = Screen::EditForm(idx);
             }
         }
         KeyCode::Char('d') => {
-            if !app.filtered_indices.is_empty() {
-                app.set_status("Delete bookmark not yet implemented (Phase 3)");
+            if let Some(idx) = app.selected_bookmark_index() {
+                let bookmark = &app.config.bookmarks[idx];
+                app.confirm_state = Some(ConfirmState::new(bookmark));
+                app.screen = Screen::DeleteConfirm(idx);
             }
         }
 
         // Help
         KeyCode::Char('?') => app.screen = Screen::Help,
 
+        _ => {}
+    }
+}
+
+/// Handle key events in the add/edit form.
+fn handle_form_key(app: &mut App, key: KeyEvent) {
+    let Some(ref mut form) = app.form_state else {
+        app.screen = Screen::List;
+        return;
+    };
+
+    match key.code {
+        KeyCode::Esc => {
+            app.form_state = None;
+            app.screen = Screen::List;
+        }
+        KeyCode::Tab | KeyCode::Down => form.next_field(),
+        KeyCode::BackTab | KeyCode::Up => form.prev_field(),
+        KeyCode::Left if form.focused == 4 => form.cycle_env_left(),
+        KeyCode::Right if form.focused == 4 => form.cycle_env_right(),
+        KeyCode::Backspace => form.delete_char(),
+        KeyCode::Enter => {
+            // Attempt to save
+            try_save_form(app);
+        }
+        KeyCode::Char(c) => form.insert_char(c),
+        _ => {}
+    }
+}
+
+/// Try to validate and save the form. On success, return to list. On failure, show error.
+fn try_save_form(app: &mut App) {
+    let Some(ref mut form) = app.form_state else {
+        return;
+    };
+
+    match form.validate_and_build(&app.config) {
+        Ok(bookmark) => {
+            let name = bookmark.name.clone();
+
+            match app.screen {
+                Screen::AddForm => {
+                    app.config.bookmarks.push(bookmark);
+                }
+                Screen::EditForm(idx) => {
+                    // Preserve last_connected and connect_count from the original
+                    let original = &app.config.bookmarks[idx];
+                    let mut updated = bookmark;
+                    updated.last_connected = original.last_connected;
+                    updated.connect_count = original.connect_count;
+                    app.config.bookmarks[idx] = updated;
+                }
+                _ => {}
+            }
+
+            // Save to disk
+            if let Err(e) = config::save(&app.config) {
+                app.set_status(format!("Error saving config: {e}"));
+            } else {
+                app.set_status(format!("Bookmark '{name}' saved"));
+            }
+
+            app.form_state = None;
+            app.screen = Screen::List;
+            app.refilter();
+        }
+        Err(e) => {
+            // Show validation error in the form
+            form.error = Some(e.to_string());
+        }
+    }
+}
+
+/// Handle key events in the delete confirmation dialog.
+fn handle_confirm_key(app: &mut App, key: KeyEvent) {
+    let Some(ref mut state) = app.confirm_state else {
+        app.screen = Screen::List;
+        return;
+    };
+
+    match key.code {
+        KeyCode::Esc => {
+            app.confirm_state = None;
+            app.screen = Screen::List;
+        }
+        KeyCode::Enter => {
+            if state.is_confirmed()
+                && let Screen::DeleteConfirm(idx) = app.screen
+            {
+                let name = app.config.bookmarks[idx].name.clone();
+                app.config.bookmarks.remove(idx);
+
+                if let Err(e) = config::save(&app.config) {
+                    app.set_status(format!("Error saving config: {e}"));
+                } else {
+                    app.set_status(format!("Bookmark '{name}' deleted"));
+                }
+
+                app.confirm_state = None;
+                app.screen = Screen::List;
+                app.refilter();
+            }
+        }
+        KeyCode::Backspace if state.is_production => {
+            state.delete_char();
+        }
+        KeyCode::Char(c) if state.is_production => {
+            state.insert_char(c);
+        }
         _ => {}
     }
 }
@@ -442,6 +572,8 @@ mod tests {
         assert_eq!(app.selected_index, 0);
         assert_eq!(app.screen, Screen::List);
         assert!(!app.search_active);
+        assert!(app.form_state.is_none());
+        assert!(app.confirm_state.is_none());
     }
 
     #[test]
@@ -508,7 +640,6 @@ mod tests {
         app.search_query = "web".to_string();
         app.refilter();
         assert!(!app.filtered_indices.is_empty());
-        // "prod-web-01" should be in results
         let names: Vec<&str> = app
             .filtered_indices
             .iter()
@@ -536,7 +667,7 @@ mod tests {
         app.selected_index = 4;
         app.env_filter = Some("production".to_string());
         app.refilter();
-        assert_eq!(app.selected_index, 0); // Clamped to 0 (only 1 result)
+        assert_eq!(app.selected_index, 0);
     }
 
     #[test]
@@ -560,7 +691,84 @@ mod tests {
     fn test_move_selection_with_empty_list() {
         let config = AppConfig::default();
         let mut app = App::new(config);
-        move_selection(&mut app, 1); // Should not panic
+        move_selection(&mut app, 1);
         assert_eq!(app.selected_index, 0);
+    }
+
+    #[test]
+    fn test_selected_bookmark_index() {
+        let app = sample_app();
+        assert!(app.selected_bookmark_index().is_some());
+
+        let empty_app = App::new(AppConfig::default());
+        assert!(empty_app.selected_bookmark_index().is_none());
+    }
+
+    #[test]
+    fn test_open_add_form() {
+        let mut app = sample_app();
+        app.form_state = Some(FormState::new_add(&app.config.settings));
+        app.screen = Screen::AddForm;
+        assert!(app.form_state.is_some());
+        assert_eq!(app.screen, Screen::AddForm);
+    }
+
+    #[test]
+    fn test_open_edit_form() {
+        let mut app = sample_app();
+        if let Some(idx) = app.selected_bookmark_index() {
+            let bookmark = app.config.bookmarks[idx].clone();
+            app.form_state = Some(FormState::new_edit(&bookmark));
+            app.screen = Screen::EditForm(idx);
+            assert!(app.form_state.is_some());
+        }
+    }
+
+    #[test]
+    fn test_open_delete_confirm() {
+        let mut app = sample_app();
+        if let Some(idx) = app.selected_bookmark_index() {
+            let bookmark = &app.config.bookmarks[idx];
+            app.confirm_state = Some(ConfirmState::new(bookmark));
+            app.screen = Screen::DeleteConfirm(idx);
+            assert!(app.confirm_state.is_some());
+        }
+    }
+
+    #[test]
+    fn test_delete_bookmark_from_app() {
+        let mut app = sample_app();
+        let initial_count = app.config.bookmarks.len();
+
+        // Delete the first bookmark
+        app.config.bookmarks.remove(0);
+        app.refilter();
+
+        assert_eq!(app.config.bookmarks.len(), initial_count - 1);
+    }
+
+    #[test]
+    fn test_add_bookmark_to_app() {
+        let mut app = sample_app();
+        let initial_count = app.config.bookmarks.len();
+
+        let new_bookmark = Bookmark {
+            name: "new-server".into(),
+            host: "10.0.5.1".into(),
+            user: None,
+            port: 22,
+            env: "development".into(),
+            tags: vec![],
+            identity_file: None,
+            proxy_jump: None,
+            notes: None,
+            last_connected: None,
+            connect_count: 0,
+        };
+        app.config.bookmarks.push(new_bookmark);
+        app.refilter();
+
+        assert_eq!(app.config.bookmarks.len(), initial_count + 1);
+        assert!(app.config.bookmarks.iter().any(|b| b.name == "new-server"));
     }
 }

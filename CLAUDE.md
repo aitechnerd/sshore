@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project
 
-sshore — Terminal-native SSH connection manager with environment-aware safety, built in Rust. Manages SSH bookmarks with color-coded environment tiers (production/staging/development/local/testing), interactive TUI, native SSH via `russh`, sudo password assist, SFTP/SCP shortcuts with resumable transfers, dual-pane TUI file browser (mc-style), persistent tunnels, per-bookmark snippets, quick remote exec, config export, known_hosts verification, ad-hoc connect with save-as-bookmark, cross-machine config sync, and a `StorageBackend` trait for future S3/cloud support.
+sshore — Terminal-native SSH connection manager with environment-aware safety, built in Rust. Manages SSH bookmarks with color-coded environment tiers (production/staging/development/local/testing), interactive TUI, native SSH via `russh`, sudo password assist, SFTP/SCP shortcuts with resumable transfers, dual-pane TUI file browser (mc-style), persistent tunnels, per-bookmark snippets, quick remote exec, config export, known_hosts verification, ad-hoc connect with save-as-bookmark, cross-machine config sync, multi-source import (ssh_config, PuTTY, MobaXterm, Tabby, SecureCRT, CSV/JSON), and a `StorageBackend` trait for future S3/cloud support.
 
 See `CLAUDE.local.md` for the implementation plan (phase files, project overview, Cargo.toml spec). Follow phases in order.
 
@@ -27,6 +27,8 @@ cargo run -- connect user@10.0.1.50        # ad-hoc connect without bookmark
 cargo run -- browse prod-web-01            # dual-pane file browser
 cargo run -- browse prod-web-01:/var/log   # browse starting at specific path
 cargo run -- --config ~/sync/sshore.toml list  # use custom config path
+cargo run -- import --from putty sessions.reg  # import PuTTY sessions
+cargo run -- import --from csv hosts.csv --env staging  # CSV import with env override
 
 # Install locally
 cargo install --path .

@@ -1,15 +1,16 @@
 mod cli;
 mod config;
+mod keychain;
 mod ssh;
 mod tui;
 
-use std::io;
+use std::io::{self, Write};
 use std::path::PathBuf;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use clap::{CommandFactory, Parser};
 
-use cli::{Cli, Commands};
+use cli::{Cli, Commands, PasswordAction};
 use config::model::Bookmark;
 use config::ssh_import::{merge_imports, parse_ssh_config};
 
@@ -45,8 +46,8 @@ async fn main() -> Result<()> {
         Some(Commands::Completions { shell }) => {
             cmd_completions(shell);
         }
-        Some(Commands::Password { .. }) => {
-            eprintln!("Not yet implemented (Phase 5)");
+        Some(Commands::Password { action }) => {
+            cmd_password(action)?;
         }
         Some(Commands::Sftp { .. }) => {
             eprintln!("Not yet implemented (Phase 6)");
@@ -176,6 +177,118 @@ async fn cmd_connect(name: &str) -> Result<()> {
         })?;
 
     ssh::connect(&mut app_config, bookmark_index).await
+}
+
+/// Manage stored passwords in OS keychain.
+fn cmd_password(action: PasswordAction) -> Result<()> {
+    match action {
+        PasswordAction::Set { bookmark } => cmd_password_set(&bookmark),
+        PasswordAction::Remove { bookmark } => cmd_password_remove(&bookmark),
+        PasswordAction::List => cmd_password_list(),
+    }
+}
+
+/// Store a password for a bookmark in the OS keychain.
+fn cmd_password_set(bookmark_name: &str) -> Result<()> {
+    let app_config = config::load().context("Failed to load config")?;
+
+    let bookmark = app_config
+        .bookmarks
+        .iter()
+        .find(|b| b.name.eq_ignore_ascii_case(bookmark_name))
+        .with_context(|| {
+            format!(
+                "No bookmark named '{bookmark_name}'. Use `sshore list` to see available bookmarks."
+            )
+        })?;
+
+    // Warn for production environments
+    if bookmark.env.eq_ignore_ascii_case("production") {
+        eprint!("Warning: storing a password for a PRODUCTION bookmark. Continue? [y/N] ");
+        io::stderr().flush()?;
+        let mut answer = String::new();
+        io::stdin().read_line(&mut answer)?;
+        if !answer.trim().eq_ignore_ascii_case("y") {
+            println!("Cancelled.");
+            return Ok(());
+        }
+    }
+
+    let password = read_password_from_tty("Password: ")?;
+    keychain::set_password(&bookmark.name, &password)?;
+    println!("Password stored for '{}'.", bookmark.name);
+
+    Ok(())
+}
+
+/// Remove a stored password for a bookmark from the OS keychain.
+fn cmd_password_remove(bookmark_name: &str) -> Result<()> {
+    let deleted = keychain::delete_password(bookmark_name)?;
+    if deleted {
+        println!("Password removed for '{bookmark_name}'.");
+    } else {
+        println!("No stored password for '{bookmark_name}'.");
+    }
+    Ok(())
+}
+
+/// List bookmarks that have stored passwords.
+fn cmd_password_list() -> Result<()> {
+    let app_config = config::load().context("Failed to load config")?;
+    let names = keychain::list_passwords(&app_config.bookmarks);
+
+    if names.is_empty() {
+        println!("No stored passwords.");
+        return Ok(());
+    }
+
+    println!("  {:<20} ENV", "BOOKMARK");
+    println!("  {}", "-".repeat(32));
+
+    for name in &names {
+        let env = app_config
+            .bookmarks
+            .iter()
+            .find(|b| b.name == *name)
+            .map(|b| b.env.as_str())
+            .unwrap_or("-");
+        let env_display = if env.is_empty() { "-" } else { env };
+        println!("  {:<20} {}", name, env_display);
+    }
+
+    println!("\n  {} password(s)", names.len());
+
+    Ok(())
+}
+
+/// Read a password from the terminal without echoing characters.
+fn read_password_from_tty(prompt: &str) -> Result<String> {
+    eprint!("{prompt}");
+    io::stderr().flush()?;
+
+    crossterm::terminal::enable_raw_mode()?;
+    let mut password = String::new();
+    loop {
+        if let crossterm::event::Event::Key(key) = crossterm::event::read()? {
+            match key.code {
+                crossterm::event::KeyCode::Enter => break,
+                crossterm::event::KeyCode::Char(c) => password.push(c),
+                crossterm::event::KeyCode::Backspace => {
+                    password.pop();
+                }
+                crossterm::event::KeyCode::Esc => {
+                    crossterm::terminal::disable_raw_mode()?;
+                    eprintln!();
+                    bail!("Cancelled");
+                }
+                _ => {}
+            }
+        }
+    }
+    crossterm::terminal::disable_raw_mode()?;
+    eprintln!(); // Newline after password entry
+
+    Ok(password)
 }
 
 /// Generate shell completions to stdout.

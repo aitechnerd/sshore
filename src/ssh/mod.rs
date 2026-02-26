@@ -1,4 +1,5 @@
 pub mod client;
+pub mod password;
 pub mod terminal_theme;
 
 use std::io::Write;
@@ -14,8 +15,10 @@ use tokio::io::AsyncReadExt;
 
 use crate::config;
 use crate::config::model::{AppConfig, Bookmark};
+use crate::keychain;
 
 use self::client::SshoreHandler;
+use self::password::PasswordDetector;
 
 /// Default SSH key filenames to try, in priority order.
 const DEFAULT_KEY_NAMES: &[&str] = &["id_ed25519", "id_rsa", "id_ecdsa"];
@@ -88,8 +91,16 @@ pub async fn connect(config: &mut AppConfig, bookmark_index: usize) -> Result<()
         .await
         .context("Failed to request shell")?;
 
+    // Check keychain for stored password and create detector
+    let bookmark_name = &config.bookmarks[bookmark_index].name;
+    let stored_password = keychain::get_password(bookmark_name).unwrap_or_else(|e| {
+        eprintln!("Warning: failed to read keychain: {e}");
+        None
+    });
+    let detector = PasswordDetector::new(stored_password.is_some());
+
     // Run the interactive proxy loop
-    run_proxy_loop(channel).await?;
+    run_proxy_loop(channel, detector, stored_password).await?;
 
     // Update bookmark stats
     config.bookmarks[bookmark_index].last_connected = Some(Utc::now());
@@ -196,9 +207,18 @@ fn prompt_password(user: &str) -> Result<String> {
     Ok(password)
 }
 
+/// Capacity for the stdin mpsc channel.
+const STDIN_CHANNEL_SIZE: usize = 64;
+
 /// Run the interactive terminal proxy loop.
-/// Forwards stdin -> SSH channel and SSH channel -> stdout.
-async fn run_proxy_loop(channel: russh::Channel<russh::client::Msg>) -> Result<()> {
+/// Routes stdin through the main `tokio::select!` loop to enable password injection
+/// without race conditions. When a password prompt is detected in SSH output,
+/// the user can press Enter to inject the stored password or Esc to skip.
+async fn run_proxy_loop(
+    channel: russh::Channel<russh::client::Msg>,
+    mut detector: PasswordDetector,
+    stored_password: Option<String>,
+) -> Result<()> {
     // Put terminal in raw mode with cleanup guard
     crossterm::terminal::enable_raw_mode().context("Failed to enable raw mode")?;
     let _guard = TerminalGuard;
@@ -206,31 +226,67 @@ async fn run_proxy_loop(channel: russh::Channel<russh::client::Msg>) -> Result<(
     let (mut channel_rx, channel_tx) = channel.split();
 
     // Create a writer for stdin forwarding (clones the internal sender)
-    let writer = channel_tx.make_writer();
+    let mut writer = channel_tx.make_writer();
 
-    // Spawn stdin -> channel task
-    let stdin_handle = tokio::spawn(forward_stdin(writer));
+    // Stdin flows through an mpsc channel so the main loop controls forwarding
+    let (stdin_tx, mut stdin_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(STDIN_CHANNEL_SIZE);
+
+    // Spawn stdin reader — sends raw bytes to the mpsc channel
+    let stdin_handle = tokio::spawn(read_stdin(stdin_tx));
 
     // Spawn resize handler (takes ownership of write half)
     let resize_handle = tokio::spawn(handle_resize(channel_tx));
 
-    // Main loop: channel -> stdout
     let mut stdout = std::io::stdout();
+    let mut awaiting_confirm = false;
+
     loop {
-        match channel_rx.wait().await {
-            Some(ChannelMsg::Data { data }) => {
-                stdout.write_all(&data)?;
-                stdout.flush()?;
+        tokio::select! {
+            msg = channel_rx.wait() => {
+                match msg {
+                    Some(ChannelMsg::Data { ref data }) => {
+                        stdout.write_all(data)?;
+                        stdout.flush()?;
+
+                        // Feed data to password detector
+                        if !awaiting_confirm && detector.feed(data) {
+                            awaiting_confirm = true;
+                            let mut stderr = std::io::stderr();
+                            let _ = write!(stderr, "\r\n[sshore] Password found in keychain. Press Enter to auto-fill, Esc to skip.\r\n");
+                            let _ = stderr.flush();
+                        }
+                    }
+                    Some(ChannelMsg::ExtendedData { data, ext: 1 }) => {
+                        std::io::stderr().write_all(&data)?;
+                        std::io::stderr().flush()?;
+                    }
+                    Some(ChannelMsg::ExitStatus { .. }) => break,
+                    Some(ChannelMsg::Eof | ChannelMsg::Close) => break,
+                    Some(_) => {}
+                    None => break,
+                }
             }
-            Some(ChannelMsg::ExtendedData { data, ext: 1 }) => {
-                // stderr
-                std::io::stderr().write_all(&data)?;
-                std::io::stderr().flush()?;
+            Some(bytes) = stdin_rx.recv() => {
+                if awaiting_confirm {
+                    // Enter (0x0d) — inject the stored password
+                    // Any other key — skip injection
+                    // Don't forward the decision keystroke to the remote
+                    if bytes.first() == Some(&0x0d)
+                        && let Some(ref pw) = stored_password
+                    {
+                        let mut payload = pw.as_bytes().to_vec();
+                        payload.push(b'\n');
+                        let _ = tokio::io::AsyncWriteExt::write_all(&mut writer, &payload).await;
+                    }
+                    awaiting_confirm = false;
+                    detector.clear();
+                } else {
+                    // Normal mode: forward stdin to SSH channel
+                    if tokio::io::AsyncWriteExt::write_all(&mut writer, &bytes).await.is_err() {
+                        break;
+                    }
+                }
             }
-            Some(ChannelMsg::ExitStatus { .. }) => break,
-            Some(ChannelMsg::Eof | ChannelMsg::Close) => break,
-            Some(_) => {}  // Ignore other messages
-            None => break, // Channel closed
         }
     }
 
@@ -241,18 +297,16 @@ async fn run_proxy_loop(channel: russh::Channel<russh::client::Msg>) -> Result<(
     Ok(())
 }
 
-/// Forward stdin to the SSH channel writer.
-async fn forward_stdin(mut writer: impl tokio::io::AsyncWrite + Unpin) {
+/// Read raw bytes from stdin and send to an mpsc channel.
+/// Runs as a spawned task so the main loop can process stdin through `tokio::select!`.
+async fn read_stdin(tx: tokio::sync::mpsc::Sender<Vec<u8>>) {
     let mut stdin = tokio::io::stdin();
     let mut buf = [0u8; 1024];
     loop {
         match stdin.read(&mut buf).await {
             Ok(0) => break,
             Ok(n) => {
-                if tokio::io::AsyncWriteExt::write_all(&mut writer, &buf[..n])
-                    .await
-                    .is_err()
-                {
+                if tx.send(buf[..n].to_vec()).await.is_err() {
                     break;
                 }
             }

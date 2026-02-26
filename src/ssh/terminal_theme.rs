@@ -5,7 +5,12 @@ use crate::config::model::{Bookmark, Settings};
 /// Apply terminal theming: set tab title and tab color based on bookmark environment.
 pub fn apply_theme(bookmark: &Bookmark, settings: &Settings) {
     let title = render_tab_title(&settings.tab_title_template, bookmark, settings);
-    set_tab_title(&title);
+    apply_theme_with_title(bookmark, settings, &title);
+}
+
+/// Apply terminal theming with a custom tab title.
+pub fn apply_theme_with_title(bookmark: &Bookmark, settings: &Settings, title: &str) {
+    set_tab_title(title);
 
     if let Some(env_color) = settings.env_colors.get(&bookmark.env) {
         set_tab_color(&env_color.bg);

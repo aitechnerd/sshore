@@ -1,6 +1,7 @@
 mod cli;
 mod config;
 mod keychain;
+mod sftp;
 mod ssh;
 mod tui;
 
@@ -49,11 +50,14 @@ async fn main() -> Result<()> {
         Some(Commands::Password { action }) => {
             cmd_password(action)?;
         }
-        Some(Commands::Sftp { .. }) => {
-            eprintln!("Not yet implemented (Phase 6)");
+        Some(Commands::Sftp { bookmark }) => {
+            cmd_sftp(&bookmark).await?;
         }
-        Some(Commands::Scp { .. }) => {
-            eprintln!("Not yet implemented (Phase 6)");
+        Some(Commands::Scp {
+            source,
+            destination,
+        }) => {
+            cmd_scp(&source, &destination).await?;
         }
         Some(Commands::Tunnel { .. }) => {
             eprintln!("Not yet implemented (Phase 7)");
@@ -164,19 +168,35 @@ fn cmd_list(env_filter: Option<String>) -> Result<()> {
     Ok(())
 }
 
-/// Connect to a bookmark by name directly (no TUI).
-async fn cmd_connect(name: &str) -> Result<()> {
-    let mut app_config = config::load().context("Failed to load config")?;
-
-    let bookmark_index = app_config
+/// Find a bookmark by name and return its index.
+fn find_bookmark_index(config: &config::model::AppConfig, name: &str) -> Result<usize> {
+    config
         .bookmarks
         .iter()
         .position(|b| b.name.eq_ignore_ascii_case(name))
         .with_context(|| {
             format!("No bookmark named '{name}'. Use `sshore list` to see available bookmarks.")
-        })?;
+        })
+}
 
-    ssh::connect(&mut app_config, bookmark_index).await
+/// Connect to a bookmark by name directly (no TUI).
+async fn cmd_connect(name: &str) -> Result<()> {
+    let mut app_config = config::load().context("Failed to load config")?;
+    let index = find_bookmark_index(&app_config, name)?;
+    ssh::connect(&mut app_config, index).await
+}
+
+/// Open an interactive SFTP session to a bookmark.
+async fn cmd_sftp(name: &str) -> Result<()> {
+    let config = config::load().context("Failed to load config")?;
+    let index = find_bookmark_index(&config, name)?;
+    sftp::open_session(&config, index).await
+}
+
+/// Copy files to/from a remote server (SCP-style).
+async fn cmd_scp(source: &str, destination: &str) -> Result<()> {
+    let config = config::load().context("Failed to load config")?;
+    sftp::shortcuts::scp_transfer(&config, source, destination).await
 }
 
 /// Manage stored passwords in OS keychain.

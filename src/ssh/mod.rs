@@ -37,9 +37,12 @@ impl Drop for TerminalGuard {
     }
 }
 
-/// Connect to a bookmark and run an interactive SSH session.
-/// Updates last_connected/connect_count after a successful session.
-pub async fn connect(config: &mut AppConfig, bookmark_index: usize) -> Result<()> {
+/// Establish an authenticated SSH session to a bookmark.
+/// Returns the session handle for opening channels (shell, SFTP, etc.).
+pub async fn establish_session(
+    config: &AppConfig,
+    bookmark_index: usize,
+) -> Result<russh::client::Handle<SshoreHandler>> {
     let bookmark = &config.bookmarks[bookmark_index];
     let settings = &config.settings;
 
@@ -68,6 +71,14 @@ pub async fn connect(config: &mut AppConfig, bookmark_index: usize) -> Result<()
     if !authenticated {
         bail!("Authentication failed for {user}@{host}:{port}");
     }
+
+    Ok(session)
+}
+
+/// Connect to a bookmark and run an interactive SSH session.
+/// Updates last_connected/connect_count after a successful session.
+pub async fn connect(config: &mut AppConfig, bookmark_index: usize) -> Result<()> {
+    let session = establish_session(config, bookmark_index).await?;
 
     // Apply terminal theming
     terminal_theme::apply_theme(&config.bookmarks[bookmark_index], &config.settings);

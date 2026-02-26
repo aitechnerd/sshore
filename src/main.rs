@@ -15,6 +15,28 @@ use cli::{Cli, Commands, PasswordAction, TunnelAction};
 use config::model::Bookmark;
 use config::ssh_import::{merge_imports, parse_ssh_config};
 
+/// Terminate a process by PID. Returns `true` if the signal was sent successfully.
+#[cfg(unix)]
+fn terminate_process(pid: u32) -> bool {
+    std::process::Command::new("kill")
+        .arg(pid.to_string())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success())
+}
+
+/// Terminate a process by PID (Windows variant). Returns `true` if the process was killed.
+#[cfg(windows)]
+fn terminate_process(pid: u32) -> bool {
+    std::process::Command::new("taskkill")
+        .args(["/PID", &pid.to_string(), "/F"])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success())
+}
+
 /// Default SSH config path (~/.ssh/config).
 fn default_ssh_config_path() -> PathBuf {
     dirs::home_dir()
@@ -416,20 +438,11 @@ fn cmd_tunnel_stop(bookmark_name: &str) -> Result<()> {
 
     let pid = entry.pid;
 
-    // Send SIGTERM to the tunnel process
-    let kill_result = std::process::Command::new("kill")
-        .arg(pid.to_string())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status();
-
-    match kill_result {
-        Ok(status) if status.success() => {
-            println!("Stopped tunnel for '{bookmark_name}' (PID {pid}).");
-        }
-        _ => {
-            eprintln!("Warning: failed to send signal to PID {pid}, removing stale entry.");
-        }
+    // Terminate the tunnel process
+    if terminate_process(pid) {
+        println!("Stopped tunnel for '{bookmark_name}' (PID {pid}).");
+    } else {
+        eprintln!("Warning: failed to send signal to PID {pid}, removing stale entry.");
     }
 
     // Remove from state file

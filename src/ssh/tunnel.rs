@@ -268,6 +268,7 @@ pub fn update_tunnel_status(
 }
 
 /// Check if a process with the given PID is alive.
+#[cfg(unix)]
 pub fn is_process_alive(pid: u32) -> bool {
     Command::new("kill")
         .args(["-0", &pid.to_string()])
@@ -275,6 +276,17 @@ pub fn is_process_alive(pid: u32) -> bool {
         .stderr(std::process::Stdio::null())
         .status()
         .is_ok_and(|s| s.success())
+}
+
+/// Check if a process with the given PID is alive (Windows variant).
+#[cfg(windows)]
+pub fn is_process_alive(pid: u32) -> bool {
+    Command::new("tasklist")
+        .args(["/FI", &format!("PID eq {pid}"), "/NH"])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .output()
+        .is_ok_and(|output| String::from_utf8_lossy(&output.stdout).contains(&pid.to_string()))
 }
 
 /// Remove tunnel entries whose PIDs are no longer alive.

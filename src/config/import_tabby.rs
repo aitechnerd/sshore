@@ -4,7 +4,7 @@ use anyhow::{Context, Result};
 use serde::Deserialize;
 
 use crate::config::env::detect_env;
-use crate::config::model::Bookmark;
+use crate::config::model::{Bookmark, sanitize_bookmark_name, validate_hostname};
 
 #[derive(Deserialize)]
 struct TabbyConfig {
@@ -46,12 +46,24 @@ pub fn parse_tabby_config(
     let config: TabbyConfig =
         serde_yaml::from_str(content).context("Failed to parse Tabby config.yaml")?;
 
-    // Filter to SSH profiles with a host
+    // Filter to SSH profiles with a valid host
     let ssh_profiles: Vec<&TabbyProfile> = config
         .profiles
         .iter()
         .filter(|p| p.profile_type.as_deref() == Some("ssh"))
         .filter(|p| p.options.host.is_some())
+        .filter(|p| {
+            let host = p.options.host.as_deref().unwrap_or("");
+            if validate_hostname(host).is_err() {
+                eprintln!(
+                    "Warning: skipping Tabby profile {:?}: invalid hostname '{}'",
+                    p.name.as_deref().unwrap_or("unnamed"),
+                    host
+                );
+                return false;
+            }
+            true
+        })
         .collect();
 
     if ssh_profiles.is_empty() {
@@ -99,36 +111,6 @@ fn resolve_jump_hosts(profiles: &[&TabbyProfile]) -> HashMap<String, String> {
     }
 
     jump_map
-}
-
-/// Sanitize a name for use as a bookmark name.
-fn sanitize_bookmark_name(name: &str) -> String {
-    let sanitized: String = name
-        .chars()
-        .map(|c| {
-            if c.is_alphanumeric() || c == '-' || c == '_' || c == '.' {
-                c
-            } else {
-                '-'
-            }
-        })
-        .collect();
-
-    let mut result = String::with_capacity(sanitized.len());
-    let mut prev_hyphen = false;
-    for c in sanitized.chars() {
-        if c == '-' {
-            if !prev_hyphen {
-                result.push(c);
-            }
-            prev_hyphen = true;
-        } else {
-            result.push(c);
-            prev_hyphen = false;
-        }
-    }
-
-    result.trim_matches('-').to_string()
 }
 
 /// Convert a Tabby profile to a sshore Bookmark.

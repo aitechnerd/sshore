@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use anyhow::{Context, Result};
 
 use crate::config::env::detect_env;
-use crate::config::model::Bookmark;
+use crate::config::model::{Bookmark, sanitize_bookmark_name, validate_hostname};
 
 /// Parse a CSV file into sshore bookmarks.
 ///
@@ -73,6 +73,11 @@ pub fn parse_csv(
             None => continue, // Skip rows with empty host
         };
 
+        if validate_hostname(&host).is_err() {
+            eprintln!("Warning: skipping CSV row {}: invalid hostname '{}'", row_idx + 2, host);
+            continue;
+        }
+
         let mut tags: Vec<String> = get(tags_col)
             .map(|t| {
                 t.split(',')
@@ -113,36 +118,6 @@ pub fn parse_csv(
     }
 
     Ok(bookmarks)
-}
-
-/// Sanitize a name for use as a bookmark name.
-fn sanitize_bookmark_name(name: &str) -> String {
-    let sanitized: String = name
-        .chars()
-        .map(|c| {
-            if c.is_alphanumeric() || c == '-' || c == '_' || c == '.' {
-                c
-            } else {
-                '-'
-            }
-        })
-        .collect();
-
-    let mut result = String::with_capacity(sanitized.len());
-    let mut prev_hyphen = false;
-    for c in sanitized.chars() {
-        if c == '-' {
-            if !prev_hyphen {
-                result.push(c);
-            }
-            prev_hyphen = true;
-        } else {
-            result.push(c);
-            prev_hyphen = false;
-        }
-    }
-
-    result.trim_matches('-').to_string()
 }
 
 #[cfg(test)]
@@ -253,5 +228,14 @@ mod tests {
         let csv = "name,host\nmyserver,example.com\n";
         let bookmarks = parse_csv(csv, None, &[]).unwrap();
         assert_eq!(bookmarks[0].port, 22);
+    }
+
+    #[test]
+    fn test_skip_hostname_with_shell_metacharacters() {
+        let csv = "name,host\ngood,example.com\nbad,host;rm -rf /\nalso-bad,host|evil\nfine,10.0.1.5\n";
+        let bookmarks = parse_csv(csv, None, &[]).unwrap();
+        assert_eq!(bookmarks.len(), 2);
+        assert_eq!(bookmarks[0].host, "example.com");
+        assert_eq!(bookmarks[1].host, "10.0.1.5");
     }
 }

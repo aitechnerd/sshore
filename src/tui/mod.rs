@@ -183,15 +183,10 @@ fn leave_tui(terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>) -> Resu
 
 /// Launch the TUI, blocking until the user quits.
 /// Loops: TUI -> SSH connect -> TUI, allowing repeated connections.
+///
+/// Terminal cleanup on panic is handled by `setup_panic_hook()` in main.rs,
+/// which covers raw mode, alternate screen, cursor, colors, and SSH theming.
 pub async fn run(config: &mut AppConfig, cfg_override: Option<&str>) -> Result<()> {
-    // Install panic hook that restores terminal state
-    let original_hook = std::panic::take_hook();
-    std::panic::set_hook(Box::new(move |info| {
-        let _ = terminal::disable_raw_mode();
-        let _ = execute!(std::io::stdout(), LeaveAlternateScreen);
-        original_hook(info);
-    }));
-
     let mut app = App::new(config.clone()).with_config_override(cfg_override);
 
     loop {

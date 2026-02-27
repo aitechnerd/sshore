@@ -1,7 +1,3 @@
-// Validation functions and identity_file resolution are used in tests now
-// and will be called from TUI form validation in Phase 3.
-#![allow(dead_code)]
-
 use std::collections::HashMap;
 
 use anyhow::{Result, anyhow, bail};
@@ -218,6 +214,7 @@ impl Bookmark {
 
 /// Expand shell variables and tilde in a string.
 /// Returns the original string unchanged if expansion fails (with a warning to stderr).
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn expand_path(input: &str) -> String {
     shellexpand::full(input)
         .map(|s| s.to_string())
@@ -261,6 +258,40 @@ pub fn validate_hostname(host: &str) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Sanitize a string for use as a bookmark name.
+///
+/// Replaces spaces and invalid characters with hyphens, collapses consecutive
+/// hyphens, and trims leading/trailing hyphens. Used by all importers.
+pub fn sanitize_bookmark_name(name: &str) -> String {
+    let sanitized: String = name
+        .chars()
+        .map(|c| {
+            if c.is_alphanumeric() || BOOKMARK_NAME_EXTRA_CHARS.contains(&c) {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect();
+
+    // Collapse consecutive hyphens
+    let mut result = String::with_capacity(sanitized.len());
+    let mut prev_hyphen = false;
+    for c in sanitized.chars() {
+        if c == '-' {
+            if !prev_hyphen {
+                result.push(c);
+            }
+            prev_hyphen = true;
+        } else {
+            result.push(c);
+            prev_hyphen = false;
+        }
+    }
+
+    result.trim_matches('-').to_string()
 }
 
 fn default_port() -> u16 {
@@ -688,5 +719,19 @@ mod tests {
         assert_eq!(config.settings.snippet_trigger, "~~");
         assert_eq!(config.settings.on_connect_delay_ms, 200);
         assert!(config.settings.snippets.is_empty());
+    }
+
+    #[test]
+    fn test_sanitize_bookmark_name() {
+        assert_eq!(sanitize_bookmark_name("My Server"), "My-Server");
+        assert_eq!(sanitize_bookmark_name("server #1"), "server-1");
+        assert_eq!(sanitize_bookmark_name("  spaces  "), "spaces");
+        assert_eq!(sanitize_bookmark_name("a--b"), "a-b");
+        assert_eq!(
+            sanitize_bookmark_name("valid-name_01.test"),
+            "valid-name_01.test"
+        );
+        assert_eq!(sanitize_bookmark_name(""), "");
+        assert_eq!(sanitize_bookmark_name("---"), "");
     }
 }

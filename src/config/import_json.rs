@@ -4,7 +4,7 @@ use anyhow::Result;
 use serde::Deserialize;
 
 use crate::config::env::detect_env;
-use crate::config::model::Bookmark;
+use crate::config::model::{Bookmark, sanitize_bookmark_name, validate_hostname};
 
 /// A JSON bookmark with flexible/optional fields.
 /// Missing fields get sensible defaults.
@@ -88,6 +88,11 @@ fn json_to_bookmark(
         return None;
     }
 
+    if validate_hostname(&host).is_err() {
+        eprintln!("Warning: skipping JSON bookmark '{}': invalid hostname '{}'", name, host);
+        return None;
+    }
+
     let env = env_override
         .map(String::from)
         .or(jb.env)
@@ -116,36 +121,6 @@ fn json_to_bookmark(
         ssh_options: HashMap::new(),
         connect_timeout_secs: None,
     })
-}
-
-/// Sanitize a name for use as a bookmark name.
-fn sanitize_bookmark_name(name: &str) -> String {
-    let sanitized: String = name
-        .chars()
-        .map(|c| {
-            if c.is_alphanumeric() || c == '-' || c == '_' || c == '.' {
-                c
-            } else {
-                '-'
-            }
-        })
-        .collect();
-
-    let mut result = String::with_capacity(sanitized.len());
-    let mut prev_hyphen = false;
-    for c in sanitized.chars() {
-        if c == '-' {
-            if !prev_hyphen {
-                result.push(c);
-            }
-            prev_hyphen = true;
-        } else {
-            result.push(c);
-            prev_hyphen = false;
-        }
-    }
-
-    result.trim_matches('-').to_string()
 }
 
 #[cfg(test)]
@@ -260,5 +235,19 @@ mod tests {
         assert!(bookmarks[0].tags.contains(&"web".to_string()));
         assert!(bookmarks[0].tags.contains(&"imported".to_string()));
         assert!(bookmarks[0].tags.contains(&"json-import".to_string()));
+    }
+
+    #[test]
+    fn test_skip_hostname_with_shell_metacharacters() {
+        let json = r#"[
+            {"name": "good", "host": "10.0.1.5"},
+            {"name": "bad", "host": "host;evil"},
+            {"name": "also-bad", "host": "$(whoami).evil.com"},
+            {"name": "fine", "host": "example.com"}
+        ]"#;
+        let bookmarks = parse_json_bookmarks(json, None, &[]).unwrap();
+        assert_eq!(bookmarks.len(), 2);
+        assert_eq!(bookmarks[0].host, "10.0.1.5");
+        assert_eq!(bookmarks[1].host, "example.com");
     }
 }

@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use anyhow::Result;
 
 use crate::config::env::detect_env;
-use crate::config::model::Bookmark;
+use crate::config::model::{Bookmark, sanitize_bookmark_name, validate_hostname};
 
 /// MobaXterm SSH session type identifier.
 const MOBA_SSH_TYPE: u16 = 109;
@@ -22,6 +22,13 @@ pub fn parse_mxtsessions(
 
     let bookmarks: Vec<Bookmark> = sessions
         .into_iter()
+        .filter(|s| {
+            if validate_hostname(&s.host).is_err() {
+                eprintln!("Warning: skipping MobaXterm session '{}': invalid hostname '{}'", s.name, s.host);
+                return false;
+            }
+            true
+        })
         .map(|s| session_to_bookmark(s, env_override, extra_tags))
         .collect();
 
@@ -117,37 +124,6 @@ fn parse_moba_packed(name: &str, packed: &str, folder: &str) -> Option<MobaSessi
         port,
         username,
     })
-}
-
-/// Sanitize a name for use as a bookmark name.
-fn sanitize_bookmark_name(name: &str) -> String {
-    let sanitized: String = name
-        .chars()
-        .map(|c| {
-            if c.is_alphanumeric() || c == '-' || c == '_' || c == '.' {
-                c
-            } else {
-                '-'
-            }
-        })
-        .collect();
-
-    // Collapse consecutive hyphens
-    let mut result = String::with_capacity(sanitized.len());
-    let mut prev_hyphen = false;
-    for c in sanitized.chars() {
-        if c == '-' {
-            if !prev_hyphen {
-                result.push(c);
-            }
-            prev_hyphen = true;
-        } else {
-            result.push(c);
-            prev_hyphen = false;
-        }
-    }
-
-    result.trim_matches('-').to_string()
 }
 
 /// Convert a MobaXterm session to a sshore Bookmark.

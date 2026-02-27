@@ -15,6 +15,7 @@ use russh::ChannelMsg;
 use russh::client::AuthResult;
 use russh::keys::PrivateKeyWithHashAlg;
 use tokio::io::AsyncReadExt;
+use zeroize::Zeroizing;
 
 use crate::config;
 use crate::config::model::{AppConfig, Bookmark};
@@ -333,12 +334,14 @@ pub async fn connect(
         .await
         .context("Failed to request shell")?;
 
-    // Check keychain for stored password and create detector
+    // Check keychain for stored password and create detector.
+    // Wrap in Zeroizing so password memory is wiped on drop.
     let bookmark_name = &config.bookmarks[bookmark_index].name;
-    let stored_password = keychain::get_password(bookmark_name).unwrap_or_else(|e| {
-        eprintln!("Warning: failed to read keychain: {e}");
-        None
-    });
+    let stored_password: Option<Zeroizing<String>> =
+        keychain::get_password(bookmark_name).unwrap_or_else(|e| {
+            eprintln!("Warning: failed to read keychain: {e}");
+            None
+        }).map(Zeroizing::new);
     let detector = PasswordDetector::new(stored_password.is_some());
 
     // Send on_connect command if configured
@@ -705,7 +708,7 @@ async fn setup_ssh_signal_handlers() -> Result<tokio::sync::watch::Receiver<bool
 async fn run_proxy_loop(
     channel: russh::Channel<russh::client::Msg>,
     mut detector: PasswordDetector,
-    stored_password: Option<String>,
+    stored_password: Option<Zeroizing<String>>,
     bookmark_snippets: Vec<crate::config::model::Snippet>,
     global_snippets: Vec<crate::config::model::Snippet>,
     snippet_trigger: String,
@@ -792,9 +795,10 @@ async fn run_proxy_loop(
                     if bytes.first() == Some(&0x0d)
                         && let Some(ref pw) = stored_password
                     {
-                        let mut payload = pw.as_bytes().to_vec();
+                        let mut payload = Zeroizing::new(pw.as_bytes().to_vec());
                         payload.push(b'\n');
                         let _ = tokio::io::AsyncWriteExt::write_all(&mut writer, &payload).await;
+                        // payload is zeroed on drop via Zeroizing
                     }
                     awaiting_confirm = false;
                     detector.clear();

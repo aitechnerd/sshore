@@ -5,7 +5,7 @@ use quick_xml::Reader;
 use quick_xml::events::Event;
 
 use crate::config::env::detect_env;
-use crate::config::model::Bookmark;
+use crate::config::model::{Bookmark, sanitize_bookmark_name, validate_hostname};
 
 /// A parsed SecureCRT session from XML export.
 #[derive(Debug, Default)]
@@ -34,6 +34,13 @@ pub fn parse_securecrt_xml(
     let bookmarks: Vec<Bookmark> = sessions
         .into_iter()
         .filter(|s| !s.hostname.is_empty())
+        .filter(|s| {
+            if validate_hostname(&s.hostname).is_err() {
+                eprintln!("Warning: skipping SecureCRT session '{}': invalid hostname '{}'", s.name, s.hostname);
+                return false;
+            }
+            true
+        })
         .map(|s| session_to_bookmark(s, env_override, extra_tags))
         .collect();
 
@@ -184,36 +191,6 @@ fn parse_hex_or_decimal(s: &str) -> Option<u32> {
 
 fn non_empty(s: String) -> Option<String> {
     if s.is_empty() { None } else { Some(s) }
-}
-
-/// Sanitize a name for use as a bookmark name.
-fn sanitize_bookmark_name(name: &str) -> String {
-    let sanitized: String = name
-        .chars()
-        .map(|c| {
-            if c.is_alphanumeric() || c == '-' || c == '_' || c == '.' {
-                c
-            } else {
-                '-'
-            }
-        })
-        .collect();
-
-    let mut result = String::with_capacity(sanitized.len());
-    let mut prev_hyphen = false;
-    for c in sanitized.chars() {
-        if c == '-' {
-            if !prev_hyphen {
-                result.push(c);
-            }
-            prev_hyphen = true;
-        } else {
-            result.push(c);
-            prev_hyphen = false;
-        }
-    }
-
-    result.trim_matches('-').to_string()
 }
 
 /// Convert a SecureCRT session to a sshore Bookmark.

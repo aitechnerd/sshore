@@ -15,6 +15,20 @@ use crate::storage::{Backend, FileEntry};
 /// Duration for TUI event poll.
 const POLL_RATE: Duration = Duration::from_millis(100);
 
+/// Drop guard that restores terminal state when the browser exits (normally or on error).
+struct BrowserGuard;
+
+impl Drop for BrowserGuard {
+    fn drop(&mut self) {
+        let _ = crossterm::terminal::disable_raw_mode();
+        let _ = crossterm::execute!(
+            std::io::stdout(),
+            crossterm::terminal::LeaveAlternateScreen,
+            crossterm::cursor::Show,
+        );
+    }
+}
+
 /// Which pane is active.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Side {
@@ -122,8 +136,9 @@ pub async fn run(
     env: &str,
     show_hidden: bool,
 ) -> Result<()> {
-    // Enter TUI mode
+    // Enter TUI mode — BrowserGuard ensures cleanup on any exit path
     crossterm::terminal::enable_raw_mode()?;
+    let _guard = BrowserGuard;
     let mut stdout = std::io::stdout();
     crossterm::execute!(
         stdout,
@@ -208,14 +223,7 @@ pub async fn run(
         }
     }
 
-    // Leave TUI mode
-    crossterm::terminal::disable_raw_mode()?;
-    crossterm::execute!(
-        terminal.backend_mut(),
-        crossterm::terminal::LeaveAlternateScreen,
-        crossterm::cursor::Show,
-    )?;
-
+    // BrowserGuard handles terminal cleanup on drop
     Ok(())
 }
 

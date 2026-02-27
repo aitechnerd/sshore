@@ -41,6 +41,44 @@ pub fn save_with_override(config: &AppConfig, custom_path: Option<&str>) -> Resu
     save_to(config, &path)
 }
 
+/// Atomically load, modify, and save the config with advisory file locking.
+///
+/// Prevents concurrent sshore instances from losing each other's changes
+/// during load→modify→save cycles (e.g., save-as-bookmark during an SSH session
+/// while another instance edits config via the TUI).
+pub fn locked_modify<T>(
+    custom_path: Option<&str>,
+    modify: impl FnOnce(&mut AppConfig) -> T,
+) -> Result<T> {
+    use fs2::FileExt;
+
+    let path = resolve_config_path(custom_path);
+    let lock_path = path.with_extension("lock");
+
+    // Ensure parent directory exists for the lock file
+    if let Some(parent) = lock_path.parent() {
+        fs::create_dir_all(parent).context("Failed to create config directory")?;
+    }
+
+    let lock_file = fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&lock_path)
+        .context("Failed to open config lock file")?;
+
+    lock_file
+        .lock_exclusive()
+        .context("Failed to acquire config file lock")?;
+
+    let mut config = load_from(&path)?;
+    let result = modify(&mut config);
+    save_to(&config, &path)?;
+
+    // Lock released when lock_file is dropped
+    Ok(result)
+}
+
 /// Resolve the effective config path from an optional override.
 fn resolve_config_path(custom_path: Option<&str>) -> PathBuf {
     match custom_path {
@@ -556,5 +594,55 @@ mod tests {
         let path = resolve_config_path(Some("~/my-sshore.toml"));
         assert!(!path.to_string_lossy().contains('~'));
         assert!(path.to_string_lossy().ends_with("my-sshore.toml"));
+    }
+
+    #[test]
+    fn test_locked_modify_basic() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let path_str = path.to_str().unwrap();
+
+        // Create initial config
+        let config = AppConfig::default();
+        save_to(&config, &path).unwrap();
+
+        // Modify under lock
+        let result = locked_modify(Some(path_str), |cfg| {
+            cfg.settings.default_user = Some("locked_user".into());
+            42
+        })
+        .unwrap();
+
+        assert_eq!(result, 42);
+
+        // Verify the change was persisted
+        let loaded = load_from(&path).unwrap();
+        assert_eq!(loaded.settings.default_user, Some("locked_user".into()));
+    }
+
+    #[test]
+    fn test_locked_modify_preserves_existing_bookmarks() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let path_str = path.to_str().unwrap();
+
+        // Create config with a bookmark
+        let mut config = AppConfig::default();
+        config
+            .bookmarks
+            .push(sample_bookmark("existing", "production", vec![]));
+        save_to(&config, &path).unwrap();
+
+        // Add another bookmark under lock
+        locked_modify(Some(path_str), |cfg| {
+            cfg.bookmarks
+                .push(sample_bookmark("new-bm", "staging", vec![]));
+        })
+        .unwrap();
+
+        let loaded = load_from(&path).unwrap();
+        assert_eq!(loaded.bookmarks.len(), 2);
+        assert_eq!(loaded.bookmarks[0].name, "existing");
+        assert_eq!(loaded.bookmarks[1].name, "new-bm");
     }
 }

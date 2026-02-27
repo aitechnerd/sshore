@@ -18,6 +18,40 @@ static PASSWORD_PATTERNS: LazyLock<Vec<Regex>> = LazyLock::new(|| {
     .collect()
 });
 
+/// Extract only valid UTF-8 from a byte slice, skipping invalid bytes.
+///
+/// Unlike `String::from_utf8_lossy`, this discards invalid bytes entirely
+/// rather than replacing them with U+FFFD, preventing binary data from
+/// producing false positive regex matches.
+fn extract_valid_utf8(data: &[u8]) -> String {
+    let mut result = String::new();
+    let mut remaining = data;
+    while !remaining.is_empty() {
+        match std::str::from_utf8(remaining) {
+            Ok(s) => {
+                result.push_str(s);
+                break;
+            }
+            Err(e) => {
+                let valid_up_to = e.valid_up_to();
+                if valid_up_to > 0 {
+                    // Safety: from_utf8 guarantees data[..valid_up_to] is valid UTF-8
+                    if let Ok(valid) = std::str::from_utf8(&remaining[..valid_up_to]) {
+                        result.push_str(valid);
+                    }
+                }
+                // Skip past the invalid byte(s)
+                let skip = match e.error_len() {
+                    Some(len) => valid_up_to + len,
+                    None => remaining.len(),
+                };
+                remaining = &remaining[skip..];
+            }
+        }
+    }
+    result
+}
+
 /// Detects password prompts in an SSH output stream using a rolling buffer.
 pub struct PasswordDetector {
     buffer: String,
@@ -41,8 +75,12 @@ impl PasswordDetector {
             return false;
         }
 
-        // Append valid UTF-8, replacing invalid sequences
-        let text = String::from_utf8_lossy(data);
+        // Only process valid UTF-8 portions, skipping invalid bytes to avoid
+        // false positives from replacement characters in binary data.
+        let text = extract_valid_utf8(data);
+        if text.is_empty() {
+            return false;
+        }
         self.buffer.push_str(&text);
 
         // Cap buffer size — keep only the tail
@@ -158,5 +196,28 @@ mod tests {
         let mut data = vec![0xFF, 0xFE];
         data.extend_from_slice(b"Password: ");
         assert!(d.feed(&data));
+    }
+
+    #[test]
+    fn test_pure_binary_data_no_false_positive() {
+        let mut d = PasswordDetector::new(true);
+        // Pure binary data should not trigger any match
+        let binary = vec![0xFF, 0xFE, 0x80, 0x81, 0x90, 0xA0, 0xB0, 0xC0];
+        assert!(!d.feed(&binary));
+    }
+
+    #[test]
+    fn test_extract_valid_utf8() {
+        // All valid
+        assert_eq!(extract_valid_utf8(b"hello"), "hello");
+        // Invalid prefix, valid suffix
+        assert_eq!(extract_valid_utf8(&[0xFF, b'h', b'i']), "hi");
+        // All invalid
+        assert_eq!(extract_valid_utf8(&[0xFF, 0xFE]), "");
+        // Mixed: valid, invalid, valid
+        let mut mixed = b"abc".to_vec();
+        mixed.push(0xFF);
+        mixed.extend_from_slice(b"def");
+        assert_eq!(extract_valid_utf8(&mixed), "abcdef");
     }
 }

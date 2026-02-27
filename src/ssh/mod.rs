@@ -835,23 +835,23 @@ async fn run_proxy_loop(
                                     &mut stdout,
                                     &session_info,
                                 ) {
-                                    // Load, merge, save
-                                    match config::load_with_override(cfg_override) {
-                                        Ok(mut app_config) => {
-                                            let bm_name = new_bookmark.name.clone();
-                                            if let Some(idx) = app_config.bookmarks.iter().position(|b| b.name == bm_name) {
-                                                app_config.bookmarks[idx] = new_bookmark;
-                                                let _ = write!(stdout, "\x1b[32mBookmark '{}' updated\x1b[0m\r\n", bm_name);
-                                            } else {
-                                                app_config.bookmarks.push(new_bookmark);
-                                                let _ = write!(stdout, "\x1b[32mBookmark '{}' saved\x1b[0m\r\n", bm_name);
-                                            }
-                                            if let Err(e) = config::save_with_override(&app_config, cfg_override) {
-                                                let _ = write!(stdout, "\x1b[31mError saving: {e}\x1b[0m\r\n");
-                                            }
+                                    // Load, merge, save with file locking to prevent
+                                    // concurrent sshore instances from losing changes
+                                    match config::locked_modify(cfg_override, |app_config| {
+                                        let bm_name = new_bookmark.name.clone();
+                                        if let Some(idx) = app_config.bookmarks.iter().position(|b| b.name == bm_name) {
+                                            app_config.bookmarks[idx] = new_bookmark;
+                                            format!("\x1b[32mBookmark '{bm_name}' updated\x1b[0m\r\n")
+                                        } else {
+                                            app_config.bookmarks.push(new_bookmark);
+                                            format!("\x1b[32mBookmark '{bm_name}' saved\x1b[0m\r\n")
+                                        }
+                                    }) {
+                                        Ok(msg) => {
+                                            let _ = write!(stdout, "{msg}");
                                         }
                                         Err(e) => {
-                                            let _ = write!(stdout, "\x1b[31mError loading config: {e}\x1b[0m\r\n");
+                                            let _ = write!(stdout, "\x1b[31mError saving bookmark: {e}\x1b[0m\r\n");
                                         }
                                     }
                                     let _ = stdout.flush();

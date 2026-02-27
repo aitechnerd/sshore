@@ -3,6 +3,7 @@ use std::path::PathBuf;
 
 use anyhow::{Context, Result};
 use base64::Engine;
+use hmac::{Hmac, Mac};
 use russh::keys::PublicKey;
 use sha2::{Digest, Sha256};
 
@@ -140,7 +141,10 @@ impl KnownHostEntry {
             if pattern == host_pattern {
                 return true;
             }
-            // Hashed hostnames (|1|salt|hash) — can't match without knowing the salt
+            // Hashed hostnames: |1|base64(salt)|base64(HMAC-SHA1(salt, hostname))
+            if check_hashed_host(pattern, host_pattern) == Some(true) {
+                return true;
+            }
         }
         false
     }
@@ -154,6 +158,33 @@ impl KnownHostEntry {
             false
         }
     }
+}
+
+/// Check if a hashed known_hosts pattern matches the given hostname.
+///
+/// OpenSSH hashed format: `|1|base64(salt)|base64(HMAC-SHA1(salt, hostname))`
+/// Returns `Some(true)` if matched, `Some(false)` if valid hash but no match,
+/// `None` if the pattern is not a hashed entry.
+fn check_hashed_host(stored_pattern: &str, host_to_check: &str) -> Option<bool> {
+    // Format: |1|salt_b64|hash_b64 → split by '|' gives ["", "1", "salt_b64", "hash_b64"]
+    let parts: Vec<&str> = stored_pattern.split('|').collect();
+    if parts.len() != 4 || !parts[0].is_empty() || parts[1] != "1" {
+        return None;
+    }
+
+    let salt = base64::engine::general_purpose::STANDARD
+        .decode(parts[2])
+        .ok()?;
+    let stored_hash = base64::engine::general_purpose::STANDARD
+        .decode(parts[3])
+        .ok()?;
+
+    type HmacSha1 = Hmac<sha1::Sha1>;
+    let mut mac = HmacSha1::new_from_slice(&salt).ok()?;
+    mac.update(host_to_check.as_bytes());
+    let computed = mac.finalize().into_bytes();
+
+    Some(computed.as_slice() == stored_hash.as_slice())
 }
 
 /// Parse a single known_hosts line into its components.
@@ -276,6 +307,73 @@ mod tests {
     fn test_known_hosts_path() {
         let path = known_hosts_path();
         assert!(path.ends_with(".ssh/known_hosts"));
+    }
+
+    #[test]
+    fn test_hashed_hostname_matching() {
+        // Generate a known HMAC-SHA1 hash for "example.com"
+        type HmacSha1 = Hmac<sha1::Sha1>;
+        let salt = b"test_salt_20_bytes!!";
+        let mut mac = HmacSha1::new_from_slice(salt).unwrap();
+        mac.update(b"example.com");
+        let hash = mac.finalize().into_bytes();
+
+        let salt_b64 = base64::engine::general_purpose::STANDARD.encode(salt);
+        let hash_b64 = base64::engine::general_purpose::STANDARD.encode(&hash);
+        let hashed_pattern = format!("|1|{salt_b64}|{hash_b64}");
+
+        let entry = KnownHostEntry {
+            host_patterns: vec![hashed_pattern],
+            _key_type: "ssh-ed25519".into(),
+            key_base64: "AAAA".into(),
+        };
+
+        assert!(entry.matches_host("example.com"));
+        assert!(!entry.matches_host("other.com"));
+    }
+
+    #[test]
+    fn test_hashed_hostname_non_standard_port() {
+        type HmacSha1 = Hmac<sha1::Sha1>;
+        let salt = b"another_salt_bytes!!";
+        let hostname = "[myhost.io]:2222";
+        let mut mac = HmacSha1::new_from_slice(salt).unwrap();
+        mac.update(hostname.as_bytes());
+        let hash = mac.finalize().into_bytes();
+
+        let salt_b64 = base64::engine::general_purpose::STANDARD.encode(salt);
+        let hash_b64 = base64::engine::general_purpose::STANDARD.encode(&hash);
+        let hashed_pattern = format!("|1|{salt_b64}|{hash_b64}");
+
+        let entry = KnownHostEntry {
+            host_patterns: vec![hashed_pattern],
+            _key_type: "ssh-rsa".into(),
+            key_base64: "AAAA".into(),
+        };
+
+        assert!(entry.matches_host("[myhost.io]:2222"));
+        assert!(!entry.matches_host("myhost.io"));
+    }
+
+    #[test]
+    fn test_hashed_pattern_not_confused_with_plain() {
+        // A non-hashed pattern that starts with | shouldn't be treated as hashed
+        let entry = KnownHostEntry {
+            host_patterns: vec!["|2|abc|def".into()], // Wrong version
+            _key_type: "ssh-ed25519".into(),
+            key_base64: "AAAA".into(),
+        };
+        // Should not match anything via hash check (version != 1)
+        assert!(!entry.matches_host("example.com"));
+    }
+
+    #[test]
+    fn test_parse_hashed_known_hosts_line() {
+        // Full line with hashed hostname
+        let line = "|1|c2FsdA==|aGFzaA== ssh-ed25519 AAAA";
+        let entry = parse_known_hosts_line(line).unwrap();
+        assert_eq!(entry.host_patterns.len(), 1);
+        assert!(entry.host_patterns[0].starts_with("|1|"));
     }
 
     #[test]

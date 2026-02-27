@@ -120,7 +120,10 @@ async fn open_sftp(config: &AppConfig, bookmark_name: &str) -> Result<(SftpSessi
 }
 
 /// Download a file from a remote server.
-/// If `resume` is true and a partial local file exists, seek to its end and continue.
+///
+/// Writes to a `.part` tempfile first and renames to the final path on success,
+/// preventing partial failures from leaving corrupted files at the target path.
+/// If `resume` is true and a partial `.part` file exists, seek to its end and continue.
 async fn download(
     config: &AppConfig,
     bookmark_name: &str,
@@ -143,49 +146,54 @@ async fn download(
         .await
         .with_context(|| format!("Failed to open {display_name}:{remote_path}"))?;
 
-    // Resume support: if local file exists and --resume was specified, seek past it
+    // Write to a .part file to avoid corrupting the final path on partial failure
+    let part_path = format!("{local_path}.part");
+
+    // Check if the final file is already complete
+    if resume
+        && let Ok(local_meta) = tokio::fs::metadata(local_path).await
+        && local_meta.len() >= total
+    {
+        eprintln!(
+            "Local file is already complete ({}).",
+            format_bytes(local_meta.len())
+        );
+        terminal_theme::reset_theme();
+        return Ok(());
+    }
+
+    // Resume support: check the .part file for a previous incomplete download
     let mut offset: u64 = 0;
     let mut local_file = if resume {
-        if let Ok(local_meta) = tokio::fs::metadata(local_path).await {
-            let local_size = local_meta.len();
-            if local_size > 0 && local_size < total {
-                eprintln!("Resuming from {}", format_bytes(local_size));
-                // Seek the remote file past what we already have
+        if let Ok(part_meta) = tokio::fs::metadata(&part_path).await {
+            let part_size = part_meta.len();
+            if part_size > 0 && part_size < total {
+                eprintln!("Resuming from {}", format_bytes(part_size));
                 use tokio::io::AsyncSeekExt;
                 remote_file
-                    .seek(std::io::SeekFrom::Start(local_size))
+                    .seek(std::io::SeekFrom::Start(part_size))
                     .await
-                    .with_context(|| {
-                        format!("Failed to seek remote file to offset {local_size}")
-                    })?;
-                offset = local_size;
-                // Open in append mode
+                    .with_context(|| format!("Failed to seek remote file to offset {part_size}"))?;
+                offset = part_size;
                 tokio::fs::OpenOptions::new()
                     .append(true)
-                    .open(local_path)
+                    .open(&part_path)
                     .await
-                    .with_context(|| format!("Failed to open local file {local_path} for append"))?
-            } else if local_size >= total {
-                eprintln!(
-                    "Local file is already complete ({}).",
-                    format_bytes(local_size)
-                );
-                terminal_theme::reset_theme();
-                return Ok(());
+                    .with_context(|| format!("Failed to open {part_path} for append"))?
             } else {
-                tokio::fs::File::create(local_path)
+                tokio::fs::File::create(&part_path)
                     .await
-                    .with_context(|| format!("Failed to create local file {local_path}"))?
+                    .with_context(|| format!("Failed to create {part_path}"))?
             }
         } else {
-            tokio::fs::File::create(local_path)
+            tokio::fs::File::create(&part_path)
                 .await
-                .with_context(|| format!("Failed to create local file {local_path}"))?
+                .with_context(|| format!("Failed to create {part_path}"))?
         }
     } else {
-        tokio::fs::File::create(local_path)
+        tokio::fs::File::create(&part_path)
             .await
-            .with_context(|| format!("Failed to create local file {local_path}"))?
+            .with_context(|| format!("Failed to create {part_path}"))?
     };
 
     eprintln!("{display_name}:{remote_path}");
@@ -207,6 +215,11 @@ async fn download(
             .context("Failed to write to local file")?;
         progress.update(n as u64);
     }
+
+    // Rename .part to final path on success
+    tokio::fs::rename(&part_path, local_path)
+        .await
+        .with_context(|| format!("Failed to rename {part_path} to {local_path}"))?;
 
     progress.finish();
     terminal_theme::reset_theme();

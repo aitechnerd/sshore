@@ -372,7 +372,7 @@ async fn setup_remote_forward(
 ) -> Result<()> {
     // Ask the server to listen. The returned port is the actual bound port
     // (may differ from requested if the server chose one).
-    let _bound_port = {
+    let bound_port = {
         let mut handle = session.lock().await;
         handle
             .tcpip_forward("0.0.0.0", spec.local_port as u32)
@@ -385,19 +385,33 @@ async fn setup_remote_forward(
             })?
     };
 
+    // Use the server-assigned port if it differs from what we requested
+    let actual_port = if bound_port != 0 {
+        bound_port
+    } else {
+        spec.local_port as u32
+    };
+
+    if bound_port != 0 && bound_port != spec.local_port as u32 {
+        eprintln!(
+            "Warning: requested remote port {} but server bound port {}",
+            spec.local_port, bound_port
+        );
+    }
+
     // Register the mapping: when the server sends traffic for this port,
     // we connect locally to remote_host:remote_port
     {
         let mut map = remote_map.lock().await;
         map.insert(
-            ("0.0.0.0".to_string(), spec.local_port as u32),
+            ("0.0.0.0".to_string(), actual_port),
             (spec.remote_host.clone(), spec.remote_port),
         );
     }
 
     eprintln!(
         "Remote forward: remote:{} → {}:{}",
-        spec.local_port, spec.remote_host, spec.remote_port
+        actual_port, spec.remote_host, spec.remote_port
     );
 
     Ok(())

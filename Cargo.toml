@@ -64,7 +64,10 @@ uuid = { version = "1", features = ["v4"] }
 whoami = "1"
 base64 = "0.22.1"
 sha2 = "0.10.9"
+hmac = "0.12"
+sha1 = "0.10"
 zeroize = "1.8.2"
+fs2 = "0.4"
 
 [dev-dependencies]
 assert_cmd = "2"

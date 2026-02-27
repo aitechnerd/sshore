@@ -7,6 +7,23 @@ const DEVELOPMENT_PATTERNS: &[&str] = &["dev", "development", "develop"];
 const LOCAL_PATTERNS: &[&str] = &["local", "localhost", "127.0.0.1", "::1"];
 const TESTING_PATTERNS: &[&str] = &["test", "testing", "qa", "uat"];
 
+/// Known environment tier names used for validation.
+pub const KNOWN_TIERS: &[&str] = &["production", "staging", "development", "local", "testing"];
+
+/// Warn to stderr if `env` is not a recognized environment tier.
+/// Returns `true` if the environment is known, `false` otherwise.
+pub fn warn_unknown_env(env: &str) -> bool {
+    if KNOWN_TIERS.iter().any(|&t| t.eq_ignore_ascii_case(env)) {
+        return true;
+    }
+    eprintln!(
+        "Warning: '{}' is not a recognized environment tier (known: {})",
+        env,
+        KNOWN_TIERS.join(", ")
+    );
+    false
+}
+
 /// Detect environment tier from bookmark name and hostname.
 ///
 /// Combines name and host, then checks pattern groups in priority order.

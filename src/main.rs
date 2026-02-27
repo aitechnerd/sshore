@@ -205,6 +205,11 @@ fn cmd_import(
     dry_run: bool,
     cfg_override: Option<&str>,
 ) -> Result<()> {
+    // Validate env_override against known tiers (warn only)
+    if let Some(ref env) = env_override {
+        config::env::warn_unknown_env(env);
+    }
+
     // Resolve the import file path
     let import_path: PathBuf = if let Some(ref f) = file {
         shellexpand::tilde(f).to_string().into()

@@ -665,6 +665,9 @@ fn prompt_password(user: &str) -> Result<String> {
 /// Capacity for the stdin mpsc channel.
 const STDIN_CHANNEL_SIZE: usize = 64;
 
+/// Grace period for spawned tasks to finish before aborting.
+const TASK_SHUTDOWN_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(100);
+
 /// Set up signal handlers for graceful SSH session shutdown.
 #[cfg(unix)]
 async fn setup_ssh_signal_handlers() -> Result<tokio::sync::watch::Receiver<bool>> {
@@ -730,10 +733,10 @@ async fn run_proxy_loop(
     let (stdin_tx, mut stdin_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(STDIN_CHANNEL_SIZE);
 
     // Spawn stdin reader — sends raw bytes to the mpsc channel
-    let stdin_handle = tokio::spawn(read_stdin(stdin_tx));
+    let mut stdin_handle = tokio::spawn(read_stdin(stdin_tx));
 
     // Spawn resize handler (takes ownership of write half)
-    let resize_handle = tokio::spawn(handle_resize(channel_tx));
+    let mut resize_handle = tokio::spawn(handle_resize(channel_tx));
 
     let mut stdout = std::io::stdout();
     let mut awaiting_confirm = false;
@@ -869,8 +872,13 @@ async fn run_proxy_loop(
         }
     }
 
-    // Clean up spawned tasks
+    // Clean up spawned tasks gracefully:
+    // Drop the stdin receiver so read_stdin's send() fails and it exits.
+    drop(stdin_rx);
+    let _ = tokio::time::timeout(TASK_SHUTDOWN_TIMEOUT, &mut stdin_handle).await;
     stdin_handle.abort();
+    // Resize handler has no cancellation signal (event stream); abort after grace period.
+    let _ = tokio::time::timeout(TASK_SHUTDOWN_TIMEOUT, &mut resize_handle).await;
     resize_handle.abort();
 
     Ok(())

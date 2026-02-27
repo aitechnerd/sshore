@@ -230,9 +230,14 @@ pub fn save_tunnel_state_to(state: &TunnelState, path: &PathBuf) -> Result<()> {
             .context("Failed to set tunnel state file permissions")?;
     }
 
-    temp_file
+    let persisted = temp_file
         .persist(path)
         .context("Failed to atomically replace tunnel state file")?;
+
+    // Sync to disk to prevent data loss on crash
+    persisted
+        .sync_all()
+        .context("Failed to sync tunnel state file to disk")?;
 
     Ok(())
 }

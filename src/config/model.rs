@@ -213,15 +213,14 @@ impl Bookmark {
 }
 
 /// Expand shell variables and tilde in a string.
-/// Returns the original string unchanged if expansion fails (with a warning to stderr).
+///
+/// Returns `Err` if expansion fails (e.g., undefined environment variable),
+/// consistent with `Bookmark::resolved_identity_file()`.
 #[cfg_attr(not(test), allow(dead_code))]
-pub fn expand_path(input: &str) -> String {
+pub fn expand_path(input: &str) -> Result<String> {
     shellexpand::full(input)
         .map(|s| s.to_string())
-        .unwrap_or_else(|e| {
-            eprintln!("Warning: variable expansion failed for '{}': {}", input, e);
-            input.to_string()
-        })
+        .map_err(|e| anyhow!("Variable expansion failed for '{}': {}", input, e))
 }
 
 /// Validate that a bookmark name contains only alphanumeric chars, hyphens, underscores, and dots.
@@ -531,7 +530,7 @@ mod tests {
 
     #[test]
     fn test_expand_path_tilde() {
-        let result = expand_path("~/test");
+        let result = expand_path("~/test").unwrap();
         assert!(!result.starts_with('~'));
         assert!(result.ends_with("/test"));
     }
@@ -541,7 +540,7 @@ mod tests {
         // Use a unique env var name to avoid races with parallel tests
         // SAFETY: test-only, no concurrent access to this variable
         unsafe { std::env::set_var("SSHORE_TEST_HOME_EXPAND", "/mock/home") };
-        let result = expand_path("$SSHORE_TEST_HOME_EXPAND/test");
+        let result = expand_path("$SSHORE_TEST_HOME_EXPAND/test").unwrap();
         assert!(!result.starts_with('$'));
         assert!(result.ends_with("/test"));
         assert!(result.starts_with("/mock/home"));
@@ -549,10 +548,9 @@ mod tests {
     }
 
     #[test]
-    fn test_expand_path_undefined_var_returns_original() {
+    fn test_expand_path_undefined_var_returns_error() {
         let result = expand_path("${SSHORE_NONEXISTENT_VAR_12345}/test");
-        // Falls back to original on error
-        assert_eq!(result, "${SSHORE_NONEXISTENT_VAR_12345}/test");
+        assert!(result.is_err());
     }
 
     #[test]

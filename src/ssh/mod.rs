@@ -54,14 +54,6 @@ struct TerminalGuard {
     was_raw: bool,
 }
 
-impl TerminalGuard {
-    fn new() -> Self {
-        Self {
-            was_raw: crossterm::terminal::is_raw_mode_enabled().unwrap_or(false),
-        }
-    }
-}
-
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
         // Flush stdout before disabling raw mode
@@ -468,7 +460,13 @@ pub async fn exec_multi(
         let command = command.to_string();
 
         let handle = tokio::spawn(async move {
-            let _permit = sem.acquire().await.unwrap();
+            let _permit = match sem.acquire().await {
+                Ok(permit) => permit,
+                Err(e) => {
+                    eprintln!("\x1b[31mError: failed to acquire semaphore permit: {e}\x1b[0m");
+                    return;
+                }
+            };
 
             let bookmark = &config.bookmarks[idx];
             let header = format!("\x1b[1m── {} ──\x1b[0m", bookmark.name);
@@ -717,8 +715,10 @@ async fn run_proxy_loop(
     cfg_override: Option<&str>,
 ) -> Result<()> {
     // Put terminal in raw mode with cleanup guard
-    let _guard = TerminalGuard::new();
+    // Capture pre-enable state first so guard is only created after successful enable
+    let was_raw = crossterm::terminal::is_raw_mode_enabled().unwrap_or(false);
     crossterm::terminal::enable_raw_mode().context("Failed to enable raw mode")?;
+    let _guard = TerminalGuard { was_raw };
 
     let (mut channel_rx, channel_tx) = channel.split();
 

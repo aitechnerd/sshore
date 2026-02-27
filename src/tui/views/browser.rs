@@ -296,8 +296,10 @@ async fn handle_key(
 
         KeyCode::Home | KeyCode::Char('g') if !key.modifiers.contains(KeyModifiers::SHIFT) => {
             let pane = active_pane_mut(left_pane, right_pane, state);
-            pane.selected = 0;
-            pane.list_state.select(Some(0));
+            if !pane.entries.is_empty() {
+                pane.selected = 0;
+                pane.list_state.select(Some(0));
+            }
         }
 
         KeyCode::End | KeyCode::Char('G') => {

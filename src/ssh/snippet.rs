@@ -131,7 +131,9 @@ pub fn show_snippet_picker(
 
     match selection {
         Some(idx) => {
-            let snippet = all_snippets[idx];
+            let snippet = all_snippets
+                .get(idx)
+                .ok_or_else(|| anyhow::anyhow!("Snippet index {idx} out of bounds"))?;
             let command = if snippet.auto_execute {
                 format!("{}\n", snippet.command)
             } else {

@@ -256,4 +256,51 @@ mod tests {
         assert_eq!(bookmarks[0].host, "example.com");
         assert_eq!(bookmarks[1].host, "10.0.1.5");
     }
+
+    #[test]
+    fn test_invalid_port_defaults_to_22() {
+        let csv = "name,host,port\nmyserver,example.com,abc\n";
+        let bookmarks = parse_csv(csv, None, &[]).unwrap();
+        assert_eq!(bookmarks.len(), 1);
+        assert_eq!(bookmarks[0].port, 22);
+    }
+
+    #[test]
+    fn test_port_overflow_defaults_to_22() {
+        let csv = "name,host,port\nmyserver,example.com,99999\n";
+        let bookmarks = parse_csv(csv, None, &[]).unwrap();
+        assert_eq!(bookmarks.len(), 1);
+        // 99999 overflows u16 (max 65535), parse fails → default 22
+        assert_eq!(bookmarks[0].port, 22);
+    }
+
+    #[test]
+    fn test_header_only_csv() {
+        let csv = "name,host,port\n";
+        let bookmarks = parse_csv(csv, None, &[]).unwrap();
+        assert!(bookmarks.is_empty());
+    }
+
+    #[test]
+    fn test_all_rows_invalid_hostname() {
+        let csv = "name,host\nbad1,host;evil\nbad2,host|evil\n";
+        let bookmarks = parse_csv(csv, None, &[]).unwrap();
+        assert!(bookmarks.is_empty());
+    }
+
+    #[test]
+    fn test_extra_tags_appended() {
+        let csv = "name,host,tags\nmyserver,example.com,web\n";
+        let bookmarks = parse_csv(csv, None, &["imported".into()]).unwrap();
+        let tags = &bookmarks[0].tags;
+        assert!(tags.contains(&"web".to_string()));
+        assert!(tags.contains(&"imported".to_string()));
+        assert!(tags.contains(&"csv-import".to_string()));
+    }
+
+    #[test]
+    fn test_whitespace_only_file() {
+        let result = parse_csv("   \n\n  ", None, &[]);
+        assert!(result.is_err());
+    }
 }

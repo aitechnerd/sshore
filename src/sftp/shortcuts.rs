@@ -542,4 +542,52 @@ mod tests {
         }
         assert_eq!(pb.transferred, 1000);
     }
+
+    // --- scp_transfer error paths (both-remote, neither-remote) ---
+    // These test the parse_remote_spec logic that drives the bail! branches.
+
+    #[test]
+    fn test_both_remote_detected() {
+        let src = parse_remote_spec("server1:/path/a");
+        let dst = parse_remote_spec("server2:/path/b");
+        // Both are Some → scp_transfer would bail "Both source and destination are remote"
+        assert!(src.is_some());
+        assert!(dst.is_some());
+    }
+
+    #[test]
+    fn test_neither_remote_detected() {
+        let src = parse_remote_spec("/local/path/a");
+        let dst = parse_remote_spec("./local/path/b");
+        // Both are None → scp_transfer would bail "Neither source nor destination is remote"
+        assert!(src.is_none());
+        assert!(dst.is_none());
+    }
+
+    #[test]
+    fn test_parse_remote_spec_multiple_colons() {
+        // Only the first colon splits bookmark:path
+        let result = parse_remote_spec("server:/path/with:colon");
+        assert_eq!(result, Some(("server", "/path/with:colon")));
+    }
+
+    // --- format_bytes_per_sec ---
+
+    #[test]
+    fn test_format_bytes_per_sec_small() {
+        assert_eq!(format_bytes_per_sec(500.0), "500B/s");
+        assert_eq!(format_bytes_per_sec(0.0), "0B/s");
+    }
+
+    #[test]
+    fn test_format_bytes_per_sec_kb() {
+        assert_eq!(format_bytes_per_sec(1024.0), "1KB/s");
+        assert_eq!(format_bytes_per_sec(10240.0), "10KB/s");
+    }
+
+    #[test]
+    fn test_format_bytes_per_sec_mb() {
+        assert_eq!(format_bytes_per_sec(1024.0 * 1024.0), "1.0MB/s");
+        assert_eq!(format_bytes_per_sec(5.5 * 1024.0 * 1024.0), "5.5MB/s");
+    }
 }

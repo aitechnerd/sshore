@@ -388,4 +388,74 @@ mod tests {
         assert!(entry.key_matches(&data));
         assert!(!entry.key_matches(&[1, 2, 3, 4, 6]));
     }
+
+    #[test]
+    fn test_key_matches_invalid_base64() {
+        let entry = KnownHostEntry {
+            host_patterns: vec!["test".into()],
+            _key_type: "ssh-rsa".into(),
+            key_base64: "not-valid-base64!!!".into(),
+        };
+        assert!(!entry.key_matches(&[1, 2, 3]));
+    }
+
+    #[test]
+    fn test_parse_known_hosts_line_empty_returns_none() {
+        assert!(parse_known_hosts_line("").is_none());
+    }
+
+    #[test]
+    fn test_parse_known_hosts_line_comment_is_skipped_by_caller() {
+        // Comments are skipped by check_host_key's loop, not by parse_known_hosts_line.
+        // But parse should handle a line with only a host and key_type (no key) gracefully.
+        assert!(parse_known_hosts_line("host ssh-rsa").is_none());
+    }
+
+    #[test]
+    fn test_parse_known_hosts_line_only_host_returns_none() {
+        assert!(parse_known_hosts_line("example.com").is_none());
+    }
+
+    #[test]
+    fn test_check_hashed_host_invalid_salt() {
+        // Malformed base64 in salt should return None (not panic)
+        assert!(check_hashed_host("|1|!!!invalid|aGFzaA==", "example.com").is_none());
+    }
+
+    #[test]
+    fn test_check_hashed_host_invalid_hash() {
+        // Valid salt but malformed base64 in hash should return None
+        assert!(check_hashed_host("|1|dGVzdA==|!!!invalid", "example.com").is_none());
+    }
+
+    #[test]
+    fn test_check_hashed_host_too_few_parts() {
+        assert!(check_hashed_host("|1|onlytwosections", "host").is_none());
+    }
+
+    #[test]
+    fn test_check_hashed_host_empty_string() {
+        assert!(check_hashed_host("", "host").is_none());
+    }
+
+    #[test]
+    fn test_host_pattern_empty_entry_no_match() {
+        let entry = KnownHostEntry {
+            host_patterns: vec![],
+            _key_type: "ssh-ed25519".into(),
+            key_base64: "AAAA".into(),
+        };
+        assert!(!entry.matches_host("example.com"));
+    }
+
+    #[test]
+    fn test_key_matches_empty_key() {
+        let entry = KnownHostEntry {
+            host_patterns: vec!["test".into()],
+            _key_type: "ssh-rsa".into(),
+            key_base64: String::new(),
+        };
+        // Empty base64 decodes to empty vec, which shouldn't match non-empty data
+        assert!(!entry.key_matches(&[1, 2, 3]));
+    }
 }

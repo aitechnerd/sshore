@@ -645,4 +645,109 @@ mod tests {
         assert_eq!(loaded.bookmarks[0].name, "existing");
         assert_eq!(loaded.bookmarks[1].name, "new-bm");
     }
+
+    // --- Additional export tests ---
+
+    #[test]
+    fn test_export_combined_env_and_tag_filter() {
+        let config = sample_config_with_bookmarks();
+        // production + web tag → only prod-web-01 (not prod-db-01 which is production + db)
+        let result =
+            export_bookmarks(&config, Some("production"), &["web".into()], None, false).unwrap();
+        assert!(result.contains("prod-web-01"));
+        assert!(!result.contains("prod-db-01"));
+    }
+
+    #[test]
+    fn test_export_combined_env_and_glob() {
+        let config = sample_config_with_bookmarks();
+        // staging + name pattern "*-api" → staging-api only
+        let result = export_bookmarks(&config, Some("staging"), &[], Some("*-api"), false).unwrap();
+        assert!(result.contains("staging-api"));
+        assert!(!result.contains("prod-web-01"));
+        assert!(!result.contains("prod-db-01"));
+        assert!(!result.contains("dev-local"));
+    }
+
+    #[test]
+    fn test_export_without_settings_uses_defaults() {
+        let mut config = sample_config_with_bookmarks();
+        config.settings.default_user = Some("custom-user".into());
+        let result = export_bookmarks(&config, None, &[], None, false).unwrap();
+        // include_settings=false means default settings are used; custom default_user should not appear
+        // Actually, default_user = None so it won't be serialized at all in default settings
+        assert!(!result.contains("custom-user"));
+    }
+
+    #[test]
+    fn test_export_header_contains_metadata() {
+        let config = sample_config_with_bookmarks();
+        let result = export_bookmarks(&config, None, &[], None, false).unwrap();
+        assert!(result.contains("# sshore bookmark export"));
+        assert!(result.contains("# Bookmarks: 4"));
+        assert!(result.contains("Passwords are stored in the OS keychain"));
+    }
+
+    #[test]
+    fn test_export_empty_config_returns_error() {
+        let config = AppConfig::default();
+        let result = export_bookmarks(&config, None, &[], None, false);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_export_nonexistent_tag_returns_error() {
+        let config = sample_config_with_bookmarks();
+        let result = export_bookmarks(&config, None, &["nonexistent-tag".into()], None, false);
+        assert!(result.is_err());
+    }
+
+    // --- Error-path tests ---
+
+    #[test]
+    fn test_load_malformed_toml_returns_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bad.toml");
+        std::fs::write(&path, "this is not [valid toml {{{{").unwrap();
+        let result = load_from(&path);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("Failed to parse config file"));
+    }
+
+    #[test]
+    fn test_load_partial_toml_uses_defaults() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("partial.toml");
+        // Valid TOML but only has settings, no bookmarks
+        std::fs::write(&path, "[settings]\ndefault_user = \"partial\"\n").unwrap();
+        let config = load_from(&path).unwrap();
+        assert_eq!(config.settings.default_user, Some("partial".into()));
+        assert!(config.bookmarks.is_empty());
+    }
+
+    #[test]
+    fn test_load_unknown_keys_silently_ignored() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("future.toml");
+        // Config from a future sshore version with unknown fields
+        std::fs::write(
+            &path,
+            "[settings]\ndefault_user = \"test\"\nfuture_field = true\n\n\
+             [[bookmarks]]\nname = \"test\"\nhost = \"10.0.1.5\"\nnew_property = \"value\"\n",
+        )
+        .unwrap();
+        // serde should ignore unknown fields by default
+        let config = load_from(&path).unwrap();
+        assert_eq!(config.bookmarks.len(), 1);
+        assert_eq!(config.bookmarks[0].name, "test");
+    }
+
+    #[test]
+    fn test_import_nonexistent_file_returns_error() {
+        let path = std::path::Path::new("/tmp/sshore_test_nonexistent_file_12345.csv");
+        // import_from_source reads the file, so it should fail for missing files
+        let result = import_from_source(path, ImportSourceKind::Csv, None, &[]);
+        assert!(result.is_err());
+    }
 }

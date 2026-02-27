@@ -208,9 +208,12 @@ fn test_json_end_to_end() {
     assert_eq!(web.identity_file, Some("~/.ssh/id_ed25519".into()));
     assert_eq!(web.proxy_jump, Some("bastion".into()));
 
-    // Bastion has auto-detected env (no env field → detect_env runs)
+    // Bastion has no env field in JSON → detect_env("bastion", "bastion.example.com")
+    // finds no matching pattern → empty string
     let bastion = bookmarks.iter().find(|b| b.name == "bastion").unwrap();
-    assert!(bastion.env.is_empty() || !bastion.env.is_empty()); // just verify it exists
+    assert!(bastion.env.is_empty());
+    assert_eq!(bastion.host, "bastion.example.com");
+    assert_eq!(bastion.user, Some("admin".into()));
 }
 
 // ── Conflict Resolution ────────────────────────────────────────────────

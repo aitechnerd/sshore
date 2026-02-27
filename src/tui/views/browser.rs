@@ -697,3 +697,276 @@ fn truncate_name(name: &str, max_len: usize) -> String {
         format!("{}...", &name[..max_len - 3])
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::Utc;
+
+    fn file_entry(name: &str, is_dir: bool, size: u64) -> FileEntry {
+        FileEntry {
+            name: name.into(),
+            path: format!("/test/{name}"),
+            is_dir,
+            size,
+            modified: None,
+            permissions: None,
+        }
+    }
+
+    fn file_entry_with_modified(name: &str, secs_ago: i64) -> FileEntry {
+        FileEntry {
+            name: name.into(),
+            path: format!("/test/{name}"),
+            is_dir: false,
+            size: 100,
+            modified: Some(Utc::now() - chrono::Duration::seconds(secs_ago)),
+            permissions: None,
+        }
+    }
+
+    // --- PaneState ---
+
+    #[test]
+    fn test_pane_state_new() {
+        let pane = PaneState::new("/home".into());
+        assert_eq!(pane.cwd, "/home");
+        assert_eq!(pane.selected, 0);
+        assert!(pane.entries.is_empty());
+        assert!(pane.marked.is_empty());
+    }
+
+    #[test]
+    fn test_pane_move_down() {
+        let mut pane = PaneState::new("/".into());
+        pane.entries = vec![
+            file_entry("a", false, 10),
+            file_entry("b", false, 20),
+            file_entry("c", false, 30),
+        ];
+        assert_eq!(pane.selected, 0);
+        pane.move_down();
+        assert_eq!(pane.selected, 1);
+        pane.move_down();
+        assert_eq!(pane.selected, 2);
+        // Clamp at bottom
+        pane.move_down();
+        assert_eq!(pane.selected, 2);
+    }
+
+    #[test]
+    fn test_pane_move_up() {
+        let mut pane = PaneState::new("/".into());
+        pane.entries = vec![file_entry("a", false, 10), file_entry("b", false, 20)];
+        pane.selected = 1;
+        pane.move_up();
+        assert_eq!(pane.selected, 0);
+        // Clamp at top
+        pane.move_up();
+        assert_eq!(pane.selected, 0);
+    }
+
+    #[test]
+    fn test_pane_move_on_empty() {
+        let mut pane = PaneState::new("/".into());
+        pane.move_down();
+        assert_eq!(pane.selected, 0);
+        pane.move_up();
+        assert_eq!(pane.selected, 0);
+    }
+
+    #[test]
+    fn test_pane_page_up_down() {
+        let mut pane = PaneState::new("/".into());
+        pane.entries = (0..25)
+            .map(|i| file_entry(&format!("f{i}"), false, 10))
+            .collect();
+        pane.selected = 0;
+        pane.page_down();
+        assert_eq!(pane.selected, 10);
+        pane.page_down();
+        assert_eq!(pane.selected, 20);
+        // Clamp at max (24)
+        pane.page_down();
+        assert_eq!(pane.selected, 24);
+        pane.page_up();
+        assert_eq!(pane.selected, 14);
+        pane.page_up();
+        assert_eq!(pane.selected, 4);
+        pane.page_up();
+        assert_eq!(pane.selected, 0);
+    }
+
+    #[test]
+    fn test_pane_toggle_mark() {
+        let mut pane = PaneState::new("/".into());
+        pane.entries = vec![file_entry("a", false, 10), file_entry("b", false, 20)];
+        pane.selected = 0;
+        assert!(!pane.marked.contains(&0));
+        pane.toggle_mark();
+        assert!(pane.marked.contains(&0));
+        // Toggle off
+        pane.toggle_mark();
+        assert!(!pane.marked.contains(&0));
+    }
+
+    #[test]
+    fn test_pane_toggle_mark_empty() {
+        let mut pane = PaneState::new("/".into());
+        // Should not panic on empty entries
+        pane.toggle_mark();
+        assert!(pane.marked.is_empty());
+    }
+
+    #[test]
+    fn test_pane_selected_entry() {
+        let mut pane = PaneState::new("/".into());
+        assert!(pane.selected_entry().is_none());
+
+        pane.entries = vec![file_entry("a", false, 10), file_entry("b", true, 0)];
+        pane.selected = 1;
+        let entry = pane.selected_entry().unwrap();
+        assert_eq!(entry.name, "b");
+        assert!(entry.is_dir);
+    }
+
+    // --- sort_entries ---
+
+    #[test]
+    fn test_sort_by_name_ascending() {
+        let mut entries = vec![
+            file_entry("c.txt", false, 30),
+            file_entry("a.txt", false, 10),
+            file_entry("b.txt", false, 20),
+        ];
+        sort_entries(&mut entries, SortField::Name, true);
+        assert_eq!(entries[0].name, "a.txt");
+        assert_eq!(entries[1].name, "b.txt");
+        assert_eq!(entries[2].name, "c.txt");
+    }
+
+    #[test]
+    fn test_sort_by_name_descending() {
+        let mut entries = vec![
+            file_entry("a.txt", false, 10),
+            file_entry("c.txt", false, 30),
+            file_entry("b.txt", false, 20),
+        ];
+        sort_entries(&mut entries, SortField::Name, false);
+        assert_eq!(entries[0].name, "c.txt");
+        assert_eq!(entries[1].name, "b.txt");
+        assert_eq!(entries[2].name, "a.txt");
+    }
+
+    #[test]
+    fn test_sort_by_size() {
+        let mut entries = vec![
+            file_entry("big", false, 1000),
+            file_entry("small", false, 10),
+            file_entry("medium", false, 500),
+        ];
+        sort_entries(&mut entries, SortField::Size, true);
+        assert_eq!(entries[0].name, "small");
+        assert_eq!(entries[1].name, "medium");
+        assert_eq!(entries[2].name, "big");
+    }
+
+    #[test]
+    fn test_sort_by_modified() {
+        let mut entries = vec![
+            file_entry_with_modified("old", 3600),
+            file_entry_with_modified("new", 60),
+            file_entry_with_modified("mid", 1800),
+        ];
+        sort_entries(&mut entries, SortField::Modified, true);
+        assert_eq!(entries[0].name, "old");
+        assert_eq!(entries[1].name, "mid");
+        assert_eq!(entries[2].name, "new");
+    }
+
+    #[test]
+    fn test_sort_dirs_first() {
+        let mut entries = vec![
+            file_entry("file.txt", false, 100),
+            file_entry("subdir", true, 0),
+            file_entry("another.txt", false, 200),
+        ];
+        sort_entries(&mut entries, SortField::Name, true);
+        // Directory should be first regardless of sort field
+        assert!(entries[0].is_dir);
+        assert_eq!(entries[0].name, "subdir");
+    }
+
+    #[test]
+    fn test_sort_case_insensitive() {
+        let mut entries = vec![
+            file_entry("Zebra", false, 10),
+            file_entry("apple", false, 20),
+            file_entry("Banana", false, 30),
+        ];
+        sort_entries(&mut entries, SortField::Name, true);
+        assert_eq!(entries[0].name, "apple");
+        assert_eq!(entries[1].name, "Banana");
+        assert_eq!(entries[2].name, "Zebra");
+    }
+
+    // --- glob_match ---
+
+    #[test]
+    fn test_glob_match_star() {
+        assert!(glob_match("*.txt", "readme.txt"));
+        assert!(glob_match("*.txt", ".txt"));
+        assert!(!glob_match("*.txt", "readme.md"));
+    }
+
+    #[test]
+    fn test_glob_match_exact() {
+        assert!(glob_match("readme.txt", "readme.txt"));
+        assert!(!glob_match("readme.txt", "README.txt"));
+    }
+
+    #[test]
+    fn test_glob_match_prefix_star() {
+        assert!(glob_match("log*", "logfile.txt"));
+        assert!(glob_match("log*", "log"));
+        assert!(!glob_match("log*", "mylog"));
+    }
+
+    #[test]
+    fn test_glob_match_middle_star() {
+        assert!(glob_match("test_*_spec.rs", "test_foo_spec.rs"));
+        assert!(!glob_match("test_*_spec.rs", "test_foo_spec.py"));
+    }
+
+    #[test]
+    fn test_glob_match_all() {
+        assert!(glob_match("*", "anything"));
+        assert!(glob_match("*", ""));
+    }
+
+    // --- truncate_name ---
+
+    #[test]
+    fn test_truncate_name_short() {
+        assert_eq!(truncate_name("short", 10), "short");
+    }
+
+    #[test]
+    fn test_truncate_name_exact_fit() {
+        assert_eq!(truncate_name("exactfit", 8), "exactfit");
+    }
+
+    #[test]
+    fn test_truncate_name_long() {
+        assert_eq!(
+            truncate_name("very_long_filename.txt", 15),
+            "very_long_fi..."
+        );
+    }
+
+    #[test]
+    fn test_truncate_name_minimum() {
+        // With max_len=3, we get "..."
+        assert_eq!(truncate_name("abcd", 3), "...");
+    }
+}

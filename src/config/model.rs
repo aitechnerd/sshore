@@ -503,9 +503,9 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn test_resolved_identity_file_env_var() {
-        // Use a unique env var name to avoid races with parallel tests
-        // SAFETY: test-only, no concurrent access to this variable
+        // SAFETY: serial_test ensures no concurrent access to environment variables
         unsafe { std::env::set_var("SSHORE_TEST_HOME_RESOLVE", "/mock/home") };
         let bookmark = Bookmark {
             identity_file: Some("$SSHORE_TEST_HOME_RESOLVE/.ssh/id_ed25519".into()),
@@ -536,9 +536,9 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn test_expand_path_env_var() {
-        // Use a unique env var name to avoid races with parallel tests
-        // SAFETY: test-only, no concurrent access to this variable
+        // SAFETY: serial_test ensures no concurrent access to environment variables
         unsafe { std::env::set_var("SSHORE_TEST_HOME_EXPAND", "/mock/home") };
         let result = expand_path("$SSHORE_TEST_HOME_EXPAND/test").unwrap();
         assert!(!result.starts_with('$'));

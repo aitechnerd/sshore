@@ -996,4 +996,112 @@ mod tests {
     fn test_infer_bookmark_name_fqdn_with_subdomain() {
         assert_eq!(infer_bookmark_name("db.staging.internal.corp"), "db");
     }
+
+    // --- effective_timeout ---
+
+    fn sample_bookmark() -> Bookmark {
+        Bookmark {
+            name: "test".into(),
+            host: "10.0.1.5".into(),
+            user: None,
+            port: 22,
+            env: String::new(),
+            tags: vec![],
+            identity_file: None,
+            proxy_jump: None,
+            notes: None,
+            last_connected: None,
+            connect_count: 0,
+            on_connect: None,
+            snippets: vec![],
+            connect_timeout_secs: None,
+            ssh_options: std::collections::HashMap::new(),
+        }
+    }
+
+    #[test]
+    fn test_effective_timeout_default() {
+        let bookmark = sample_bookmark();
+        let settings = crate::config::model::Settings::default();
+        assert_eq!(
+            effective_timeout(&bookmark, &settings),
+            DEFAULT_CONNECT_TIMEOUT_SECS
+        );
+    }
+
+    #[test]
+    fn test_effective_timeout_from_settings() {
+        let bookmark = sample_bookmark();
+        let settings = crate::config::model::Settings {
+            connect_timeout_secs: Some(30),
+            ..Default::default()
+        };
+        assert_eq!(effective_timeout(&bookmark, &settings), 30);
+    }
+
+    #[test]
+    fn test_effective_timeout_bookmark_overrides_settings() {
+        let bookmark = Bookmark {
+            connect_timeout_secs: Some(5),
+            ..sample_bookmark()
+        };
+        let settings = crate::config::model::Settings {
+            connect_timeout_secs: Some(30),
+            ..Default::default()
+        };
+        assert_eq!(effective_timeout(&bookmark, &settings), 5);
+    }
+
+    #[test]
+    fn test_effective_timeout_bookmark_overrides_default() {
+        let bookmark = Bookmark {
+            connect_timeout_secs: Some(60),
+            ..sample_bookmark()
+        };
+        let settings = crate::config::model::Settings::default();
+        assert_eq!(effective_timeout(&bookmark, &settings), 60);
+    }
+
+    // --- parse_connection_string edge cases ---
+
+    #[test]
+    fn test_parse_connection_string_port_overflow() {
+        let result = parse_connection_string("host:99999");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_connection_string_port_zero() {
+        // Port 0 is technically valid in u16 parse
+        let (_, _, port) = parse_connection_string("host:0").unwrap();
+        assert_eq!(port, 0);
+    }
+
+    #[test]
+    fn test_parse_connection_string_fqdn_with_port() {
+        let (user, host, port) = parse_connection_string("admin@web.example.com:8022").unwrap();
+        assert_eq!(user, Some("admin".to_string()));
+        assert_eq!(host, "web.example.com");
+        assert_eq!(port, 8022);
+    }
+
+    #[test]
+    fn test_parse_connection_string_ipv4() {
+        let (user, host, port) = parse_connection_string("root@192.168.1.1:22").unwrap();
+        assert_eq!(user, Some("root".to_string()));
+        assert_eq!(host, "192.168.1.1");
+        assert_eq!(port, 22);
+    }
+
+    // --- infer_bookmark_name edge cases ---
+
+    #[test]
+    fn test_infer_bookmark_name_single_char() {
+        assert_eq!(infer_bookmark_name("a"), "a");
+    }
+
+    #[test]
+    fn test_infer_bookmark_name_ip_v4_loopback() {
+        assert_eq!(infer_bookmark_name("127.0.0.1"), "server-127-0-0-1");
+    }
 }

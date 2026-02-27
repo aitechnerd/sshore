@@ -266,4 +266,46 @@ mod tests {
         assert_eq!(bookmarks.len(), 1);
         assert_eq!(bookmarks[0].name, "has-host");
     }
+
+    #[test]
+    fn test_skip_empty_host_string() {
+        let json = r#"[{"name": "empty-host", "host": ""}]"#;
+        let bookmarks = parse_json_bookmarks(json, None, &[]).unwrap();
+        assert!(bookmarks.is_empty());
+    }
+
+    #[test]
+    fn test_skip_empty_name() {
+        let json = r#"[
+            {"name": "", "host": "10.0.1.5"},
+            {"name": "valid", "host": "10.0.1.6"}
+        ]"#;
+        let bookmarks = parse_json_bookmarks(json, None, &[]).unwrap();
+        assert_eq!(bookmarks.len(), 1);
+        assert_eq!(bookmarks[0].name, "valid");
+    }
+
+    #[test]
+    fn test_invalid_json_structure() {
+        // Valid JSON but not an array or object with bookmarks key
+        let result = parse_json_bookmarks("\"just a string\"", None, &[]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_wrapped_format_missing_bookmarks_key() {
+        let json = r#"{"servers": [{"name": "a", "host": "10.0.1.5"}]}"#;
+        let result = parse_json_bookmarks(json, None, &[]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_all_bookmarks_invalid_produces_empty() {
+        let json = r#"[
+            {"name": "", "host": "10.0.1.5"},
+            {"name": "bad-host", "host": "host;evil"}
+        ]"#;
+        let bookmarks = parse_json_bookmarks(json, None, &[]).unwrap();
+        assert!(bookmarks.is_empty());
+    }
 }

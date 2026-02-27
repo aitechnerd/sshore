@@ -96,7 +96,20 @@ pub fn parse_csv(
             .or_else(|| get(env_col))
             .unwrap_or_else(|| detect_env(&name, &host));
 
-        let port = get(port_col).and_then(|p| p.parse().ok()).unwrap_or(22);
+        let port = match get(port_col) {
+            Some(p) => match p.parse::<u16>() {
+                Ok(port) => port,
+                Err(_) => {
+                    eprintln!(
+                        "Warning: invalid port '{}' in CSV row {}, defaulting to 22",
+                        p,
+                        row_idx + 2
+                    );
+                    22
+                }
+            },
+            None => 22,
+        };
 
         bookmarks.push(Bookmark {
             name,

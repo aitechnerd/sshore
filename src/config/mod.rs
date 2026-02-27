@@ -72,12 +72,27 @@ pub fn load_from(path: &Path) -> Result<AppConfig> {
     let config: AppConfig = toml::from_str(&content)
         .with_context(|| format!("Failed to parse config file: {}", path.display()))?;
 
+    warn_duplicate_names(&config.bookmarks);
+
     Ok(config)
 }
 
 /// Save config to a specific path via atomic write.
 pub fn save_to(config: &AppConfig, path: &Path) -> Result<()> {
     atomic_write(config, path)
+}
+
+/// Warn to stderr if any bookmarks share the same name.
+fn warn_duplicate_names(bookmarks: &[Bookmark]) {
+    let mut seen = HashSet::new();
+    for b in bookmarks {
+        if !seen.insert(&b.name) {
+            eprintln!(
+                "Warning: duplicate bookmark name '{}' — last occurrence will be used in lookups",
+                b.name
+            );
+        }
+    }
 }
 
 /// Warn to stderr if the config file has permissions wider than 0600 on Unix.

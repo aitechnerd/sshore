@@ -79,14 +79,13 @@ fn json_to_bookmark(
         return None;
     }
 
-    let host = jb
-        .host
-        .or(jb.hostname_alias)
-        .unwrap_or_else(|| name.clone());
-
-    if host.is_empty() {
-        return None;
-    }
+    let host = match jb.host.or(jb.hostname_alias) {
+        Some(h) if !h.is_empty() => h,
+        _ => {
+            eprintln!("Warning: skipping JSON bookmark '{}': missing host field", name);
+            return None;
+        }
+    };
 
     if validate_hostname(&host).is_err() {
         eprintln!("Warning: skipping JSON bookmark '{}': invalid hostname '{}'", name, host);
@@ -249,5 +248,16 @@ mod tests {
         assert_eq!(bookmarks.len(), 2);
         assert_eq!(bookmarks[0].host, "10.0.1.5");
         assert_eq!(bookmarks[1].host, "example.com");
+    }
+
+    #[test]
+    fn test_skip_missing_host() {
+        let json = r#"[
+            {"name": "no-host"},
+            {"name": "has-host", "host": "10.0.1.5"}
+        ]"#;
+        let bookmarks = parse_json_bookmarks(json, None, &[]).unwrap();
+        assert_eq!(bookmarks.len(), 1);
+        assert_eq!(bookmarks[0].name, "has-host");
     }
 }

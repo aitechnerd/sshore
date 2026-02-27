@@ -159,10 +159,14 @@ fn parse_ssh_config_recursive(
                 }
             }
             "port" => {
-                if let Some(ref mut block) = current_block
-                    && let Ok(port) = value.parse::<u16>()
-                {
-                    block.port = Some(port);
+                if let Some(ref mut block) = current_block {
+                    match value.parse::<u16>() {
+                        Ok(port) => block.port = Some(port),
+                        Err(_) => eprintln!(
+                            "Warning: invalid port '{}' in SSH config, defaulting to 22",
+                            value
+                        ),
+                    }
                 }
             }
             "identityfile" => {
@@ -186,7 +190,7 @@ fn parse_ssh_config_recursive(
                     block.on_connect = Some(value.to_string());
                 }
             }
-            "localforward"
+            key @ ("localforward"
             | "remoteforward"
             | "serveraliveinterval"
             | "serveralivecountmax"
@@ -194,11 +198,12 @@ fn parse_ssh_config_recursive(
             | "forwardagent"
             | "compression"
             | "stricthostkeychecking"
-            | "requesttty" => {
+            | "requesttty") => {
                 if let Some(ref mut block) = current_block {
+                    let canonical = canonical_ssh_option(key);
                     block
                         .ssh_options
-                        .insert(directive.to_string(), value.to_string());
+                        .insert(canonical.to_string(), value.to_string());
                 }
             }
             "include" => {
@@ -219,6 +224,22 @@ fn parse_ssh_config_recursive(
     }
 
     Ok(bookmarks)
+}
+
+/// Map a lowercased SSH directive to its canonical PascalCase form.
+fn canonical_ssh_option(key: &str) -> &'static str {
+    match key {
+        "localforward" => "LocalForward",
+        "remoteforward" => "RemoteForward",
+        "serveraliveinterval" => "ServerAliveInterval",
+        "serveralivecountmax" => "ServerAliveCountMax",
+        "addkeystoagent" => "AddKeysToAgent",
+        "forwardagent" => "ForwardAgent",
+        "compression" => "Compression",
+        "stricthostkeychecking" => "StrictHostKeyChecking",
+        "requesttty" => "RequestTTY",
+        _ => unreachable!("canonical_ssh_option called with unknown key: {key}"),
+    }
 }
 
 /// Split an SSH config line into (directive, value).
@@ -261,7 +282,13 @@ fn resolve_includes(
 
     let paths: Vec<PathBuf> = glob::glob(&full_pattern)
         .with_context(|| format!("Invalid Include glob pattern: {}", full_pattern))?
-        .filter_map(|entry| entry.ok())
+        .filter_map(|entry| match entry {
+            Ok(path) => Some(path),
+            Err(e) => {
+                eprintln!("Warning: failed to read Include path: {}", e);
+                None
+            }
+        })
         .collect();
 
     for path in paths {
@@ -1008,5 +1035,39 @@ Host myhost
                 .map(String::as_str),
             Some("accept-new")
         );
+    }
+
+    #[test]
+    fn test_ssh_option_keys_canonicalized() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_temp_ssh_config(
+            dir.path(),
+            "config",
+            // Use lowercase directives — should be stored as PascalCase
+            "Host myhost\n    hostname example.com\n    serveraliveinterval 60\n    compression yes\n    localforward 8080:localhost:80\n",
+        );
+
+        let bookmarks = parse_ssh_config(&path).unwrap();
+        let opts = &bookmarks[0].ssh_options;
+        assert_eq!(opts.get("ServerAliveInterval").map(String::as_str), Some("60"));
+        assert_eq!(opts.get("Compression").map(String::as_str), Some("yes"));
+        assert_eq!(opts.get("LocalForward").map(String::as_str), Some("8080:localhost:80"));
+        // Lowercase keys should NOT exist
+        assert!(opts.get("serveraliveinterval").is_none());
+        assert!(opts.get("compression").is_none());
+    }
+
+    #[test]
+    fn test_invalid_port_warns() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_temp_ssh_config(
+            dir.path(),
+            "config",
+            "Host myhost\n    HostName example.com\n    Port 999999\n",
+        );
+
+        let bookmarks = parse_ssh_config(&path).unwrap();
+        // Invalid port should fall back to default 22
+        assert_eq!(bookmarks[0].port, 22);
     }
 }

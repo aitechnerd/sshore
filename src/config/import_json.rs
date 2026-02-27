@@ -82,13 +82,19 @@ fn json_to_bookmark(
     let host = match jb.host.or(jb.hostname_alias) {
         Some(h) if !h.is_empty() => h,
         _ => {
-            eprintln!("Warning: skipping JSON bookmark '{}': missing host field", name);
+            eprintln!(
+                "Warning: skipping JSON bookmark '{}': missing host field",
+                name
+            );
             return None;
         }
     };
 
     if validate_hostname(&host).is_err() {
-        eprintln!("Warning: skipping JSON bookmark '{}': invalid hostname '{}'", name, host);
+        eprintln!(
+            "Warning: skipping JSON bookmark '{}': invalid hostname '{}'",
+            name, host
+        );
         return None;
     }
 

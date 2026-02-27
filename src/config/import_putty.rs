@@ -34,7 +34,10 @@ pub fn parse_putty_reg(
         .into_iter()
         .filter(|s| {
             if validate_hostname(&s.hostname).is_err() {
-                eprintln!("Warning: skipping PuTTY session '{}': invalid hostname '{}'", s.name, s.hostname);
+                eprintln!(
+                    "Warning: skipping PuTTY session '{}': invalid hostname '{}'",
+                    s.name, s.hostname
+                );
                 return false;
             }
             true

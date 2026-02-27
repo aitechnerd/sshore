@@ -329,11 +329,12 @@ pub async fn connect(
     // Check keychain for stored password and create detector.
     // Wrap in Zeroizing so password memory is wiped on drop.
     let bookmark_name = &config.bookmarks[bookmark_index].name;
-    let stored_password: Option<Zeroizing<String>> =
-        keychain::get_password(bookmark_name).unwrap_or_else(|e| {
+    let stored_password: Option<Zeroizing<String>> = keychain::get_password(bookmark_name)
+        .unwrap_or_else(|e| {
             eprintln!("Warning: failed to read keychain: {e}");
             None
-        }).map(Zeroizing::new);
+        })
+        .map(Zeroizing::new);
     let detector = PasswordDetector::new(stored_password.is_some());
 
     // Send on_connect command if configured

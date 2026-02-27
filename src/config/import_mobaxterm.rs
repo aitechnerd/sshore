@@ -24,7 +24,10 @@ pub fn parse_mxtsessions(
         .into_iter()
         .filter(|s| {
             if validate_hostname(&s.host).is_err() {
-                eprintln!("Warning: skipping MobaXterm session '{}': invalid hostname '{}'", s.name, s.host);
+                eprintln!(
+                    "Warning: skipping MobaXterm session '{}': invalid hostname '{}'",
+                    s.name, s.host
+                );
                 return false;
             }
             true

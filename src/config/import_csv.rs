@@ -74,7 +74,11 @@ pub fn parse_csv(
         };
 
         if validate_hostname(&host).is_err() {
-            eprintln!("Warning: skipping CSV row {}: invalid hostname '{}'", row_idx + 2, host);
+            eprintln!(
+                "Warning: skipping CSV row {}: invalid hostname '{}'",
+                row_idx + 2,
+                host
+            );
             continue;
         }
 
@@ -245,7 +249,8 @@ mod tests {
 
     #[test]
     fn test_skip_hostname_with_shell_metacharacters() {
-        let csv = "name,host\ngood,example.com\nbad,host;rm -rf /\nalso-bad,host|evil\nfine,10.0.1.5\n";
+        let csv =
+            "name,host\ngood,example.com\nbad,host;rm -rf /\nalso-bad,host|evil\nfine,10.0.1.5\n";
         let bookmarks = parse_csv(csv, None, &[]).unwrap();
         assert_eq!(bookmarks.len(), 2);
         assert_eq!(bookmarks[0].host, "example.com");

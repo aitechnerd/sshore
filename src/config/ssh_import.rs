@@ -1049,9 +1049,15 @@ Host myhost
 
         let bookmarks = parse_ssh_config(&path).unwrap();
         let opts = &bookmarks[0].ssh_options;
-        assert_eq!(opts.get("ServerAliveInterval").map(String::as_str), Some("60"));
+        assert_eq!(
+            opts.get("ServerAliveInterval").map(String::as_str),
+            Some("60")
+        );
         assert_eq!(opts.get("Compression").map(String::as_str), Some("yes"));
-        assert_eq!(opts.get("LocalForward").map(String::as_str), Some("8080:localhost:80"));
+        assert_eq!(
+            opts.get("LocalForward").map(String::as_str),
+            Some("8080:localhost:80")
+        );
         // Lowercase keys should NOT exist
         assert!(opts.get("serveraliveinterval").is_none());
         assert!(opts.get("compression").is_none());

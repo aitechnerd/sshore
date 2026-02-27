@@ -36,7 +36,10 @@ pub fn parse_securecrt_xml(
         .filter(|s| !s.hostname.is_empty())
         .filter(|s| {
             if validate_hostname(&s.hostname).is_err() {
-                eprintln!("Warning: skipping SecureCRT session '{}': invalid hostname '{}'", s.name, s.hostname);
+                eprintln!(
+                    "Warning: skipping SecureCRT session '{}': invalid hostname '{}'",
+                    s.name, s.hostname
+                );
                 return false;
             }
             true

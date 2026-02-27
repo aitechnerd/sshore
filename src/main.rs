@@ -85,6 +85,11 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
     let cfg_override = cli.config.as_deref();
 
+    // Warn if a subcommand name collides with a bookmark name
+    if let Some(ref cmd) = cli.command {
+        check_bookmark_subcommand_collision(cmd, cfg_override);
+    }
+
     match cli.command {
         Some(Commands::Import {
             from,
@@ -158,6 +163,36 @@ async fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Check if the invoked subcommand name collides with an existing bookmark name.
+/// If so, print a hint suggesting `sshore connect <name>` instead.
+fn check_bookmark_subcommand_collision(cmd: &Commands, cfg_override: Option<&str>) {
+    let cmd_name = match cmd {
+        Commands::Import { .. } => "import",
+        Commands::List { .. } => "list",
+        Commands::Connect { .. } => return, // `connect` is the intended escape hatch
+        Commands::Sftp { .. } => "sftp",
+        Commands::Scp { .. } => "scp",
+        Commands::Browse { .. } => "browse",
+        Commands::Tunnel { .. } => "tunnel",
+        Commands::Exec { .. } => "exec",
+        Commands::Export { .. } => "export",
+        Commands::Password { .. } => "password",
+        Commands::Completions { .. } => "completions",
+    };
+
+    if let Ok(app_config) = config::load_with_override(cfg_override)
+        && app_config
+            .bookmarks
+            .iter()
+            .any(|b| b.name.eq_ignore_ascii_case(cmd_name))
+    {
+        eprintln!(
+            "Hint: you have a bookmark named '{cmd_name}'. \
+             To connect to it, use: sshore connect {cmd_name}"
+        );
+    }
 }
 
 /// Import bookmarks from various sources.

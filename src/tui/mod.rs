@@ -416,6 +416,9 @@ fn handle_list_key(app: &mut App, key: KeyEvent) {
             } else {
                 app.env_filter = Some(ENV_FILTER_MAP[idx].to_string());
             }
+            // Clear search state so the search prompt doesn't linger
+            app.search_active = false;
+            app.search_query.clear();
             app.refilter();
         }
 
@@ -580,7 +583,7 @@ fn handle_search_key(app: &mut App, key: KeyEvent) {
         // Allow arrow navigation while searching (before Char catch-all)
         KeyCode::Up => move_selection(app, -1),
         KeyCode::Down => move_selection(app, 1),
-        KeyCode::Char(c) => {
+        KeyCode::Char(c) if !c.is_control() => {
             app.search_query.push(c);
             app.refilter();
         }

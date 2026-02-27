@@ -168,6 +168,10 @@ impl FormState {
 
     /// Validate the form and build a Bookmark. Returns Err with a user-facing message on failure.
     pub fn validate_and_build(&mut self, config: &AppConfig) -> Result<Bookmark> {
+        // Clear any previous warning (e.g., identity file not found) so
+        // stale messages don't persist across validation attempts.
+        self.error = None;
+
         let name = self.fields[FIELD_NAME].trim().to_string();
         let host = self.fields[FIELD_HOST].trim().to_string();
 

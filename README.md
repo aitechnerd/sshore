@@ -5,7 +5,7 @@
 <h1 align="center">sshore</h1>
 
 <p align="center">
-  <strong>Your SSH config, SFTP client, tunnel manager, and Termius subscription — replaced by a single compact Rust binary.</strong>
+  <strong>SSH connections, file transfers, tunnels, and team config — all in one place. Your data stays on your machine.</strong>
 </p>
 
 <p align="center">
@@ -140,34 +140,22 @@ sshore completions fish > ~/.config/fish/completions/sshore.fish
 
 ## 💡 Why sshore?
 
-### The problem
+**Environment safety is built in, not bolted on.** Every bookmark has an environment tier. Every screen shows it. Production is red, always. You can't accidentally `rm -rf` on prod without seeing a wall of red and typing "yes" to confirm. This isn't a feature — it's a philosophy.
 
-If you manage more than a handful of servers, your workflow probably looks like one of these:
+**Five seconds to organized.** `sshore import` reads your `~/.ssh/config` — or your PuTTY sessions, MobaXterm bookmarks, Tabby profiles, SecureCRT exports, even a CSV — and auto-classifies hosts by environment based on hostname patterns. From install to fully organized, color-coded bookmarks in a single command.
 
-**The "raw ssh_config" approach** — You maintain `~/.ssh/config` by hand, maybe with some shell aliases. No organization beyond what you can grep for. One typo in production and you're deploying to the wrong server.
+**A single, compact binary.** Native Rust with `russh` for SSH, `ratatui` for TUI, and zero runtime dependencies. Starts in milliseconds, uses negligible memory, runs on macOS, Linux, and Windows.
 
-**The "Termius" approach** — You pay $120/year for bookmark organization, SFTP, and snippets. Your config lives in someone else's cloud. No export. Vendor lock-in by design.
+**Your data is yours, in an open format.** Your config is a single TOML file — `cat` it, `git` it, `diff` it, share it. Export your bookmarks anytime with `sshore export`. No proprietary formats, no lock-in, no account required to access your own data. Passwords live in your OS keychain, never in the config file.
 
-**The "Tabby" approach** — You download a 200MB Electron app that uses 800MB of RAM, spikes to 100% CPU, and has had broken SSH auth since the russh migration.
-
-### What sshore does differently
-
-**Environment tiers are mandatory, not optional.** Every bookmark has a tier. Every screen shows it. Production is red, always. You can't accidentally `rm -rf` on prod without seeing a wall of red and typing "yes" to confirm. This isn't a feature — it's a philosophy.
-
-**Zero-friction adoption.** `sshore import` reads your `~/.ssh/config` (including `Include`, `ProxyJump`, wildcard hosts, environment variables in `IdentityFile`) and auto-classifies hosts by environment based on hostname patterns. Five seconds from install to fully organized bookmarks.
-
-**It's a single, compact binary.** Not an Electron app. Not a web wrapper. Native Rust with `russh` for SSH, `ratatui` for TUI, and zero runtime dependencies. Starts in milliseconds, uses negligible memory.
-
-**Everything is portable TOML.** Your config is one file. `cat` it, `git` it, `diff` it, share it. Passwords are in your OS keychain, never in the config file. Export a filtered subset for your team with `sshore export --env production`.
-
-**It works offline.** sshore never makes a network call unless you explicitly connect, transfer, or tunnel. No update checks, no telemetry, no DNS resolution at startup. Important if you work on air-gapped networks.
+**Fully offline.** sshore never makes a network call unless you explicitly connect, transfer, or tunnel. No update checks, no telemetry, no DNS resolution at startup. Your infrastructure stays yours.
 
 ## ✨ Features
 
 ### SSH Connection Manager
 
 - **Interactive TUI** with fuzzy search, tag filtering, and environment grouping — handles hundreds of bookmarks
-- **Bookmark CRUD** with inline validation, auto-detected environments, and `~/.ssh/config` import
+- **Bookmark CRUD** with inline validation, auto-detected environments, and multi-source import (SSH config, PuTTY, MobaXterm, Tabby, SecureCRT, CSV)
 - **Direct connect** by bookmark name: `sshore prod-web-01` (no TUI needed)
 - **Ad-hoc connect** to any host: `sshore connect user@10.0.1.50` — save as bookmark later with `~b`
 - **ProxyJump / bastion host** support, including chained jumps
@@ -229,6 +217,26 @@ sshore import --file prod-servers.toml
 # Use a synced config location (Git, Dropbox, iCloud)
 export SSHORE_CONFIG=~/dotfiles/sshore/config.toml
 ```
+
+### Bring Your Bookmarks
+
+Switching tools should take seconds, not hours. sshore imports from wherever your bookmarks live today:
+
+```bash
+sshore import                                        # Interactive wizard — pick your source
+sshore import --from putty sessions.reg              # PuTTY registry export
+sshore import --from mobaxterm sessions.mxtsessions  # MobaXterm sessions
+sshore import --from tabby config.yaml               # Tabby profiles
+sshore import --from securecrt export.xml            # SecureCRT XML export
+sshore import --from csv hosts.csv                   # CSV (bulk provisioning, Ansible inventories)
+sshore import --from json hosts.json                 # JSON
+```
+
+Every import auto-detects environment tiers from hostname patterns and folder names, shows a preview of what will be created, and lets you resolve conflicts before committing. Add `--dry-run` to preview without saving.
+
+The `~/.ssh/config` importer handles `Include` directives, `ProxyJump` chains, `IdentityFile` with `~` and `$VAR` expansion, and 16 directives total. The PuTTY importer reads `.reg` registry exports. The MobaXterm importer reads `.mxtsessions` INI files. Tabby's jump host UUIDs are resolved to real hostnames automatically.
+
+sshore never scans your filesystem or registry looking for other tools — you choose what to import and provide the file.
 
 ### Host Key Verification
 
@@ -361,23 +369,6 @@ sshore is designed with the assumption that your SSH infrastructure is critical.
 
 If you discover a security vulnerability, please email **security@aitechnerd.com** (or [open a private security advisory](https://github.com/aitechnerd/sshore/security/advisories/new) on GitHub). Do not open a public issue for security vulnerabilities. We aim to acknowledge reports within 48 hours and provide a fix within 7 days for critical issues.
 
-## 🤝 Comparison
-
-| | sshore | sshs | termscp | Tabby | Termius |
-|---|:---:|:---:|:---:|:---:|:---:|
-| Environment-aware safety | ✅ | — | — | — | — |
-| Terminal tab theming | ✅ | — | — | ✅ | — |
-| Native SSH (no shell-out) | ✅ | — | ✅ | ✅ | ✅ |
-| SFTP / file browser | ✅ | — | ✅ | ✅ | ✅ (paid) |
-| Sudo password assist | ✅ | — | — | — | — |
-| Persistent tunnels | ✅ | — | — | ✅ | ✅ (paid) |
-| Snippets | ✅ | — | — | — | ✅ (paid) |
-| Config export | ✅ | — | — | — | — |
-| Resumable transfers | ✅ | — | — | — | — |
-| Shell completions | ✅ | — | — | — | — |
-| Binary size | Small | Small | Medium | ~200 MB | ~150 MB |
-| Price | **Free** | Free | Free | Free | **$120/yr** |
-
 ## 🤝 Contributing
 
 Contributions are welcome — whether it's a bug report, feature request, documentation improvement, or code.
@@ -424,7 +415,12 @@ sshore is structured around a clear phase-based architecture documented in [`CLA
 
 sshore is under active development. Current priorities:
 
+- [ ] Team sharing — export a filtered set of bookmarks for teammates (by environment, tag, or glob)
 - [ ] S3 / cloud storage browsing via `StorageBackend` trait + OpenDAL
+- [ ] Interactive import wizard with preview and conflict resolution TUI
+- [ ] Daily testing and stability hardening
+- [ ] Demo GIF and terminal recordings
+- [ ] Homebrew tap and binary releases for all platforms
 
 See the full plan in [CLAUDE.md](CLAUDE.md) and [CLAUDE.local.md](CLAUDE.local.md).
 

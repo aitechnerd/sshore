@@ -879,10 +879,10 @@ async fn run_proxy_loop(
                         }
                     }
                     // Flush remaining batch
-                    if !forward_batch.is_empty() {
-                        if tokio::io::AsyncWriteExt::write_all(&mut writer, &forward_batch).await.is_err() {
-                            break;
-                        }
+                    if !forward_batch.is_empty()
+                        && tokio::io::AsyncWriteExt::write_all(&mut writer, &forward_batch).await.is_err()
+                    {
+                        break;
                     }
                 } else {
                     // No escape triggers configured — fast path, skip detection

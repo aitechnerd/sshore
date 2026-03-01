@@ -18,11 +18,12 @@ use ratatui::widgets::{Block, Borders};
 
 use crate::config;
 use crate::config::model::AppConfig;
+use crate::config::ssh_import::merge_imports;
 use crate::ssh;
 use crate::tui::theme::{ThemeColors, resolve_theme};
 use crate::tui::views::confirm::ConfirmState;
 use crate::tui::views::form::FormState;
-use crate::tui::views::{confirm, form, help, list};
+use crate::tui::views::{confirm, form, help, import_wizard, list};
 use crate::tui::widgets::{search_bar, status_bar};
 
 /// Duration before status messages auto-clear.
@@ -187,6 +188,29 @@ fn leave_tui(terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>) -> Resu
 /// Terminal cleanup on panic is handled by `setup_panic_hook()` in main.rs,
 /// which covers raw mode, alternate screen, cursor, colors, and SSH theming.
 pub async fn run(config: &mut AppConfig, cfg_override: Option<&str>) -> Result<()> {
+    // First-run import wizard: show when no bookmarks and not previously dismissed
+    if config.bookmarks.is_empty() && !config.settings.import_wizard_dismissed {
+        match import_wizard::run_wizard(config, false, None, &[], true)? {
+            Some(result) => {
+                let imported = merge_imports(&mut config.bookmarks, result.bookmarks, false);
+                config.settings.import_wizard_dismissed = true;
+                config::save_with_override(config, cfg_override)
+                    .context("Failed to save config after import")?;
+                eprintln!(
+                    "Imported {} bookmark(s) from {}",
+                    imported.imported.len(),
+                    result.source_label
+                );
+            }
+            None => {
+                // User cancelled/skipped — persist dismissal so wizard doesn't nag
+                config.settings.import_wizard_dismissed = true;
+                config::save_with_override(config, cfg_override)
+                    .context("Failed to save config after dismissing wizard")?;
+            }
+        }
+    }
+
     let mut app = App::new(config.clone()).with_config_override(cfg_override);
 
     loop {

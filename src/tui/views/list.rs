@@ -118,7 +118,6 @@ pub fn render_list(frame: &mut Frame, area: Rect, app: &App) {
 fn render_empty_state(frame: &mut Frame, area: Rect, theme: &ThemeColors) {
     let text = Text::from(vec![
         Line::from(""),
-        Line::from(""),
         Line::from(Span::styled(
             "No bookmarks yet.",
             Style::default()
@@ -131,12 +130,21 @@ fn render_empty_state(frame: &mut Frame, area: Rect, theme: &ThemeColors) {
             Style::default().fg(theme.fg),
         )),
         Line::from(Span::styled(
-            "  sshore import",
+            "sshore import",
             Style::default().fg(theme.accent),
         )),
         Line::from(Span::styled(
-            "to import from ~/.ssh/config",
+            "to import from:",
             Style::default().fg(theme.fg),
+        )),
+        Line::from(""),
+        Line::from(Span::styled(
+            "SSH Config  \u{00b7}  PuTTY  \u{00b7}  MobaXterm  \u{00b7}  Tabby",
+            Style::default().fg(theme.fg_dim),
+        )),
+        Line::from(Span::styled(
+            "SecureCRT  \u{00b7}  CSV  \u{00b7}  JSON",
+            Style::default().fg(theme.fg_dim),
         )),
     ]);
 

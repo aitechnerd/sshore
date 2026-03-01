@@ -807,18 +807,29 @@ async fn run_proxy_loop(
                     awaiting_confirm = false;
                     detector.clear();
                 } else if has_escape_triggers {
-                    // Escape detection: feed bytes through combined handler
+                    // Escape detection: feed bytes through combined handler.
+                    // Batch forwarded bytes to minimize SSH channel writes.
+                    let mut forward_batch = Vec::new();
                     for &byte in &bytes {
                         match escape_handler.feed(byte) {
                             SessionAction::Forward(fwd) => {
-                                if tokio::io::AsyncWriteExt::write_all(&mut writer, &fwd).await.is_err() {
-                                    break;
-                                }
+                                forward_batch.extend(fwd);
                             }
                             SessionAction::Buffer => {
-                                // Hold — might be start of escape sequence
+                                // Flush accumulated batch before buffering
+                                if !forward_batch.is_empty() {
+                                    if tokio::io::AsyncWriteExt::write_all(&mut writer, &forward_batch).await.is_err() {
+                                        break;
+                                    }
+                                    forward_batch.clear();
+                                }
                             }
                             SessionAction::ShowSnippets => {
+                                // Flush batch before showing picker
+                                if !forward_batch.is_empty() {
+                                    let _ = tokio::io::AsyncWriteExt::write_all(&mut writer, &forward_batch).await;
+                                    forward_batch.clear();
+                                }
                                 // Show snippet picker, inject selected command
                                 if let Ok(Some(command)) = snippet::show_snippet_picker(
                                     &mut stdout,
@@ -833,6 +844,11 @@ async fn run_proxy_loop(
                                 }
                             }
                             SessionAction::ShowSaveBookmark => {
+                                // Flush batch before showing form
+                                if !forward_batch.is_empty() {
+                                    let _ = tokio::io::AsyncWriteExt::write_all(&mut writer, &forward_batch).await;
+                                    forward_batch.clear();
+                                }
                                 // Show save-as-bookmark form
                                 if let Ok(Some(new_bookmark)) = snippet::show_save_bookmark_form(
                                     &mut stdout,
@@ -860,6 +876,12 @@ async fn run_proxy_loop(
                                     let _ = stdout.flush();
                                 }
                             }
+                        }
+                    }
+                    // Flush remaining batch
+                    if !forward_batch.is_empty() {
+                        if tokio::io::AsyncWriteExt::write_all(&mut writer, &forward_batch).await.is_err() {
+                            break;
                         }
                     }
                 } else {
@@ -903,15 +925,39 @@ async fn read_stdin(tx: tokio::sync::mpsc::Sender<Vec<u8>>) {
 }
 
 /// Handle terminal resize events and forward to SSH channel.
+/// Uses SIGWINCH signal on Unix to avoid competing with the stdin reader
+/// for stdin bytes (crossterm's EventStream reads from stdin too,
+/// which causes dropped keystrokes).
+#[cfg(unix)]
 async fn handle_resize(channel_tx: russh::ChannelWriteHalf<russh::client::Msg>) {
-    let mut event_stream = crossterm::event::EventStream::new();
-    use tokio_stream::StreamExt;
+    use tokio::signal::unix::{SignalKind, signal};
 
-    while let Some(Ok(event)) = event_stream.next().await {
-        if let crossterm::event::Event::Resize(cols, rows) = event {
-            let _ = channel_tx
-                .window_change(cols as u32, rows as u32, 0, 0)
-                .await;
+    let mut sigwinch = match signal(SignalKind::window_change()) {
+        Ok(s) => s,
+        Err(_) => return,
+    };
+
+    while sigwinch.recv().await.is_some() {
+        let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
+        let _ = channel_tx
+            .window_change(cols as u32, rows as u32, 0, 0)
+            .await;
+    }
+}
+
+/// Handle terminal resize events via polling on non-Unix platforms.
+#[cfg(not(unix))]
+async fn handle_resize(channel_tx: russh::ChannelWriteHalf<russh::client::Msg>) {
+    let mut last_size = crossterm::terminal::size().unwrap_or((80, 24));
+    loop {
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        if let Ok(size) = crossterm::terminal::size() {
+            if size != last_size {
+                last_size = size;
+                let _ = channel_tx
+                    .window_change(size.0 as u32, size.1 as u32, 0, 0)
+                    .await;
+            }
         }
     }
 }

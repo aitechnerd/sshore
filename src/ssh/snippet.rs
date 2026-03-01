@@ -176,11 +176,27 @@ pub enum SessionAction {
     ShowSaveBookmark,
 }
 
+/// Tracks terminal escape sequence state so the trigger detectors
+/// don't intercept bytes that are part of CSI/SS3 sequences
+/// (e.g. F10 = `\x1b[21~` — the trailing `~` must not start trigger matching).
+enum TermSeqState {
+    Normal,
+    /// Saw `\x1b`, waiting for type indicator.
+    AfterEsc,
+    /// Inside a CSI sequence (`\x1b[`), waiting for final byte (0x40..=0x7E).
+    InCsi,
+    /// Inside an SS3 sequence (`\x1b O`), next byte completes it.
+    InSs3,
+}
+
 /// Combined escape handler for snippet trigger and bookmark trigger.
 /// Handles two independent escape sequences during an SSH session.
+/// Tracks terminal escape sequences (CSI, SS3) to avoid intercepting
+/// function key bytes like the `~` terminator in `\x1b[21~` (F10).
 pub struct SessionEscapeHandler {
     snippet_detector: EscapeDetector,
     bookmark_detector: EscapeDetector,
+    term_seq: TermSeqState,
 }
 
 impl SessionEscapeHandler {
@@ -189,16 +205,51 @@ impl SessionEscapeHandler {
         Self {
             snippet_detector: EscapeDetector::new(snippet_trigger),
             bookmark_detector: EscapeDetector::new(bookmark_trigger),
+            term_seq: TermSeqState::Normal,
         }
     }
 
     /// Feed a single byte from stdin. Returns what action to take.
     ///
-    /// The snippet detector gets first pass. If it buffers or triggers, the
-    /// bookmark detector doesn't see the byte. When the snippet detector
-    /// forwards (either immediately or by flushing a failed partial match),
-    /// those forwarded bytes are then checked by the bookmark detector.
+    /// Terminal escape sequences (CSI, SS3) are forwarded directly without
+    /// trigger detection. For normal bytes, the snippet detector gets first
+    /// pass; when it forwards, those bytes are checked by the bookmark detector.
     pub fn feed(&mut self, byte: u8) -> SessionAction {
+        // Track terminal escape sequence state.
+        // Bytes inside escape sequences bypass trigger detection entirely.
+        match self.term_seq {
+            TermSeqState::Normal => {
+                if byte == 0x1b {
+                    self.term_seq = TermSeqState::AfterEsc;
+                    return SessionAction::Forward(vec![byte]);
+                }
+                // Not inside an escape sequence — run trigger detection below
+            }
+            TermSeqState::AfterEsc => {
+                self.term_seq = match byte {
+                    b'[' => TermSeqState::InCsi,
+                    b'O' => TermSeqState::InSs3,
+                    // Two-byte sequence (\x1b + char, e.g. Alt+key) — done
+                    _ => TermSeqState::Normal,
+                };
+                return SessionAction::Forward(vec![byte]);
+            }
+            TermSeqState::InCsi => {
+                // Final byte range 0x40..=0x7E ends the CSI sequence
+                // (includes `~`, `A`-`Z`, `a`-`z`, etc.)
+                if (0x40..=0x7E).contains(&byte) {
+                    self.term_seq = TermSeqState::Normal;
+                }
+                return SessionAction::Forward(vec![byte]);
+            }
+            TermSeqState::InSs3 => {
+                // SS3 sequences are exactly one byte after \x1bO
+                self.term_seq = TermSeqState::Normal;
+                return SessionAction::Forward(vec![byte]);
+            }
+        }
+
+        // Normal byte — run through trigger detectors
         match self.snippet_detector.feed(byte) {
             EscapeAction::Trigger => SessionAction::ShowSnippets,
             EscapeAction::Buffer => {
@@ -615,5 +666,103 @@ mod tests {
             SessionAction::Forward(bytes) => assert_eq!(bytes, vec![b'~']),
             _ => panic!("Expected Forward for disabled triggers"),
         }
+    }
+
+    // --- Terminal escape sequence passthrough ---
+
+    #[test]
+    fn test_session_handler_f10_csi_passthrough() {
+        // F10 = \x1b[21~ — the trailing ~ must NOT start trigger matching
+        let mut handler = SessionEscapeHandler::new("~~", "~b");
+
+        let f10 = b"\x1b[21~";
+        let mut forwarded = Vec::new();
+        for &byte in f10 {
+            match handler.feed(byte) {
+                SessionAction::Forward(fwd) => forwarded.extend(fwd),
+                SessionAction::Buffer => panic!("CSI bytes should not be buffered by trigger"),
+                _ => panic!("CSI sequence should not trigger actions"),
+            }
+        }
+        assert_eq!(forwarded, f10.to_vec());
+    }
+
+    #[test]
+    fn test_session_handler_f5_csi_passthrough() {
+        // F5 = \x1b[15~
+        let mut handler = SessionEscapeHandler::new("~~", "~b");
+
+        let f5 = b"\x1b[15~";
+        let mut forwarded = Vec::new();
+        for &byte in f5 {
+            match handler.feed(byte) {
+                SessionAction::Forward(fwd) => forwarded.extend(fwd),
+                _ => panic!("F5 CSI sequence should pass through"),
+            }
+        }
+        assert_eq!(forwarded, f5.to_vec());
+    }
+
+    #[test]
+    fn test_session_handler_arrow_key_csi_passthrough() {
+        // Up arrow = \x1b[A
+        let mut handler = SessionEscapeHandler::new("~~", "~b");
+
+        let up = b"\x1b[A";
+        let mut forwarded = Vec::new();
+        for &byte in up {
+            match handler.feed(byte) {
+                SessionAction::Forward(fwd) => forwarded.extend(fwd),
+                _ => panic!("Arrow key CSI should pass through"),
+            }
+        }
+        assert_eq!(forwarded, up.to_vec());
+    }
+
+    #[test]
+    fn test_session_handler_ss3_passthrough() {
+        // Some terminals send SS3 for function keys: \x1bOP (F1)
+        let mut handler = SessionEscapeHandler::new("~~", "~b");
+
+        let f1 = b"\x1bOP";
+        let mut forwarded = Vec::new();
+        for &byte in f1 {
+            match handler.feed(byte) {
+                SessionAction::Forward(fwd) => forwarded.extend(fwd),
+                _ => panic!("SS3 sequence should pass through"),
+            }
+        }
+        assert_eq!(forwarded, f1.to_vec());
+    }
+
+    #[test]
+    fn test_session_handler_csi_then_trigger_works() {
+        // After a CSI sequence completes, trigger detection should still work
+        let mut handler = SessionEscapeHandler::new("~~", "~b");
+
+        // Send F10
+        for &byte in b"\x1b[21~" {
+            handler.feed(byte);
+        }
+
+        // Now trigger ~~ should still work
+        assert!(matches!(handler.feed(b'~'), SessionAction::Buffer));
+        assert!(matches!(handler.feed(b'~'), SessionAction::ShowSnippets));
+    }
+
+    #[test]
+    fn test_session_handler_alt_key_passthrough() {
+        // Alt+x = \x1b x (two bytes)
+        let mut handler = SessionEscapeHandler::new("~~", "~b");
+
+        let alt_x = b"\x1bx";
+        let mut forwarded = Vec::new();
+        for &byte in alt_x {
+            match handler.feed(byte) {
+                SessionAction::Forward(fwd) => forwarded.extend(fwd),
+                _ => panic!("Alt+key should pass through"),
+            }
+        }
+        assert_eq!(forwarded, alt_x.to_vec());
     }
 }

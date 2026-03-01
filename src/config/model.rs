@@ -97,6 +97,11 @@ pub struct Settings {
     /// SSH connection timeout in seconds. Default: 15.
     /// Set higher for slow networks, lower for fast local connections.
     pub connect_timeout_secs: Option<u64>,
+
+    /// Whether the first-run import wizard has been dismissed.
+    /// Set to true after the user skips or completes the wizard.
+    #[serde(default)]
+    pub import_wizard_dismissed: bool,
 }
 
 /// Color and badge configuration for an environment tier.
@@ -186,6 +191,7 @@ impl Default for Settings {
             snippets: Vec::new(),
             host_key_checking: default_host_key_checking(),
             connect_timeout_secs: None,
+            import_wizard_dismissed: false,
         }
     }
 }

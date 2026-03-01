@@ -7,7 +7,7 @@ mod storage;
 mod tui;
 
 use std::io::{self, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 use clap::{CommandFactory, Parser};
@@ -210,11 +210,35 @@ fn cmd_import(
         config::env::warn_unknown_env(env);
     }
 
+    // AC-8: --from/--file flags bypass wizard entirely (backward compat)
+    // AC-9: other flags (--overwrite, --env) without --from/--file open wizard with flags applied
+    if from.is_none() && file.is_none() {
+        let app_config =
+            config::load_with_override(cfg_override).context("Failed to load sshore config")?;
+        let result = match tui::views::import_wizard::run_wizard(
+            &app_config,
+            overwrite,
+            env_override.as_deref(),
+            &extra_tags,
+            false,
+        )? {
+            Some(r) => r,
+            None => return Ok(()), // User cancelled
+        };
+        return finish_import(
+            result.bookmarks,
+            &result.source_label,
+            &result.file_path,
+            overwrite,
+            dry_run,
+            cfg_override,
+        );
+    }
+
     // Resolve the import file path
     let import_path: PathBuf = if let Some(ref f) = file {
         shellexpand::tilde(f).to_string().into()
-    } else if from.is_none() || matches!(from, Some(ImportSource::SshConfig)) {
-        // Default to ~/.ssh/config for ssh_config / no-source
+    } else if matches!(from, Some(ImportSource::SshConfig)) {
         default_ssh_config_path()
     } else {
         anyhow::bail!(
@@ -230,9 +254,6 @@ fn cmd_import(
             import_path.display()
         );
     }
-
-    let mut app_config =
-        config::load_with_override(cfg_override).context("Failed to load sshore config")?;
 
     // Convert CLI ImportSource to config ImportSourceKind
     let source_kind = match &from {
@@ -299,6 +320,28 @@ fn cmd_import(
             }
         }
     }
+
+    finish_import(
+        imported,
+        source_label,
+        &import_path,
+        overwrite,
+        dry_run,
+        cfg_override,
+    )
+}
+
+/// Complete an import: dry-run output or merge + save + summary.
+fn finish_import(
+    imported: Vec<Bookmark>,
+    source_label: &str,
+    import_path: &Path,
+    overwrite: bool,
+    dry_run: bool,
+    cfg_override: Option<&str>,
+) -> Result<()> {
+    let mut app_config =
+        config::load_with_override(cfg_override).context("Failed to load sshore config")?;
 
     let total_parsed = imported.len();
 
@@ -406,8 +449,9 @@ fn cmd_list(env_filter: Option<String>, cfg_override: Option<&str>) -> Result<()
         if env_filter.is_some() {
             println!("No bookmarks matching environment filter.");
         } else {
-            println!("No bookmarks yet. Import from SSH config:");
-            println!("  sshore import");
+            println!(
+                "No bookmarks yet. Run `sshore import` to import from SSH config, PuTTY, Tabby, CSV, and more."
+            );
         }
         return Ok(());
     }

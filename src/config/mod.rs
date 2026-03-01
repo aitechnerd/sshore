@@ -95,10 +95,6 @@ pub fn load_from(path: &Path) -> Result<AppConfig> {
     if !path.exists() {
         let config = AppConfig::default();
         save_to(&config, path)?;
-        eprintln!(
-            "Created default config at {}\nTip: run `sshore import` to import from ~/.ssh/config",
-            path.display()
-        );
         return Ok(config);
     }
 

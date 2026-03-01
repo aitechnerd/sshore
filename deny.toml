@@ -2,20 +2,24 @@
 # Docs: https://embarkstudios.github.io/cargo-deny/
 
 [advisories]
-vulnerability = "deny"
-unmaintained = "warn"
-yanked = "warn"
-notice = "warn"
+version = 2
+# RUSTSEC-2023-0071: rsa crate Marvin Attack — transitive via russh,
+# no patch available, low risk (no direct RSA usage, timing attacks
+# impractical over SSH).
+ignore = ["RUSTSEC-2023-0071"]
 
 [licenses]
-unlicensed = "deny"
+version = 2
 allow = [
     "MIT",
     "Apache-2.0",
     "BSD-2-Clause",
     "BSD-3-Clause",
     "ISC",
-    "Unicode-DFS-2016",
+    "CC0-1.0",
+    "MPL-2.0",
+    "OpenSSL",
+    "Unicode-3.0",
     "Zlib",
 ]
 

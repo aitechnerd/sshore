@@ -1,0 +1,14 @@
+# Gitleaks configuration — suppress false positives
+# Docs: https://github.com/gitleaks/gitleaks
+
+[allowlist]
+# Cargo.lock contains crate names (e.g., "libcrux-sha3") that
+# resemble API keys but are not secrets.
+paths = [
+    '''Cargo\.lock''',
+]
+
+# Test fixture SSH public key fragments in known_hosts tests.
+regexes = [
+    '''AAAAC3NzaC1lZDI1NTE5AAAAItest''',
+]

@@ -16,7 +16,6 @@ crossterm = "0.29"
 
 # SSH & SFTP
 russh = "0.57"
-russh-keys = "0.49"
 russh-sftp = "2.1"
 
 # Async
@@ -57,7 +56,6 @@ percent-encoding = "2"
 # Other
 regex = "1"
 chrono = { version = "0.4", features = ["serde"] }
-uuid = { version = "1", features = ["v4"] }
 whoami = "1"
 base64 = "0.22.1"
 sha2 = "0.10.9"

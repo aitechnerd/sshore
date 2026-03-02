@@ -26,8 +26,8 @@ use crate::tui::widgets::env_badge;
 
 // ─── Constants ───────────────────────────────────────────────────────────────
 
-/// Tick rate for UI updates.
-const TICK_RATE: std::time::Duration = std::time::Duration::from_millis(100);
+/// Poll timeout when idle. User input is detected instantly regardless of this value.
+const TICK_RATE: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// Number of available import sources.
 const SOURCE_COUNT: usize = 8;
@@ -244,15 +244,27 @@ pub fn run_wizard(
         first_run,
     };
 
-    loop {
-        terminal
-            .draw(|frame| draw(frame, &state, &config.settings, &theme))
-            .context("Failed to draw frame")?;
+    let mut needs_redraw = true;
 
-        if event::poll(TICK_RATE).context("Failed to poll events")?
-            && let Event::Key(key) = event::read().context("Failed to read event")?
-        {
-            handle_key(&mut state, key, config, env_override, extra_tags);
+    loop {
+        if needs_redraw {
+            terminal
+                .draw(|frame| draw(frame, &state, &config.settings, &theme))
+                .context("Failed to draw frame")?;
+            needs_redraw = false;
+        }
+
+        if event::poll(TICK_RATE).context("Failed to poll events")? {
+            match event::read().context("Failed to read event")? {
+                Event::Key(key) => {
+                    handle_key(&mut state, key, config, env_override, extra_tags);
+                    needs_redraw = true;
+                }
+                Event::Resize(_, _) => {
+                    needs_redraw = true;
+                }
+                _ => {}
+            }
         }
 
         if state.should_quit {

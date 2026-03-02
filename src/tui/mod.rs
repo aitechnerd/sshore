@@ -30,8 +30,12 @@ use crate::tui::widgets::{search_bar, status_bar};
 /// Duration before status messages auto-clear.
 const STATUS_MESSAGE_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Tick rate for UI updates.
-const TICK_RATE: Duration = Duration::from_millis(100);
+/// Poll timeout when a status message is pending (need to detect expiry).
+const TICK_RATE_ACTIVE: Duration = Duration::from_millis(100);
+
+/// Poll timeout when idle (no timed state changes pending).
+/// User input is detected instantly regardless of this value.
+const TICK_RATE_IDLE: Duration = Duration::from_secs(1);
 
 /// Number of items to jump with Page Up/Down.
 const PAGE_JUMP: usize = 10;
@@ -320,18 +324,43 @@ fn event_loop(
     app.connect_request = None;
     app.browse_request = None;
 
-    loop {
-        terminal
-            .draw(|frame| draw(frame, app))
-            .context("Failed to draw frame")?;
+    // Always draw the first frame
+    let mut needs_redraw = true;
 
-        if event::poll(TICK_RATE).context("Failed to poll events")?
-            && let Event::Key(key) = event::read().context("Failed to read event")?
-        {
-            handle_key_event(app, key);
+    loop {
+        if needs_redraw {
+            terminal
+                .draw(|frame| draw(frame, app))
+                .context("Failed to draw frame")?;
+            needs_redraw = false;
         }
 
+        // Use a shorter poll timeout when a status message needs expiry checking
+        let poll_timeout = if app.status_message.is_some() {
+            TICK_RATE_ACTIVE
+        } else {
+            TICK_RATE_IDLE
+        };
+
+        if event::poll(poll_timeout).context("Failed to poll events")? {
+            match event::read().context("Failed to read event")? {
+                Event::Key(key) => {
+                    handle_key_event(app, key);
+                    needs_redraw = true;
+                }
+                Event::Resize(_, _) => {
+                    needs_redraw = true;
+                }
+                _ => {}
+            }
+        }
+
+        // Check if status message expired (only source of timed state change)
+        let had_status = app.status_message.is_some();
         app.tick();
+        if had_status && app.status_message.is_none() {
+            needs_redraw = true;
+        }
 
         if app.should_quit {
             return Ok(LoopAction::Quit);

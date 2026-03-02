@@ -12,8 +12,9 @@ use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph};
 use crate::sftp::shortcuts::format_bytes;
 use crate::storage::{Backend, FileEntry};
 
-/// Duration for TUI event poll.
-const POLL_RATE: Duration = Duration::from_millis(100);
+/// Poll timeout when idle (no timed state changes pending).
+/// User input is detected instantly regardless of this value.
+const POLL_RATE: Duration = Duration::from_secs(1);
 
 /// Drop guard that restores terminal state when the browser exits (normally or on error).
 struct BrowserGuard;
@@ -209,38 +210,52 @@ pub async fn run(
     refresh_pane(&mut left_pane, left, &state).await?;
     refresh_pane(&mut right_pane, right, &state).await?;
 
+    let mut needs_redraw = true;
+
     loop {
-        terminal.draw(|frame| draw(frame, &mut left_pane, &mut right_pane, &state))?;
+        if needs_redraw {
+            terminal.draw(|frame| draw(frame, &mut left_pane, &mut right_pane, &state))?;
+            needs_redraw = false;
+        }
 
-        if event::poll(POLL_RATE)?
-            && let Event::Key(key) = event::read()?
-        {
-            // Handle input modes (filter, mkdir, rename, confirm, pattern select)
-            if !matches!(state.input_mode, InputMode::Normal) {
-                handle_input_mode(
-                    key,
-                    &mut left_pane,
-                    &mut right_pane,
-                    &mut state,
-                    left,
-                    right,
-                )
-                .await?;
-                continue;
-            }
+        if event::poll(POLL_RATE)? {
+            match event::read()? {
+                Event::Key(key) => {
+                    // Handle input modes (filter, mkdir, rename, confirm, pattern select)
+                    if !matches!(state.input_mode, InputMode::Normal) {
+                        handle_input_mode(
+                            key,
+                            &mut left_pane,
+                            &mut right_pane,
+                            &mut state,
+                            left,
+                            right,
+                        )
+                        .await?;
+                        needs_redraw = true;
+                        continue;
+                    }
 
-            let action = handle_key(
-                key,
-                &mut left_pane,
-                &mut right_pane,
-                &mut state,
-                left,
-                right,
-            )
-            .await?;
+                    let action = handle_key(
+                        key,
+                        &mut left_pane,
+                        &mut right_pane,
+                        &mut state,
+                        left,
+                        right,
+                    )
+                    .await?;
 
-            if action == BrowserAction::Quit {
-                break;
+                    needs_redraw = true;
+
+                    if action == BrowserAction::Quit {
+                        break;
+                    }
+                }
+                Event::Resize(_, _) => {
+                    needs_redraw = true;
+                }
+                _ => {}
             }
         }
     }

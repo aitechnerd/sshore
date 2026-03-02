@@ -22,7 +22,7 @@ use crate::config::model::{AppConfig, Bookmark};
 use crate::keychain;
 
 use self::client::{HostKeyCheckMode, SshoreHandler};
-use self::password::PasswordDetector;
+use self::password::{PasswordDetector, PromptKind};
 
 /// Result of executing a single command on a remote host.
 pub struct ExecResult {
@@ -424,7 +424,7 @@ pub async fn connect(
             None
         })
         .map(Zeroizing::new);
-    let detector = PasswordDetector::new(stored_password.is_some());
+    let detector = PasswordDetector::new(true);
 
     // Send on_connect command if configured
     let bookmark = &config.bookmarks[bookmark_index];
@@ -905,7 +905,7 @@ enum ProxyAction {
 async fn run_proxy_loop(
     channel: russh::Channel<russh::client::Msg>,
     mut detector: PasswordDetector,
-    stored_password: Option<Zeroizing<String>>,
+    mut stored_password: Option<Zeroizing<String>>,
     bookmark_snippets: Vec<crate::config::model::Snippet>,
     global_snippets: Vec<crate::config::model::Snippet>,
     snippet_trigger: String,
@@ -930,6 +930,8 @@ async fn run_proxy_loop(
 
     let mut stdout = std::io::stdout();
     let mut awaiting_confirm = false;
+    let mut capturing_pw: Option<Zeroizing<String>> = None;
+    let mut offering_save_pw: Option<Zeroizing<String>> = None;
 
     // Combined escape handler for snippets, bookmark save, and browser
     use self::snippet::{SessionAction, SessionEscapeHandler};
@@ -1003,12 +1005,29 @@ async fn run_proxy_loop(
                             }
 
                             // Feed data to password detector
-                            if !awaiting_confirm && detector.feed(data) {
-                                tracing::debug!("password prompt detected in output");
-                                awaiting_confirm = true;
-                                let mut stderr = std::io::stderr();
-                                let _ = write!(stderr, "\r\n[sshore] Password found in keychain. Press Enter to auto-fill, Esc to skip.\r\n");
-                                let _ = stderr.flush();
+                            let sudo_active = awaiting_confirm
+                                || capturing_pw.is_some()
+                                || offering_save_pw.is_some();
+                            if !sudo_active {
+                                let prompt = detector.feed(data);
+                                if prompt.detected() {
+                                    tracing::debug!(?prompt, "password prompt detected");
+                                    if stored_password.is_some() {
+                                        // Auto-fill works for any prompt type
+                                        awaiting_confirm = true;
+                                        let mut stderr = std::io::stderr();
+                                        let _ = write!(stderr, "\r\n[sshore] Password found in keychain. Press Enter to auto-fill, Esc to skip.\r\n");
+                                        let _ = stderr.flush();
+                                    } else if prompt == PromptKind::Sudo
+                                        && session_info.bookmark_name.is_some()
+                                    {
+                                        // Only capture-and-save for explicit sudo prompts;
+                                        // generic "Password:" could be su, mysql, etc.
+                                        tracing::debug!("no stored password — capturing sudo password");
+                                        capturing_pw =
+                                            Some(Zeroizing::new(String::new()));
+                                    }
+                                }
                             }
                         }
                         Some(ChannelMsg::ExtendedData { data, ext: 1 }) => {
@@ -1046,6 +1065,94 @@ async fn run_proxy_loop(
                         }
                         awaiting_confirm = false;
                         detector.clear();
+                    } else if capturing_pw.is_some() {
+                        // Capture typed password while forwarding to remote
+                        let buffer = capturing_pw.as_mut().unwrap();
+                        let mut enter_pressed = false;
+                        for &b in &bytes {
+                            match b {
+                                0x0d => {
+                                    enter_pressed = true;
+                                    break;
+                                }
+                                0x7f | 0x08 => {
+                                    buffer.pop();
+                                }
+                                b if b >= 0x20 => {
+                                    buffer.push(b as char);
+                                }
+                                _ => {}
+                            }
+                        }
+                        // Forward all bytes to remote
+                        if tokio::io::AsyncWriteExt::write_all(&mut writer, &bytes)
+                            .await
+                            .is_err()
+                        {
+                            break 'proxy ProxyAction::Exit;
+                        }
+                        if enter_pressed {
+                            let pw = capturing_pw.take().unwrap();
+                            if !pw.is_empty()
+                                && let Some(ref name) = session_info.bookmark_name
+                            {
+                                tracing::debug!("password captured, offering save");
+                                let mut stderr = std::io::stderr();
+                                let _ = write!(
+                                    stderr,
+                                    "\r\n\x1b[2m[sshore] Save password to keychain \
+                                     for '{name}'? [y/N]\x1b[0m "
+                                );
+                                let _ = stderr.flush();
+                                offering_save_pw = Some(pw);
+                            }
+                            detector.clear();
+                        }
+                    } else if offering_save_pw.is_some() {
+                        // Handle y/N response for password save offer
+                        let pw = offering_save_pw.take().unwrap();
+                        let first = bytes.first().copied();
+                        let mut stderr = std::io::stderr();
+                        if first == Some(b'y') || first == Some(b'Y') {
+                            if let Some(ref name) = session_info.bookmark_name {
+                                match keychain::set_password(name, &pw) {
+                                    Ok(()) => {
+                                        tracing::debug!("password saved to keychain");
+                                        let _ = write!(
+                                            stderr,
+                                            "\r\n\x1b[2m[sshore] Password saved \
+                                             for '{name}'.\x1b[0m\r\n"
+                                        );
+                                        // Enable auto-fill for subsequent prompts
+                                        stored_password = Some(pw);
+                                    }
+                                    Err(e) => {
+                                        let _ = write!(
+                                            stderr,
+                                            "\r\n\x1b[2mWarning: failed to save: \
+                                             {e}\x1b[0m\r\n"
+                                        );
+                                    }
+                                }
+                            }
+                        } else if first == Some(b'n')
+                            || first == Some(b'N')
+                            || first == Some(0x0d)
+                            || first == Some(0x1b)
+                        {
+                            // Explicit decline — consume the keystroke
+                            let _ = write!(stderr, "\r\n");
+                        } else {
+                            // Any other key — dismiss prompt and forward to remote
+                            let _ = write!(stderr, "\r\n");
+                            if tokio::io::AsyncWriteExt::write_all(&mut writer, &bytes)
+                                .await
+                                .is_err()
+                            {
+                                break 'proxy ProxyAction::Exit;
+                            }
+                        }
+                        let _ = stderr.flush();
                     } else if has_escape_triggers {
                         let mut forward_batch = Vec::new();
                         let mut should_break = false;

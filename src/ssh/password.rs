@@ -5,10 +5,18 @@ use regex::Regex;
 /// Maximum rolling buffer size in bytes.
 const BUFFER_CAP: usize = 256;
 
-/// Compiled regex patterns for common sudo/password prompts.
-static PASSWORD_PATTERNS: LazyLock<Vec<Regex>> = LazyLock::new(|| {
+/// Sudo-specific patterns — safe to capture and offer saving to keychain.
+static SUDO_PATTERNS: LazyLock<Vec<Regex>> = LazyLock::new(|| {
+    [r"\[sudo\] password for \S+:\s*$"]
+        .iter()
+        .map(|p| Regex::new(p).expect("sudo pattern must compile"))
+        .collect()
+});
+
+/// Generic password prompts — suitable for auto-fill but too ambiguous to
+/// capture-and-save (could be `su`, `mysql`, `passwd`, etc.).
+static GENERIC_PASSWORD_PATTERNS: LazyLock<Vec<Regex>> = LazyLock::new(|| {
     [
-        r"\[sudo\] password for \S+:\s*$",
         r"Password:\s*$",
         r"Enter passphrase for key '.+':\s*$",
         r"\S+'s password:\s*$",
@@ -17,6 +25,24 @@ static PASSWORD_PATTERNS: LazyLock<Vec<Regex>> = LazyLock::new(|| {
     .map(|p| Regex::new(p).expect("password pattern must compile"))
     .collect()
 });
+
+/// What kind of password prompt was detected.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PromptKind {
+    /// No prompt detected.
+    None,
+    /// `[sudo] password for <user>:` — safe to capture and save.
+    Sudo,
+    /// Generic prompt (`Password:`, passphrase, `user's password:`) — auto-fill only.
+    Generic,
+}
+
+impl PromptKind {
+    /// Whether any prompt was detected.
+    pub fn detected(self) -> bool {
+        self != Self::None
+    }
+}
 
 /// Extract only valid UTF-8 from a byte slice, skipping invalid bytes.
 ///
@@ -69,17 +95,17 @@ impl PasswordDetector {
     }
 
     /// Feed data from the SSH output stream into the detector.
-    /// Returns `true` if a password prompt is detected.
-    pub fn feed(&mut self, data: &[u8]) -> bool {
+    /// Returns the kind of password prompt detected, if any.
+    pub fn feed(&mut self, data: &[u8]) -> PromptKind {
         if !self.has_password {
-            return false;
+            return PromptKind::None;
         }
 
         // Only process valid UTF-8 portions, skipping invalid bytes to avoid
         // false positives from replacement characters in binary data.
         let text = extract_valid_utf8(data);
         if text.is_empty() {
-            return false;
+            return PromptKind::None;
         }
         self.buffer.push_str(&text);
 
@@ -95,7 +121,16 @@ impl PasswordDetector {
             self.buffer = self.buffer[boundary..].to_string();
         }
 
-        PASSWORD_PATTERNS.iter().any(|p| p.is_match(&self.buffer))
+        if SUDO_PATTERNS.iter().any(|p| p.is_match(&self.buffer)) {
+            PromptKind::Sudo
+        } else if GENERIC_PASSWORD_PATTERNS
+            .iter()
+            .any(|p| p.is_match(&self.buffer))
+        {
+            PromptKind::Generic
+        } else {
+            PromptKind::None
+        }
     }
 
     /// Reset the buffer after password injection or when skipping.
@@ -111,49 +146,55 @@ mod tests {
     #[test]
     fn test_detect_sudo_prompt() {
         let mut d = PasswordDetector::new(true);
-        assert!(d.feed(b"[sudo] password for deploy: "));
+        assert_eq!(d.feed(b"[sudo] password for deploy: "), PromptKind::Sudo);
     }
 
     #[test]
     fn test_detect_generic_password_prompt() {
         let mut d = PasswordDetector::new(true);
-        assert!(d.feed(b"Password: "));
+        assert_eq!(d.feed(b"Password: "), PromptKind::Generic);
     }
 
     #[test]
     fn test_detect_password_prompt_no_trailing_space() {
         let mut d = PasswordDetector::new(true);
-        assert!(d.feed(b"Password:"));
+        assert_eq!(d.feed(b"Password:"), PromptKind::Generic);
     }
 
     #[test]
     fn test_detect_passphrase_prompt() {
         let mut d = PasswordDetector::new(true);
-        assert!(d.feed(b"Enter passphrase for key '/home/user/.ssh/id_rsa': "));
+        assert_eq!(
+            d.feed(b"Enter passphrase for key '/home/user/.ssh/id_rsa': "),
+            PromptKind::Generic,
+        );
     }
 
     #[test]
     fn test_detect_user_password_prompt() {
         let mut d = PasswordDetector::new(true);
-        assert!(d.feed(b"deploy's password: "));
+        assert_eq!(d.feed(b"deploy's password: "), PromptKind::Generic);
     }
 
     #[test]
     fn test_no_false_positive_on_similar_text() {
         let mut d = PasswordDetector::new(true);
-        assert!(!d.feed(b"The password was reset successfully."));
+        assert_eq!(
+            d.feed(b"The password was reset successfully."),
+            PromptKind::None,
+        );
     }
 
     #[test]
     fn test_no_false_positive_on_partial_prompt() {
         let mut d = PasswordDetector::new(true);
-        assert!(!d.feed(b"[sudo] password for"));
+        assert_eq!(d.feed(b"[sudo] password for"), PromptKind::None);
     }
 
     #[test]
     fn test_has_password_false_skips_detection() {
         let mut d = PasswordDetector::new(false);
-        assert!(!d.feed(b"[sudo] password for deploy: "));
+        assert_eq!(d.feed(b"[sudo] password for deploy: "), PromptKind::None,);
     }
 
     #[test]
@@ -162,7 +203,7 @@ mod tests {
         d.feed(b"[sudo] password for ");
         d.clear();
         // After clear, partial prompt from before is gone — this new data alone doesn't match
-        assert!(!d.feed(b"deploy: "));
+        assert_eq!(d.feed(b"deploy: "), PromptKind::None);
     }
 
     #[test]
@@ -178,15 +219,18 @@ mod tests {
     #[test]
     fn test_prompt_split_across_feeds() {
         let mut d = PasswordDetector::new(true);
-        assert!(!d.feed(b"[sudo] password "));
-        assert!(d.feed(b"for deploy: "));
+        assert_eq!(d.feed(b"[sudo] password "), PromptKind::None);
+        assert_eq!(d.feed(b"for deploy: "), PromptKind::Sudo);
     }
 
     #[test]
     fn test_prompt_after_other_output() {
         let mut d = PasswordDetector::new(true);
-        assert!(!d.feed(b"Last login: Mon Feb 24 10:00:00 2026\n"));
-        assert!(d.feed(b"[sudo] password for admin: "));
+        assert_eq!(
+            d.feed(b"Last login: Mon Feb 24 10:00:00 2026\n"),
+            PromptKind::None,
+        );
+        assert_eq!(d.feed(b"[sudo] password for admin: "), PromptKind::Sudo,);
     }
 
     #[test]
@@ -195,7 +239,7 @@ mod tests {
         // Feed some invalid UTF-8 followed by a valid prompt
         let mut data = vec![0xFF, 0xFE];
         data.extend_from_slice(b"Password: ");
-        assert!(d.feed(&data));
+        assert!(d.feed(&data).detected());
     }
 
     #[test]
@@ -203,7 +247,14 @@ mod tests {
         let mut d = PasswordDetector::new(true);
         // Pure binary data should not trigger any match
         let binary = vec![0xFF, 0xFE, 0x80, 0x81, 0x90, 0xA0, 0xB0, 0xC0];
-        assert!(!d.feed(&binary));
+        assert!(!d.feed(&binary).detected());
+    }
+
+    #[test]
+    fn test_su_prompt_is_generic_not_sudo() {
+        let mut d = PasswordDetector::new(true);
+        // `su -` shows bare "Password:" — should NOT be classified as Sudo
+        assert_eq!(d.feed(b"Password: "), PromptKind::Generic);
     }
 
     #[test]

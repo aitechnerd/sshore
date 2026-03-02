@@ -49,7 +49,8 @@ fn hint_pair<'a>(key: &str, action: &str, theme: &ThemeColors) -> Vec<Span<'a>> 
 fn list_hints(theme: &ThemeColors) -> Line<'static> {
     let mut spans = Vec::new();
     spans.extend(hint_pair("\u{2191}\u{2193}/jk", "Navigate", theme));
-    spans.extend(hint_pair("Enter", "Connect", theme));
+    spans.extend(hint_pair("Enter", "SSH", theme));
+    spans.extend(hint_pair("f", "SFTP", theme));
     spans.extend(hint_pair("/", "Search", theme));
     spans.extend(hint_pair("a", "Add", theme));
     spans.extend(hint_pair("d", "Delete", theme));

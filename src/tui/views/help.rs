@@ -7,15 +7,29 @@ use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 use crate::tui::theme::ThemeColors;
 
 /// Render a centered help overlay with all keybindings.
-pub fn render_help(frame: &mut Frame, area: Rect, theme: &ThemeColors) {
-    let popup = centered_rect(60, 70, area);
+pub fn render_help(frame: &mut Frame, area: Rect, theme: &ThemeColors, scroll: u16) {
+    let sections = build_help_sections(theme);
+    let content_height = sections.len() as u16 + 2; // +2 for borders
+
+    // Size to content, capped at 90% of terminal height
+    let max_height = (area.height as u32 * 90 / 100) as u16;
+    let popup_height = content_height.min(max_height);
+    let popup = centered_rect_with_height(60, popup_height, area);
 
     // Clear the area behind the popup
     frame.render_widget(Clear, popup);
 
+    let is_scrollable = content_height > popup_height;
+    let title_bottom = if is_scrollable {
+        " \u{2191}\u{2193} scroll "
+    } else {
+        ""
+    };
+
     let block = Block::default()
         .title(" Keybindings ")
         .title_alignment(Alignment::Center)
+        .title_bottom(Line::from(title_bottom).alignment(Alignment::Center))
         .borders(Borders::ALL)
         .border_style(Style::default().fg(theme.border))
         .style(Style::default().bg(theme.surface));
@@ -23,8 +37,7 @@ pub fn render_help(frame: &mut Frame, area: Rect, theme: &ThemeColors) {
     let inner = block.inner(popup);
     frame.render_widget(block, popup);
 
-    let sections = build_help_sections(theme);
-    let paragraph = Paragraph::new(sections);
+    let paragraph = Paragraph::new(sections).scroll((scroll, 0));
     frame.render_widget(paragraph, inner);
 }
 
@@ -51,11 +64,17 @@ fn build_help_sections(theme: &ThemeColors) -> Vec<Line<'static>> {
     lines.push(Line::from(""));
 
     section_header(&mut lines, "Actions", theme);
-    key_hint(&mut lines, "Enter", "Connect to selected bookmark", theme);
+    key_hint(&mut lines, "Enter", "SSH connect", theme);
+    key_hint(&mut lines, "f", "SFTP file browser", theme);
     key_hint(&mut lines, "a", "Add new bookmark", theme);
     key_hint(&mut lines, "e", "Edit selected bookmark", theme);
     key_hint(&mut lines, "d", "Delete selected bookmark", theme);
-    key_hint(&mut lines, "~~ (in session)", "Open snippet picker", theme);
+    lines.push(Line::from(""));
+
+    section_header(&mut lines, "In SSH Session", theme);
+    key_hint(&mut lines, "~~ ", "Open snippet picker", theme);
+    key_hint(&mut lines, "~b", "Save as bookmark", theme);
+    key_hint(&mut lines, "~f", "Open file browser (SFTP)", theme);
     lines.push(Line::from(""));
 
     section_header(&mut lines, "Search & Filter", theme);
@@ -101,12 +120,13 @@ fn key_hint(lines: &mut Vec<Line<'static>>, key: &str, desc: &str, theme: &Theme
     ]));
 }
 
-/// Create a centered rectangle with given percentage width and height.
-fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
+/// Create a centered rectangle with given percentage width and fixed height.
+fn centered_rect_with_height(percent_x: u16, height: u16, area: Rect) -> Rect {
+    let v_pad = area.height.saturating_sub(height) / 2;
     let vertical = Layout::vertical([
-        Constraint::Percentage((100 - percent_y) / 2),
-        Constraint::Percentage(percent_y),
-        Constraint::Percentage((100 - percent_y) / 2),
+        Constraint::Length(v_pad),
+        Constraint::Length(height),
+        Constraint::Min(0),
     ])
     .split(area);
 

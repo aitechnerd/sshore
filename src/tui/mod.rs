@@ -55,10 +55,11 @@ const ENV_FILTER_MAP: &[&str] = &[
     "testing",     // 5
 ];
 
-/// Action returned by the event loop to signal leaving the TUI for SSH.
+/// Action returned by the event loop to signal leaving the TUI for SSH or SFTP.
 enum LoopAction {
     Quit,
     Connect(usize),
+    Browse(usize),
 }
 
 /// Main application state.
@@ -79,6 +80,10 @@ pub struct App {
     pub tunnel_bookmarks: HashSet<String>,
     /// Set when the user presses Enter to connect; signals the event loop to exit.
     connect_request: Option<usize>,
+    /// Set when the user presses 'f' to browse; signals the event loop to exit.
+    browse_request: Option<usize>,
+    /// Scroll offset for the help overlay.
+    help_scroll: u16,
     /// Config file path override (from --config flag or SSHORE_CONFIG env var).
     config_path_override: Option<String>,
     matcher: SkimMatcherV2,
@@ -107,6 +112,8 @@ impl App {
             confirm_state: None,
             tunnel_bookmarks,
             connect_request: None,
+            browse_request: None,
+            help_scroll: 0,
             config_path_override: None,
             matcher,
         }
@@ -243,6 +250,13 @@ pub async fn run(config: &mut AppConfig, cfg_override: Option<&str>) -> Result<(
                     let _ = wait_for_enter();
                 }
             }
+            LoopAction::Browse(bookmark_index) => {
+                if let Err(e) = launch_browse(&app.config, bookmark_index).await {
+                    eprintln!("Browse error: {e:#}");
+                    eprintln!("Press Enter to return to sshore...");
+                    let _ = wait_for_enter();
+                }
+            }
         }
     }
 
@@ -259,13 +273,34 @@ fn wait_for_enter() -> Result<()> {
     Ok(())
 }
 
+/// Launch the file browser for a bookmark from the TUI.
+async fn launch_browse(config: &AppConfig, bookmark_index: usize) -> Result<()> {
+    use crate::storage;
+
+    let bookmark = &config.bookmarks[bookmark_index];
+    ssh::print_production_banner(bookmark, &config.settings, "SFTP browser");
+    ssh::terminal_theme::apply_theme(bookmark, &config.settings);
+
+    let remote_sftp = storage::sftp_backend::SftpBackend::new(config, bookmark_index).await?;
+    let local_fs = storage::local_backend::LocalBackend::new(".")?;
+
+    let mut left = storage::Backend::Sftp(remote_sftp);
+    let mut right = storage::Backend::Local(local_fs);
+
+    views::browser::run(&mut left, &mut right, &bookmark.name, &bookmark.env, false).await?;
+
+    ssh::terminal_theme::reset_theme();
+    Ok(())
+}
+
 /// Main event loop: draw, poll, handle. Returns action when the loop exits.
 fn event_loop(
     terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
     app: &mut App,
 ) -> Result<LoopAction> {
-    // Reset connect request from any previous iteration
+    // Reset requests from any previous iteration
     app.connect_request = None;
+    app.browse_request = None;
 
     loop {
         terminal
@@ -286,6 +321,9 @@ fn event_loop(
 
         if let Some(idx) = app.connect_request.take() {
             return Ok(LoopAction::Connect(idx));
+        }
+        if let Some(idx) = app.browse_request.take() {
+            return Ok(LoopAction::Browse(idx));
         }
     }
 }
@@ -381,7 +419,7 @@ fn draw(frame: &mut ratatui::Frame, app: &App) {
     // Overlays on top of everything
     match app.screen {
         Screen::Help => {
-            help::render_help(frame, frame.area(), theme);
+            help::render_help(frame, frame.area(), theme, app.help_scroll);
         }
         Screen::AddForm | Screen::EditForm(_) => {
             if let Some(ref state) = app.form_state {
@@ -480,9 +518,17 @@ fn handle_list_key(app: &mut App, key: KeyEvent) {
                 app.screen = Screen::DeleteConfirm(idx);
             }
         }
+        KeyCode::Char('f') => {
+            if let Some(idx) = app.selected_bookmark_index() {
+                app.browse_request = Some(idx);
+            }
+        }
 
         // Help
-        KeyCode::Char('?') => app.screen = Screen::Help,
+        KeyCode::Char('?') => {
+            app.help_scroll = 0;
+            app.screen = Screen::Help;
+        }
 
         _ => {}
     }
@@ -630,6 +676,13 @@ fn handle_help_key(app: &mut App, key: KeyEvent) {
     match key.code {
         KeyCode::Esc | KeyCode::Char('?') | KeyCode::Char('q') => {
             app.screen = Screen::List;
+            app.help_scroll = 0;
+        }
+        KeyCode::Down | KeyCode::Char('j') => {
+            app.help_scroll = app.help_scroll.saturating_add(1);
+        }
+        KeyCode::Up | KeyCode::Char('k') => {
+            app.help_scroll = app.help_scroll.saturating_sub(1);
         }
         _ => {}
     }

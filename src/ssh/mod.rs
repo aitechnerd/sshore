@@ -1030,6 +1030,8 @@ async fn run_proxy_loop(
 }
 
 /// Launch the dual-pane file browser using the existing SSH session.
+/// Detects the remote shell's current directory via `pwd` so the browser
+/// starts where the user left off.
 async fn launch_browser(
     session: &russh::client::Handle<SshoreHandler>,
     name: &str,
@@ -1038,7 +1040,15 @@ async fn launch_browser(
     use crate::storage::{Backend, local_backend::LocalBackend, sftp_backend::SftpBackend};
     use crate::tui::views::browser;
 
-    let sftp_backend = SftpBackend::from_handle(session, name).await?;
+    let remote_cwd = detect_remote_cwd(session).await;
+
+    let mut sftp_backend = SftpBackend::from_handle(session, name).await?;
+    if let Some(ref cwd) = remote_cwd
+        && let Err(e) = sftp_backend.cd(cwd).await
+    {
+        eprintln!("Warning: could not cd to {cwd}: {e}");
+    }
+
     let local_backend = LocalBackend::new(".")?;
 
     let mut left = Backend::Sftp(sftp_backend);
@@ -1047,6 +1057,28 @@ async fn launch_browser(
     browser::run(&mut left, &mut right, name, env, false).await?;
 
     Ok(())
+}
+
+/// Run `pwd` over a separate exec channel to detect the remote shell's
+/// current working directory. Returns None on any failure (non-fatal).
+async fn detect_remote_cwd(session: &russh::client::Handle<SshoreHandler>) -> Option<String> {
+    let channel = session.channel_open_session().await.ok()?;
+    channel.exec(true, "pwd").await.ok()?;
+
+    let (mut rx, _tx) = channel.split();
+    let mut output = Vec::new();
+
+    loop {
+        match rx.wait().await {
+            Some(ChannelMsg::Data { ref data }) => output.extend_from_slice(data),
+            Some(ChannelMsg::Eof | ChannelMsg::Close | ChannelMsg::ExitStatus { .. }) => break,
+            Some(_) => {}
+            None => break,
+        }
+    }
+
+    let path = String::from_utf8_lossy(&output).trim().to_string();
+    if path.is_empty() { None } else { Some(path) }
 }
 
 /// Read raw bytes from stdin and send to an mpsc channel.

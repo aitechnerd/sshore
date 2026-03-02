@@ -10,6 +10,7 @@ pub fn apply_theme(bookmark: &Bookmark, settings: &Settings) {
 
 /// Apply terminal theming with a custom tab title.
 pub fn apply_theme_with_title(bookmark: &Bookmark, settings: &Settings, title: &str) {
+    save_title();
     set_tab_title(title);
 
     if let Some(env_color) = settings.env_colors.get(&bookmark.env) {
@@ -23,6 +24,14 @@ pub fn reset_theme() {
     reset_tab_color();
 }
 
+/// Save the current window title to the terminal's title stack (xterm CSI 22;0t).
+/// Supported by most modern terminals: xterm, iTerm2, Tabby, kitty, Alacritty, WezTerm.
+fn save_title() {
+    let mut stdout = std::io::stdout();
+    let _ = write!(stdout, "\x1b[22;0t");
+    let _ = stdout.flush();
+}
+
 /// Set terminal tab title via OSC 0 (universally supported).
 fn set_tab_title(title: &str) {
     let title = sanitize_terminal_text(title);
@@ -31,10 +40,10 @@ fn set_tab_title(title: &str) {
     let _ = stdout.flush();
 }
 
-/// Reset terminal tab title to empty.
+/// Restore the previous window title from the terminal's title stack (xterm CSI 23;0t).
 fn reset_tab_title() {
     let mut stdout = std::io::stdout();
-    let _ = write!(stdout, "\x1b]0;\x07");
+    let _ = write!(stdout, "\x1b[23;0t");
     let _ = stdout.flush();
 }
 

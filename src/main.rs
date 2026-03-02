@@ -11,6 +11,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 use clap::{CommandFactory, Parser};
+use zeroize::Zeroizing;
 
 use cli::{Cli, Commands, ImportSource, PasswordAction, TunnelAction};
 use config::ImportSourceKind;
@@ -605,7 +606,7 @@ fn cmd_password_set(bookmark_name: &str, cfg_override: Option<&str>) -> Result<(
     }
 
     let password = read_password_from_tty("Password: ")?;
-    keychain::set_password(&bookmark.name, &password)?;
+    keychain::set_password(&bookmark.name, password.as_str())?;
     println!("Password stored for '{}'.", bookmark.name);
 
     Ok(())
@@ -652,12 +653,12 @@ fn cmd_password_list(cfg_override: Option<&str>) -> Result<()> {
 }
 
 /// Read a password from the terminal without echoing characters.
-fn read_password_from_tty(prompt: &str) -> Result<String> {
+fn read_password_from_tty(prompt: &str) -> Result<Zeroizing<String>> {
     eprint!("{prompt}");
     io::stderr().flush()?;
 
     crossterm::terminal::enable_raw_mode()?;
-    let mut password = String::new();
+    let mut password = Zeroizing::new(String::new());
     loop {
         if let crossterm::event::Event::Key(key) = crossterm::event::read()? {
             match key.code {

@@ -45,10 +45,19 @@ pub fn print_production_banner(
     context: &str,
 ) {
     if bookmark.env.eq_ignore_ascii_case("production") {
-        let user = bookmark.effective_user(settings);
+        let user: String = bookmark
+            .effective_user(settings)
+            .chars()
+            .filter(|c| !c.is_ascii_control())
+            .collect();
+        let host: String = bookmark
+            .host
+            .chars()
+            .filter(|c| !c.is_ascii_control())
+            .collect();
         eprintln!(
             "\x1b[1;37;41m PROD \x1b[0m {}: {}@{}:{}",
-            context, user, bookmark.host, bookmark.port
+            context, user, host, bookmark.port
         );
     }
 }
@@ -644,7 +653,7 @@ async fn authenticate(
 
     // Fall back to password auth — prompt user
     let password = prompt_password(user)?;
-    match session.authenticate_password(user, &password).await {
+    match session.authenticate_password(user, password.as_str()).await {
         Ok(AuthResult::Success) => Ok(true),
         Ok(AuthResult::Failure { .. }) => Ok(false),
         Err(e) => Err(e.into()),
@@ -652,13 +661,13 @@ async fn authenticate(
 }
 
 /// Prompt the user for a password on stderr (so it doesn't interfere with SSH I/O).
-fn prompt_password(user: &str) -> Result<String> {
+fn prompt_password(user: &str) -> Result<Zeroizing<String>> {
     eprint!("{user}'s password: ");
     std::io::stderr().flush()?;
 
     // Read password without echo
     crossterm::terminal::enable_raw_mode()?;
-    let mut password = String::new();
+    let mut password = Zeroizing::new(String::new());
     loop {
         if let crossterm::event::Event::Key(key) = crossterm::event::read()? {
             match key.code {

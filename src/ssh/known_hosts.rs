@@ -22,6 +22,11 @@ pub enum HostKeyStatus {
         fingerprint_new: String,
         known_hosts_line: usize,
     },
+    /// Host key is explicitly marked as revoked in known_hosts.
+    Revoked {
+        fingerprint: String,
+        known_hosts_line: usize,
+    },
 }
 
 /// Path to the user's known_hosts file.
@@ -67,13 +72,21 @@ pub fn check_host_key(hostname: &str, port: u16, server_key: &PublicKey) -> Resu
             && entry.matches_host(&host_pattern)
         {
             if entry.key_matches(&server_key_data) {
+                if entry.is_revoked {
+                    return Ok(HostKeyStatus::Revoked {
+                        fingerprint: format_fingerprint(server_key),
+                        known_hosts_line: line_num + 1,
+                    });
+                }
                 return Ok(HostKeyStatus::Known);
             } else {
                 // KEY CHANGED — potential MITM
-                return Ok(HostKeyStatus::Changed {
-                    fingerprint_new: format_fingerprint(server_key),
-                    known_hosts_line: line_num + 1,
-                });
+                if !entry.is_revoked {
+                    return Ok(HostKeyStatus::Changed {
+                        fingerprint_new: format_fingerprint(server_key),
+                        known_hosts_line: line_num + 1,
+                    });
+                }
             }
         }
     }
@@ -131,6 +144,8 @@ struct KnownHostEntry {
     _key_type: String,
     /// Base64-encoded public key data.
     key_base64: String,
+    /// Whether this entry is marked with @revoked.
+    is_revoked: bool,
 }
 
 impl KnownHostEntry {
@@ -189,14 +204,25 @@ fn check_hashed_host(stored_pattern: &str, host_to_check: &str) -> Option<bool> 
 
 /// Parse a single known_hosts line into its components.
 fn parse_known_hosts_line(line: &str) -> Option<KnownHostEntry> {
-    // Format: host_patterns key_type base64_key [comment]
-    let mut parts = line.splitn(3, char::is_whitespace);
-    let hosts_str = parts.next()?.trim();
-    let key_type = parts.next()?.trim().to_string();
-    let rest = parts.next()?.trim();
+    // Format: [@marker] host_patterns key_type base64_key [comment]
+    let parts: Vec<&str> = line.split_whitespace().collect();
+    if parts.len() < 3 {
+        return None;
+    }
 
-    // The base64 key is the next whitespace-delimited token (ignore trailing comment)
-    let key_base64 = rest.split_whitespace().next().unwrap_or("").to_string();
+    let (is_revoked, base_idx) = if parts[0].starts_with('@') {
+        (parts[0].eq_ignore_ascii_case("@revoked"), 1usize)
+    } else {
+        (false, 0usize)
+    };
+
+    if parts.len() < base_idx + 3 {
+        return None;
+    }
+
+    let hosts_str = parts[base_idx].trim();
+    let key_type = parts[base_idx + 1].trim().to_string();
+    let key_base64 = parts[base_idx + 2].trim().to_string();
 
     if key_base64.is_empty() {
         return None;
@@ -208,6 +234,7 @@ fn parse_known_hosts_line(line: &str) -> Option<KnownHostEntry> {
         host_patterns,
         _key_type: key_type,
         key_base64,
+        is_revoked,
     })
 }
 
@@ -242,6 +269,7 @@ mod tests {
             host_patterns: vec!["example.com".into()],
             _key_type: "ssh-ed25519".into(),
             key_base64: "AAAA".into(),
+            is_revoked: false,
         };
         assert!(entry.matches_host("example.com"));
         assert!(!entry.matches_host("[example.com]:2222"));
@@ -253,6 +281,7 @@ mod tests {
             host_patterns: vec!["[example.com]:2222".into()],
             _key_type: "ssh-ed25519".into(),
             key_base64: "AAAA".into(),
+            is_revoked: false,
         };
         assert!(entry.matches_host("[example.com]:2222"));
         assert!(!entry.matches_host("example.com"));
@@ -264,6 +293,7 @@ mod tests {
             host_patterns: vec!["host1.example.com".into(), "host2.example.com".into()],
             _key_type: "ssh-rsa".into(),
             key_base64: "AAAA".into(),
+            is_revoked: false,
         };
         assert!(entry.matches_host("host1.example.com"));
         assert!(entry.matches_host("host2.example.com"));
@@ -277,6 +307,7 @@ mod tests {
         assert_eq!(entry.host_patterns, vec!["example.com"]);
         assert_eq!(entry._key_type, "ssh-ed25519");
         assert_eq!(entry.key_base64, "AAAAC3NzaC1lZDI1NTE5AAAAItest");
+        assert!(!entry.is_revoked);
     }
 
     #[test]
@@ -285,6 +316,7 @@ mod tests {
         let entry = parse_known_hosts_line(line).unwrap();
         assert_eq!(entry._key_type, "ssh-rsa");
         assert_eq!(entry.key_base64, "AAAAB3NzaC1yc2EAAAA");
+        assert!(!entry.is_revoked);
     }
 
     #[test]
@@ -301,6 +333,16 @@ mod tests {
         let line = "[example.com]:2222 ssh-ed25519 AAAA";
         let entry = parse_known_hosts_line(line).unwrap();
         assert_eq!(entry.host_patterns, vec!["[example.com]:2222"]);
+    }
+
+    #[test]
+    fn test_parse_known_hosts_line_revoked_marker() {
+        let line = "@revoked example.com ssh-ed25519 AAAA";
+        let entry = parse_known_hosts_line(line).unwrap();
+        assert_eq!(entry.host_patterns, vec!["example.com"]);
+        assert_eq!(entry._key_type, "ssh-ed25519");
+        assert_eq!(entry.key_base64, "AAAA");
+        assert!(entry.is_revoked);
     }
 
     #[test]
@@ -326,6 +368,7 @@ mod tests {
             host_patterns: vec![hashed_pattern],
             _key_type: "ssh-ed25519".into(),
             key_base64: "AAAA".into(),
+            is_revoked: false,
         };
 
         assert!(entry.matches_host("example.com"));
@@ -349,6 +392,7 @@ mod tests {
             host_patterns: vec![hashed_pattern],
             _key_type: "ssh-rsa".into(),
             key_base64: "AAAA".into(),
+            is_revoked: false,
         };
 
         assert!(entry.matches_host("[myhost.io]:2222"));
@@ -362,6 +406,7 @@ mod tests {
             host_patterns: vec!["|2|abc|def".into()], // Wrong version
             _key_type: "ssh-ed25519".into(),
             key_base64: "AAAA".into(),
+            is_revoked: false,
         };
         // Should not match anything via hash check (version != 1)
         assert!(!entry.matches_host("example.com"));
@@ -384,6 +429,7 @@ mod tests {
             host_patterns: vec!["test".into()],
             _key_type: "ssh-rsa".into(),
             key_base64: b64,
+            is_revoked: false,
         };
         assert!(entry.key_matches(&data));
         assert!(!entry.key_matches(&[1, 2, 3, 4, 6]));
@@ -395,6 +441,7 @@ mod tests {
             host_patterns: vec!["test".into()],
             _key_type: "ssh-rsa".into(),
             key_base64: "not-valid-base64!!!".into(),
+            is_revoked: false,
         };
         assert!(!entry.key_matches(&[1, 2, 3]));
     }
@@ -444,6 +491,7 @@ mod tests {
             host_patterns: vec![],
             _key_type: "ssh-ed25519".into(),
             key_base64: "AAAA".into(),
+            is_revoked: false,
         };
         assert!(!entry.matches_host("example.com"));
     }
@@ -454,6 +502,7 @@ mod tests {
             host_patterns: vec!["test".into()],
             _key_type: "ssh-rsa".into(),
             key_base64: String::new(),
+            is_revoked: false,
         };
         // Empty base64 decodes to empty vec, which shouldn't match non-empty data
         assert!(!entry.key_matches(&[1, 2, 3]));

@@ -160,6 +160,21 @@ impl client::Handler for SshoreHandler {
                 eprintln!("Host key verification failed.");
                 Ok(false)
             }
+            HostKeyStatus::Revoked {
+                fingerprint,
+                known_hosts_line,
+            } => {
+                eprintln!("@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@");
+                eprintln!("@            WARNING: REVOKED HOST KEY DETECTED!          @");
+                eprintln!("@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@");
+                eprintln!(
+                    "This host key is marked as revoked in ~/.ssh/known_hosts line {}.",
+                    known_hosts_line
+                );
+                eprintln!("Presented key fingerprint: {}", fingerprint);
+                eprintln!("Connection refused for safety.");
+                Ok(false)
+            }
         }
     }
 
@@ -177,7 +192,16 @@ impl client::Handler for SshoreHandler {
         let key = (connected_address.to_string(), connected_port);
         let target = {
             let map = self.remote_forwards.lock().await;
-            map.get(&key).cloned()
+            map.get(&key).cloned().or_else(|| {
+                // Some servers report loopback as "localhost" while we register as 127.0.0.1.
+                if connected_address == "localhost" {
+                    map.get(&("127.0.0.1".to_string(), connected_port)).cloned()
+                } else if connected_address == "127.0.0.1" {
+                    map.get(&("localhost".to_string(), connected_port)).cloned()
+                } else {
+                    None
+                }
+            })
         };
 
         let Some((local_host, local_port)) = target else {

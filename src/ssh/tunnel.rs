@@ -36,6 +36,8 @@ pub const RECONNECT_MAX_DELAY_SECS: u64 = 60;
 
 /// Backoff multiplier between reconnect attempts.
 pub const RECONNECT_BACKOFF_MULTIPLIER: u64 = 2;
+/// Default remote bind address for -R forwards (loopback-only for safety).
+const REMOTE_FORWARD_BIND_ADDR: &str = "127.0.0.1";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -380,7 +382,7 @@ async fn setup_remote_forward(
     let bound_port = {
         let mut handle = session.lock().await;
         handle
-            .tcpip_forward("0.0.0.0", spec.local_port as u32)
+            .tcpip_forward(REMOTE_FORWARD_BIND_ADDR, spec.local_port as u32)
             .await
             .with_context(|| {
                 format!(
@@ -409,7 +411,7 @@ async fn setup_remote_forward(
     {
         let mut map = remote_map.lock().await;
         map.insert(
-            ("0.0.0.0".to_string(), actual_port),
+            (REMOTE_FORWARD_BIND_ADDR.to_string(), actual_port),
             (spec.remote_host.clone(), spec.remote_port),
         );
     }

@@ -25,6 +25,7 @@ pub fn reset_theme() {
 
 /// Set terminal tab title via OSC 0 (universally supported).
 fn set_tab_title(title: &str) {
+    let title = sanitize_terminal_text(title);
     let mut stdout = std::io::stdout();
     let _ = write!(stdout, "\x1b]0;{title}\x07");
     let _ = stdout.flush();
@@ -84,13 +85,29 @@ fn parse_hex_rgb(hex: &str) -> Option<(u8, u8, u8)> {
 /// Supported placeholders: {name}, {host}, {user}, {env}, {badge}, {label}
 pub fn render_tab_title(template: &str, bookmark: &Bookmark, settings: &Settings) -> String {
     let env_color = settings.env_colors.get(&bookmark.env);
-    template
-        .replace("{name}", &bookmark.name)
-        .replace("{host}", &bookmark.host)
-        .replace("{user}", bookmark.user.as_deref().unwrap_or(""))
-        .replace("{env}", &bookmark.env)
-        .replace("{badge}", env_color.map_or("", |c| &c.badge))
-        .replace("{label}", env_color.map_or("", |c| &c.label))
+    let safe_template = sanitize_terminal_text(template);
+    let safe_name = sanitize_terminal_text(&bookmark.name);
+    let safe_host = sanitize_terminal_text(&bookmark.host);
+    let safe_user = sanitize_terminal_text(bookmark.user.as_deref().unwrap_or(""));
+    let safe_env = sanitize_terminal_text(&bookmark.env);
+    let safe_badge = sanitize_terminal_text(env_color.map_or("", |c| &c.badge));
+    let safe_label = sanitize_terminal_text(env_color.map_or("", |c| &c.label));
+
+    safe_template
+        .replace("{name}", &safe_name)
+        .replace("{host}", &safe_host)
+        .replace("{user}", &safe_user)
+        .replace("{env}", &safe_env)
+        .replace("{badge}", &safe_badge)
+        .replace("{label}", &safe_label)
+}
+
+/// Strip control bytes from user-supplied terminal text to prevent escape injection.
+fn sanitize_terminal_text(input: &str) -> String {
+    input
+        .chars()
+        .filter(|c| !c.is_ascii_control())
+        .collect::<String>()
 }
 
 #[cfg(test)]
@@ -173,5 +190,31 @@ mod tests {
         assert_eq!(parse_hex_rgb("CC0000"), None);
         assert_eq!(parse_hex_rgb("#FFF"), None); // Too short
         assert_eq!(parse_hex_rgb("#GGGGGG"), None);
+    }
+
+    #[test]
+    fn test_render_tab_title_strips_control_chars() {
+        let settings = Settings::default();
+        let bookmark = Bookmark {
+            name: "prod\x1b]0;hacked\x07".into(),
+            host: "10.0.1.5".into(),
+            user: Some("deploy".into()),
+            port: 22,
+            env: "production".into(),
+            tags: vec![],
+            identity_file: None,
+            proxy_jump: None,
+            notes: None,
+            last_connected: None,
+            connect_count: 0,
+            on_connect: None,
+            snippets: vec![],
+            connect_timeout_secs: None,
+            ssh_options: std::collections::HashMap::new(),
+        };
+        let result = render_tab_title("{name}", &bookmark, &settings);
+        assert_eq!(result, "prod]0;hacked");
+        assert!(!result.contains('\x1b'));
+        assert!(!result.contains('\x07'));
     }
 }

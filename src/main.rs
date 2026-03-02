@@ -536,6 +536,7 @@ async fn cmd_browse(
 
     let index = find_bookmark_index(&config, bookmark_name)?;
     let bookmark = &config.bookmarks[index];
+    ssh::print_production_banner(bookmark, &config.settings, "SFTP browser");
 
     // Apply terminal theming
     ssh::terminal_theme::apply_theme(bookmark, &config.settings);

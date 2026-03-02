@@ -24,6 +24,8 @@ pub async fn open_session(config: &AppConfig, bookmark_index: usize) -> Result<(
         terminal_theme::render_tab_title(&settings.tab_title_template, bookmark, settings)
     );
     terminal_theme::apply_theme_with_title(bookmark, settings, &title);
+    ssh::print_production_banner(bookmark, settings, "SFTP session");
+    let is_production = bookmark.env.eq_ignore_ascii_case("production");
 
     // Open a session channel and request SFTP subsystem
     let channel = session
@@ -50,7 +52,7 @@ pub async fn open_session(config: &AppConfig, bookmark_index: usize) -> Result<(
     eprintln!("Type 'help' for available commands.");
 
     // Run the interactive command loop
-    let result = run_command_loop(&sftp, cwd).await;
+    let result = run_command_loop(&sftp, cwd, is_production).await;
 
     // Always reset theme, even on error
     terminal_theme::reset_theme();
@@ -59,7 +61,11 @@ pub async fn open_session(config: &AppConfig, bookmark_index: usize) -> Result<(
 }
 
 /// Run the interactive SFTP command loop.
-async fn run_command_loop(sftp: &SftpSession, initial_cwd: String) -> Result<()> {
+async fn run_command_loop(
+    sftp: &SftpSession,
+    initial_cwd: String,
+    is_production: bool,
+) -> Result<()> {
     let mut cwd = initial_cwd;
     let stdin = io::stdin();
     let mut stdout = io::stdout();
@@ -155,6 +161,10 @@ async fn run_command_loop(sftp: &SftpSession, initial_cwd: String) -> Result<()>
                     eprintln!("rm: missing path argument");
                 } else {
                     let path = resolve_path(&cwd, args);
+                    if is_production && !confirm_production_delete("rm", &path)? {
+                        eprintln!("rm: cancelled");
+                        continue;
+                    }
                     if let Err(e) = sftp.remove_file(&path).await {
                         eprintln!("rm: {e}");
                     }
@@ -165,6 +175,10 @@ async fn run_command_loop(sftp: &SftpSession, initial_cwd: String) -> Result<()>
                     eprintln!("rmdir: missing path argument");
                 } else {
                     let path = resolve_path(&cwd, args);
+                    if is_production && !confirm_production_delete("rmdir", &path)? {
+                        eprintln!("rmdir: cancelled");
+                        continue;
+                    }
                     if let Err(e) = sftp.remove_dir(&path).await {
                         eprintln!("rmdir: {e}");
                     }
@@ -195,6 +209,15 @@ async fn run_command_loop(sftp: &SftpSession, initial_cwd: String) -> Result<()>
     }
 
     Ok(())
+}
+
+/// Ask for explicit confirmation before destructive actions on production hosts.
+fn confirm_production_delete(action: &str, path: &str) -> Result<bool> {
+    eprint!("\x1b[1;37;41m PROD \x1b[0m Confirm {action} {path}? Type 'yes' to proceed: ");
+    io::stderr().flush()?;
+    let mut answer = String::new();
+    io::stdin().read_line(&mut answer)?;
+    Ok(answer.trim().eq_ignore_ascii_case("yes"))
 }
 
 /// Parse a command line into (command, args).

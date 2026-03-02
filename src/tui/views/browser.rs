@@ -126,6 +126,14 @@ pub struct BrowserState {
     pub status_message: Option<String>,
     pub bookmark_name: String,
     pub env: String,
+    pub pending_delete: Option<PendingDelete>,
+}
+
+pub struct PendingDelete {
+    pub side: Side,
+    pub path: String,
+    pub name: String,
+    pub is_dir: bool,
 }
 
 /// Run the dual-pane file browser.
@@ -164,6 +172,7 @@ pub async fn run(
         status_message: None,
         bookmark_name: bookmark_name.to_string(),
         env: env.to_string(),
+        pending_delete: None,
     };
 
     // Initial load
@@ -264,6 +273,33 @@ async fn handle_key(
     left: &mut Backend,
     right: &mut Backend,
 ) -> Result<BrowserAction> {
+    if let Some(pending) = state.pending_delete.take() {
+        match key.code {
+            KeyCode::Char('y') | KeyCode::Char('Y') => {
+                let (pane, backend) = match pending.side {
+                    Side::Left => (left_pane, left),
+                    Side::Right => (right_pane, right),
+                };
+                if pending.is_dir {
+                    backend.rmdir(&pending.path).await?;
+                } else {
+                    backend.delete(&pending.path).await?;
+                }
+                state.status_message = Some(format!("Deleted: {}", pending.name));
+                refresh_pane(pane, backend, state).await?;
+            }
+            KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('N') => {
+                state.status_message = Some("Delete cancelled.".to_string());
+            }
+            _ => {
+                state.pending_delete = Some(pending);
+                state.status_message =
+                    Some("PROD delete pending: press y to confirm, n/Esc to cancel".to_string());
+            }
+        }
+        return Ok(BrowserAction::Continue);
+    }
+
     match key.code {
         KeyCode::Char('q') | KeyCode::Esc => return Ok(BrowserAction::Quit),
 
@@ -408,16 +444,31 @@ async fn handle_key(
             if let Some(entry) = pane.selected_entry().cloned()
                 && entry.name != ".."
             {
-                let backend = active_backend_mut(left, right, state);
-                if entry.is_dir {
-                    backend.rmdir(&entry.path).await?;
+                let requires_confirm = state.env.eq_ignore_ascii_case("production")
+                    && state.active_pane == Side::Right;
+                if requires_confirm {
+                    state.pending_delete = Some(PendingDelete {
+                        side: state.active_pane,
+                        path: entry.path,
+                        name: entry.name.clone(),
+                        is_dir: entry.is_dir,
+                    });
+                    state.status_message = Some(format!(
+                        "PROD delete '{}': press y to confirm, n/Esc to cancel",
+                        entry.name
+                    ));
                 } else {
-                    backend.delete(&entry.path).await?;
+                    let backend = active_backend_mut(left, right, state);
+                    if entry.is_dir {
+                        backend.rmdir(&entry.path).await?;
+                    } else {
+                        backend.delete(&entry.path).await?;
+                    }
+                    state.status_message = Some(format!("Deleted: {}", entry.name));
+                    let pane = active_pane_mut(left_pane, right_pane, state);
+                    let backend = active_backend_mut(left, right, state);
+                    refresh_pane(pane, backend, state).await?;
                 }
-                state.status_message = Some(format!("Deleted: {}", entry.name));
-                let pane = active_pane_mut(left_pane, right_pane, state);
-                let backend = active_backend_mut(left, right, state);
-                refresh_pane(pane, backend, state).await?;
             }
         }
 

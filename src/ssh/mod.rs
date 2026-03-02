@@ -38,6 +38,21 @@ const DEFAULT_KEY_NAMES: &[&str] = &["id_ed25519", "id_rsa", "id_ecdsa"];
 /// Can be overridden per-settings or per-bookmark.
 const DEFAULT_CONNECT_TIMEOUT_SECS: u64 = 15;
 
+/// Print a one-time high-visibility production banner for interactive operations.
+pub fn print_production_banner(
+    bookmark: &Bookmark,
+    settings: &crate::config::model::Settings,
+    context: &str,
+) {
+    if bookmark.env.eq_ignore_ascii_case("production") {
+        let user = bookmark.effective_user(settings);
+        eprintln!(
+            "\x1b[1;37;41m PROD \x1b[0m {}: {}@{}:{}",
+            context, user, bookmark.host, bookmark.port
+        );
+    }
+}
+
 /// Resolve the effective connection timeout for a bookmark.
 /// Priority: bookmark.connect_timeout_secs → settings.connect_timeout_secs → default (15s).
 fn effective_timeout(bookmark: &Bookmark, settings: &crate::config::model::Settings) -> u64 {
@@ -306,6 +321,11 @@ pub async fn connect(
 
     // Apply terminal theming
     terminal_theme::apply_theme(&config.bookmarks[bookmark_index], &config.settings);
+    print_production_banner(
+        &config.bookmarks[bookmark_index],
+        &config.settings,
+        "SSH session",
+    );
 
     // Open session channel
     let channel = session

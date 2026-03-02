@@ -95,6 +95,7 @@ async fn open_sftp(config: &AppConfig, bookmark_name: &str) -> Result<(SftpSessi
     // Apply theming
     let bookmark = &config.bookmarks[index];
     let settings = &config.settings;
+    ssh::print_production_banner(bookmark, settings, "SCP transfer");
     let title = format!(
         "SCP: {}",
         terminal_theme::render_tab_title(&settings.tab_title_template, bookmark, settings)

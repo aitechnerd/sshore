@@ -115,6 +115,25 @@ impl PaneState {
     }
 }
 
+/// Input mode for inline prompts and confirmations.
+#[derive(Debug, Clone)]
+pub enum InputMode {
+    Normal,
+    Filter(String),
+    MkdirPrompt(String),
+    RenamePrompt {
+        input: String,
+        source: FileEntry,
+    },
+    ConfirmDelete {
+        entries: Vec<(String, String, bool)>,
+    }, // (path, name, is_dir)
+    SelectPattern {
+        input: String,
+        selecting: bool,
+    },
+}
+
 /// Overall browser state.
 pub struct BrowserState {
     pub active_pane: Side,
@@ -122,11 +141,10 @@ pub struct BrowserState {
     pub sort_by: SortField,
     pub sort_asc: bool,
     pub filter: Option<String>,
-    pub filter_input: Option<String>,
+    pub input_mode: InputMode,
     pub status_message: Option<String>,
     pub bookmark_name: String,
     pub env: String,
-    pub pending_delete: Option<PendingDelete>,
     pub left_label: PaneLabel,
     pub right_label: PaneLabel,
 }
@@ -136,13 +154,6 @@ pub struct BrowserState {
 pub enum PaneLabel {
     Local,
     Remote,
-}
-
-pub struct PendingDelete {
-    pub side: Side,
-    pub path: String,
-    pub name: String,
-    pub is_dir: bool,
 }
 
 /// Run the dual-pane file browser.
@@ -186,11 +197,10 @@ pub async fn run(
         sort_by: SortField::Name,
         sort_asc: true,
         filter: None,
-        filter_input: None,
+        input_mode: InputMode::Normal,
         status_message: None,
         bookmark_name: bookmark_name.to_string(),
         env: env.to_string(),
-        pending_delete: None,
         left_label,
         right_label,
     };
@@ -205,34 +215,17 @@ pub async fn run(
         if event::poll(POLL_RATE)?
             && let Event::Key(key) = event::read()?
         {
-            // Handle filter input mode
-            if state.filter_input.is_some() {
-                match key.code {
-                    KeyCode::Esc => {
-                        state.filter_input = None;
-                        state.filter = None;
-                        let pane = active_pane_mut(&mut left_pane, &mut right_pane, &state);
-                        let backend = active_backend_mut(left, right, &state);
-                        refresh_pane(pane, backend, &state).await?;
-                    }
-                    KeyCode::Enter => {
-                        state.filter = state.filter_input.take();
-                        let pane = active_pane_mut(&mut left_pane, &mut right_pane, &state);
-                        let backend = active_backend_mut(left, right, &state);
-                        refresh_pane(pane, backend, &state).await?;
-                    }
-                    KeyCode::Char(c) => {
-                        if let Some(ref mut input) = state.filter_input {
-                            input.push(c);
-                        }
-                    }
-                    KeyCode::Backspace => {
-                        if let Some(ref mut input) = state.filter_input {
-                            input.pop();
-                        }
-                    }
-                    _ => {}
-                }
+            // Handle input modes (filter, mkdir, rename, confirm, pattern select)
+            if !matches!(state.input_mode, InputMode::Normal) {
+                handle_input_mode(
+                    key,
+                    &mut left_pane,
+                    &mut right_pane,
+                    &mut state,
+                    left,
+                    right,
+                )
+                .await?;
                 continue;
             }
 
@@ -293,35 +286,21 @@ async fn handle_key(
     left: &mut Backend,
     right: &mut Backend,
 ) -> Result<BrowserAction> {
-    if let Some(pending) = state.pending_delete.take() {
-        match key.code {
-            KeyCode::Char('y') | KeyCode::Char('Y') => {
-                let (pane, backend) = match pending.side {
-                    Side::Left => (left_pane, left),
-                    Side::Right => (right_pane, right),
-                };
-                if pending.is_dir {
-                    backend.rmdir(&pending.path).await?;
-                } else {
-                    backend.delete(&pending.path).await?;
-                }
-                state.status_message = Some(format!("Deleted: {}", pending.name));
-                refresh_pane(pane, backend, state).await?;
-            }
-            KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('N') => {
-                state.status_message = Some("Delete cancelled.".to_string());
-            }
-            _ => {
-                state.pending_delete = Some(pending);
-                state.status_message =
-                    Some("PROD delete pending: press y to confirm, n/Esc to cancel".to_string());
-            }
-        }
-        return Ok(BrowserAction::Continue);
-    }
-
     match key.code {
-        KeyCode::Char('q') | KeyCode::Esc => return Ok(BrowserAction::Quit),
+        KeyCode::Char('q') | KeyCode::Esc | KeyCode::F(10) => return Ok(BrowserAction::Quit),
+
+        KeyCode::F(1) => {
+            state.status_message = Some(
+                "F3=View F5=Copy F6=Move F7=Mkdir F8=Del F10=Quit | v=Mark *=Invert +=Select -=Deselect Tab=Switch"
+                    .to_string(),
+            );
+        }
+
+        KeyCode::Char('r') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            refresh_pane(left_pane, left, state).await?;
+            refresh_pane(right_pane, right, state).await?;
+            state.status_message = Some("Refreshed".to_string());
+        }
 
         KeyCode::Tab => {
             state.active_pane = match state.active_pane {
@@ -391,37 +370,112 @@ async fn handle_key(
             }
         }
 
-        KeyCode::Char(' ') => {
-            // Copy selected to other pane
+        KeyCode::Char(' ') | KeyCode::F(5) => {
+            // Batch-aware copy to other pane
             let pane = active_pane_mut(left_pane, right_pane, state);
-            if let Some(entry) = pane.selected_entry().cloned()
-                && !entry.is_dir
-            {
-                let (src_backend, dst_backend, dst_pane) = match state.active_pane {
-                    Side::Left => (left as &Backend, right as &mut Backend, &mut *right_pane),
-                    Side::Right => (right as &Backend, left as &mut Backend, &mut *left_pane),
-                };
-
-                let dst_path = format!("{}/{}", dst_pane.cwd.trim_end_matches('/'), entry.name);
-
-                // Use a temp file as intermediary for cross-backend transfers
+            let targets = collect_batch_targets(pane);
+            if !targets.is_empty() {
+                let total = targets.len();
                 let temp_dir = tempfile::tempdir()?;
-                let temp_file = temp_dir.path().join(&entry.name);
+                let mut copied = 0usize;
+                let mut last_error: Option<String> = None;
 
-                state.status_message = Some(format!("Copying {}...", entry.name));
+                for (i, (src_path, name, _is_dir)) in targets.iter().enumerate() {
+                    state.status_message = Some(if total == 1 {
+                        format!("Copying {name}...")
+                    } else {
+                        format!("Copying {}/{total}: {name}...", i + 1)
+                    });
 
-                match src_backend.download(&entry.path, &temp_file).await {
-                    Ok(()) => match dst_backend.upload(&temp_file, &dst_path).await {
+                    let temp_file = temp_dir.path().join(name);
+                    let (src_backend, dst_backend, dst_pane) = match state.active_pane {
+                        Side::Left => (left as &Backend, right as &mut Backend, &mut *right_pane),
+                        Side::Right => (right as &Backend, left as &mut Backend, &mut *left_pane),
+                    };
+                    let dst_path = format!("{}/{}", dst_pane.cwd.trim_end_matches('/'), name);
+
+                    match src_backend.download(src_path, &temp_file).await {
+                        Ok(()) => match dst_backend.upload(&temp_file, &dst_path).await {
+                            Ok(()) => copied += 1,
+                            Err(e) => last_error = Some(format!("Upload {name}: {e}")),
+                        },
+                        Err(e) => last_error = Some(format!("Download {name}: {e}")),
+                    }
+                }
+
+                state.status_message = Some(if let Some(err) = last_error {
+                    format!("Copied {copied}/{total}, error: {err}")
+                } else if total == 1 {
+                    format!("Copied: {}", targets[0].1)
+                } else {
+                    format!("Copied {total} items")
+                });
+
+                // Refresh destination pane and clear source marks
+                let (dst_pane, dst_backend) = match state.active_pane {
+                    Side::Left => (&mut *right_pane, right as &mut Backend),
+                    Side::Right => (&mut *left_pane, left as &mut Backend),
+                };
+                refresh_pane(dst_pane, dst_backend, state).await?;
+                let src_pane = active_pane_mut(left_pane, right_pane, state);
+                src_pane.marked.clear();
+            }
+        }
+
+        KeyCode::F(3) => {
+            // View: directory = enter, file = open in $PAGER
+            let pane = active_pane_mut(left_pane, right_pane, state);
+            if let Some(entry) = pane.selected_entry().cloned() {
+                if entry.is_dir {
+                    // Same as Enter — navigate into directory
+                    let backend = active_backend_mut(left, right, state);
+                    if entry.name == ".." {
+                        backend.cd("..").await?;
+                    } else {
+                        backend.cd(&entry.name).await?;
+                    }
+                    let new_cwd = backend.cwd().unwrap_or_default();
+                    let pane = active_pane_mut(left_pane, right_pane, state);
+                    pane.cwd = new_cwd;
+                    pane.selected = 0;
+                    pane.list_state.select(Some(0));
+                    pane.marked.clear();
+                    state.filter = None;
+                    let pane = active_pane_mut(left_pane, right_pane, state);
+                    let backend = active_backend_mut(left, right, state);
+                    refresh_pane(pane, backend, state).await?;
+                } else {
+                    // Download to temp file, open in pager
+                    state.status_message = Some(format!("Downloading {}...", entry.name));
+                    let temp_dir = tempfile::tempdir()?;
+                    let temp_file = temp_dir.path().join(&entry.name);
+                    let backend = active_backend_mut(left, right, state);
+                    match backend.download(&entry.path, &temp_file).await {
                         Ok(()) => {
-                            state.status_message = Some(format!("Copied: {}", entry.name));
-                            refresh_pane(dst_pane, dst_backend, state).await?;
+                            let pager =
+                                std::env::var("PAGER").unwrap_or_else(|_| "less".to_string());
+                            // Leave TUI mode for pager
+                            crossterm::terminal::disable_raw_mode()?;
+                            crossterm::execute!(
+                                std::io::stdout(),
+                                crossterm::terminal::LeaveAlternateScreen,
+                                crossterm::cursor::Show,
+                            )?;
+                            let _ = std::process::Command::new(&pager)
+                                .arg(temp_file.as_os_str())
+                                .status();
+                            // Re-enter TUI mode
+                            crossterm::terminal::enable_raw_mode()?;
+                            crossterm::execute!(
+                                std::io::stdout(),
+                                crossterm::terminal::EnterAlternateScreen,
+                                crossterm::cursor::Hide,
+                            )?;
+                            state.status_message = None;
                         }
                         Err(e) => {
-                            state.status_message = Some(format!("Upload error: {e}"));
+                            state.status_message = Some(format!("Download error: {e}"));
                         }
-                    },
-                    Err(e) => {
-                        state.status_message = Some(format!("Download error: {e}"));
                     }
                 }
             }
@@ -440,7 +494,7 @@ async fn handle_key(
         }
 
         KeyCode::Char('/') => {
-            state.filter_input = Some(String::new());
+            state.input_mode = InputMode::Filter(String::new());
         }
 
         KeyCode::Char('s') => {
@@ -461,30 +515,34 @@ async fn handle_key(
 
         KeyCode::Char('d') | KeyCode::F(8) => {
             let pane = active_pane_mut(left_pane, right_pane, state);
-            if let Some(entry) = pane.selected_entry().cloned()
-                && entry.name != ".."
-            {
-                let requires_confirm = state.env.eq_ignore_ascii_case("production")
-                    && state.active_pane == Side::Right;
+            let targets = collect_batch_targets(pane);
+            if !targets.is_empty() {
+                let requires_confirm = is_production_remote(state);
                 if requires_confirm {
-                    state.pending_delete = Some(PendingDelete {
-                        side: state.active_pane,
-                        path: entry.path,
-                        name: entry.name.clone(),
-                        is_dir: entry.is_dir,
-                    });
+                    let names: Vec<_> = targets.iter().map(|(_, n, _)| n.as_str()).collect();
                     state.status_message = Some(format!(
-                        "PROD delete '{}': press y to confirm, n/Esc to cancel",
-                        entry.name
+                        "PROD delete {}: press y to confirm, n/Esc to cancel",
+                        if names.len() == 1 {
+                            format!("'{}'", names[0])
+                        } else {
+                            format!("{} items", names.len())
+                        }
                     ));
+                    state.input_mode = InputMode::ConfirmDelete { entries: targets };
                 } else {
                     let backend = active_backend_mut(left, right, state);
-                    if entry.is_dir {
-                        backend.rmdir(&entry.path).await?;
-                    } else {
-                        backend.delete(&entry.path).await?;
+                    for (path, _, is_dir) in &targets {
+                        if *is_dir {
+                            backend.rmdir(path).await?;
+                        } else {
+                            backend.delete(path).await?;
+                        }
                     }
-                    state.status_message = Some(format!("Deleted: {}", entry.name));
+                    state.status_message = Some(if targets.len() == 1 {
+                        format!("Deleted: {}", targets[0].1)
+                    } else {
+                        format!("Deleted {} items", targets.len())
+                    });
                     let pane = active_pane_mut(left_pane, right_pane, state);
                     let backend = active_backend_mut(left, right, state);
                     refresh_pane(pane, backend, state).await?;
@@ -492,14 +550,48 @@ async fn handle_key(
             }
         }
 
-        KeyCode::Char('+') | KeyCode::F(7) => {
-            // Quick mkdir — prompt is handled inline (simplified: use first char input)
-            // For now, skip the inline prompt and use a simple approach
-            state.status_message = Some("mkdir: not yet interactive".to_string());
+        KeyCode::F(7) => {
+            state.input_mode = InputMode::MkdirPrompt(String::new());
         }
 
-        KeyCode::Char('r') => {
-            state.status_message = Some("rename: not yet interactive".to_string());
+        KeyCode::Char('r') | KeyCode::F(6) => {
+            let pane = active_pane_mut(left_pane, right_pane, state);
+            if let Some(entry) = pane.selected_entry().cloned()
+                && entry.name != ".."
+            {
+                state.input_mode = InputMode::RenamePrompt {
+                    input: entry.name.clone(),
+                    source: entry,
+                };
+            }
+        }
+
+        KeyCode::Char('*') => {
+            // Invert all marks (skip "..")
+            let pane = active_pane_mut(left_pane, right_pane, state);
+            for (i, entry) in pane.entries.iter().enumerate() {
+                if entry.name != ".." {
+                    if pane.marked.contains(&i) {
+                        pane.marked.remove(&i);
+                    } else {
+                        pane.marked.insert(i);
+                    }
+                }
+            }
+        }
+
+        KeyCode::Char('+') => {
+            state.input_mode = InputMode::SelectPattern {
+                input: String::new(),
+                selecting: true,
+            };
+        }
+
+        KeyCode::Char('-') => {
+            state.input_mode = InputMode::SelectPattern {
+                input: String::new(),
+                selecting: false,
+            };
         }
 
         KeyCode::Backspace => {
@@ -608,15 +700,25 @@ fn draw(
 ) {
     let size = frame.area();
 
-    // Layout: header, main (left | right), filter bar, status bar
-    let has_filter = state.filter_input.is_some() || state.filter.is_some();
+    // Layout: header, panes, filter bar (0-1), prompt bar (0-1), status message (0-1), F-key bar
+    let has_filter = matches!(state.input_mode, InputMode::Filter(_)) || state.filter.is_some();
+    let has_prompt = matches!(
+        state.input_mode,
+        InputMode::MkdirPrompt(_)
+            | InputMode::RenamePrompt { .. }
+            | InputMode::SelectPattern { .. }
+    );
+    let has_status = state.status_message.is_some()
+        || matches!(state.input_mode, InputMode::ConfirmDelete { .. });
     let main_chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(1),                              // header
             Constraint::Min(5),                                 // panes
             Constraint::Length(if has_filter { 1 } else { 0 }), // filter
-            Constraint::Length(1),                              // status bar
+            Constraint::Length(if has_prompt { 1 } else { 0 }), // prompt (mkdir/rename/pattern)
+            Constraint::Length(if has_status { 1 } else { 0 }), // status message
+            Constraint::Length(1),                              // F-key bar (always)
         ])
         .split(size);
 
@@ -664,7 +766,7 @@ fn draw(
 
     // Filter bar
     if has_filter {
-        let filter_text = if let Some(ref input) = state.filter_input {
+        let filter_text = if let InputMode::Filter(ref input) = state.input_mode {
             format!(" Filter: {}_ ", input)
         } else if let Some(ref filter) = state.filter {
             format!(" Filter: {} ", filter)
@@ -677,17 +779,48 @@ fn draw(
         );
     }
 
-    // Status bar
-    let status_text = if let Some(ref msg) = state.status_message {
-        msg.clone()
-    } else {
-        " Tab=Switch  Enter=Open  Space=Copy  d=Delete  s=Sort  .=Hidden  /=Filter  q=Quit"
-            .to_string()
-    };
-    frame.render_widget(
-        Paragraph::new(status_text).style(Style::default().fg(Color::DarkGray)),
-        main_chunks[3],
-    );
+    // Prompt bar (mkdir / rename / pattern select)
+    if has_prompt {
+        let prompt_text = match &state.input_mode {
+            InputMode::MkdirPrompt(input) => format!(" Mkdir: {}_ ", input),
+            InputMode::RenamePrompt { input, .. } => format!(" Rename: {}_ ", input),
+            InputMode::SelectPattern { input, selecting } => {
+                let label = if *selecting { "Select" } else { "Deselect" };
+                format!(" {} pattern: {}_ ", label, input)
+            }
+            _ => String::new(),
+        };
+        frame.render_widget(
+            Paragraph::new(prompt_text).style(Style::default().fg(Color::Yellow)),
+            main_chunks[3],
+        );
+    }
+
+    // Status message
+    if has_status {
+        let msg = if let InputMode::ConfirmDelete { ref entries } = state.input_mode {
+            if entries.len() == 1 {
+                format!(
+                    " PROD delete '{}': press y to confirm, n/Esc to cancel",
+                    entries[0].1
+                )
+            } else {
+                format!(
+                    " PROD delete {} items: press y to confirm, n/Esc to cancel",
+                    entries.len()
+                )
+            }
+        } else {
+            state.status_message.as_deref().unwrap_or("").to_string()
+        };
+        frame.render_widget(
+            Paragraph::new(msg).style(Style::default().fg(Color::DarkGray)),
+            main_chunks[4],
+        );
+    }
+
+    // F-key bar (always visible)
+    draw_fkey_bar(frame, main_chunks[5]);
 }
 
 /// Draw a single pane.
@@ -778,6 +911,241 @@ fn draw_pane(
     );
 
     frame.render_stateful_widget(list, area, &mut pane.list_state);
+}
+
+/// Check if the active pane is a production remote pane.
+fn is_production_remote(state: &BrowserState) -> bool {
+    let label = match state.active_pane {
+        Side::Left => state.left_label,
+        Side::Right => state.right_label,
+    };
+    state.env.eq_ignore_ascii_case("production") && label == PaneLabel::Remote
+}
+
+/// Collect batch operation targets: marked entries if any, otherwise the selected entry (skip `..`).
+fn collect_batch_targets(pane: &PaneState) -> Vec<(String, String, bool)> {
+    if !pane.marked.is_empty() {
+        pane.marked
+            .iter()
+            .filter_map(|&idx| pane.entries.get(idx))
+            .filter(|e| e.name != "..")
+            .map(|e| (e.path.clone(), e.name.clone(), e.is_dir))
+            .collect()
+    } else if let Some(entry) = pane.selected_entry()
+        && entry.name != ".."
+    {
+        vec![(entry.path.clone(), entry.name.clone(), entry.is_dir)]
+    } else {
+        vec![]
+    }
+}
+
+/// Handle input modes: filter, mkdir prompt, rename prompt, confirm delete, pattern select.
+async fn handle_input_mode(
+    key: KeyEvent,
+    left_pane: &mut PaneState,
+    right_pane: &mut PaneState,
+    state: &mut BrowserState,
+    left: &mut Backend,
+    right: &mut Backend,
+) -> Result<()> {
+    // Handle char/backspace editing for text input modes
+    if matches!(key.code, KeyCode::Char(_) | KeyCode::Backspace) {
+        let input_ref = match &mut state.input_mode {
+            InputMode::Filter(input)
+            | InputMode::MkdirPrompt(input)
+            | InputMode::SelectPattern { input, .. } => Some(input),
+            InputMode::RenamePrompt { input, .. } => Some(input),
+            _ => None,
+        };
+        if let Some(input) = input_ref {
+            match key.code {
+                KeyCode::Char(c) => {
+                    input.push(c);
+                    return Ok(());
+                }
+                KeyCode::Backspace => {
+                    input.pop();
+                    return Ok(());
+                }
+                _ => {}
+            }
+        }
+    }
+
+    // Handle ConfirmDelete chars (y/n) separately
+    if let InputMode::ConfirmDelete { .. } = &state.input_mode {
+        let entries = if let InputMode::ConfirmDelete { entries } =
+            std::mem::replace(&mut state.input_mode, InputMode::Normal)
+        {
+            entries
+        } else {
+            unreachable!()
+        };
+        match key.code {
+            KeyCode::Char('y') | KeyCode::Char('Y') => {
+                let backend = active_backend_mut(left, right, state);
+                for (path, _, is_dir) in &entries {
+                    if *is_dir {
+                        backend.rmdir(path).await?;
+                    } else {
+                        backend.delete(path).await?;
+                    }
+                }
+                state.status_message = Some(if entries.len() == 1 {
+                    format!("Deleted: {}", entries[0].1)
+                } else {
+                    format!("Deleted {} items", entries.len())
+                });
+                let pane = active_pane_mut(left_pane, right_pane, state);
+                let backend = active_backend_mut(left, right, state);
+                refresh_pane(pane, backend, state).await?;
+            }
+            KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('N') => {
+                state.status_message = Some("Delete cancelled.".to_string());
+            }
+            _ => {
+                // Put entries back — unrecognized key
+                state.input_mode = InputMode::ConfirmDelete { entries };
+            }
+        }
+        return Ok(());
+    }
+
+    // Handle Esc — cancel all input modes
+    if key.code == KeyCode::Esc {
+        if matches!(state.input_mode, InputMode::Filter(_)) {
+            state.filter = None;
+            state.input_mode = InputMode::Normal;
+            let pane = active_pane_mut(left_pane, right_pane, state);
+            let backend = active_backend_mut(left, right, state);
+            refresh_pane(pane, backend, state).await?;
+        } else {
+            state.input_mode = InputMode::Normal;
+        }
+        return Ok(());
+    }
+
+    // Handle Enter — commit the current input mode
+    if key.code == KeyCode::Enter {
+        // Take ownership of input_mode so we can freely use state
+        let mode = std::mem::replace(&mut state.input_mode, InputMode::Normal);
+        match mode {
+            InputMode::Filter(input) => {
+                state.filter = if input.is_empty() { None } else { Some(input) };
+                let pane = active_pane_mut(left_pane, right_pane, state);
+                let backend = active_backend_mut(left, right, state);
+                refresh_pane(pane, backend, state).await?;
+            }
+            InputMode::MkdirPrompt(input) => {
+                let name = input.trim().to_string();
+                if name.is_empty() || name == "." || name == ".." || name.contains('/') {
+                    state.status_message = Some("Invalid directory name".to_string());
+                } else {
+                    let pane = active_pane_mut(left_pane, right_pane, state);
+                    let path = format!("{}/{}", pane.cwd.trim_end_matches('/'), name);
+                    let backend = active_backend_mut(left, right, state);
+                    match backend.mkdir(&path).await {
+                        Ok(()) => {
+                            state.status_message = Some(format!("Created: {name}"));
+                            let pane = active_pane_mut(left_pane, right_pane, state);
+                            let backend = active_backend_mut(left, right, state);
+                            refresh_pane(pane, backend, state).await?;
+                        }
+                        Err(e) => {
+                            state.status_message = Some(format!("Mkdir error: {e}"));
+                        }
+                    }
+                }
+            }
+            InputMode::RenamePrompt { input, source } => {
+                let new_name = input.trim().to_string();
+                if new_name.is_empty()
+                    || new_name == "."
+                    || new_name == ".."
+                    || new_name.contains('/')
+                {
+                    state.status_message = Some("Invalid name".to_string());
+                } else {
+                    let pane = active_pane_mut(left_pane, right_pane, state);
+                    let new_path = format!("{}/{}", pane.cwd.trim_end_matches('/'), new_name);
+                    let backend = active_backend_mut(left, right, state);
+                    match backend.rename(&source.path, &new_path).await {
+                        Ok(()) => {
+                            state.status_message = Some(format!("Renamed → {new_name}"));
+                            let pane = active_pane_mut(left_pane, right_pane, state);
+                            let backend = active_backend_mut(left, right, state);
+                            refresh_pane(pane, backend, state).await?;
+                        }
+                        Err(e) => {
+                            state.status_message = Some(format!("Rename error: {e}"));
+                        }
+                    }
+                }
+            }
+            InputMode::SelectPattern { input, selecting } => {
+                let pattern = input.trim().to_string();
+                if !pattern.is_empty() {
+                    let pane = active_pane_mut(left_pane, right_pane, state);
+                    for (i, entry) in pane.entries.iter().enumerate() {
+                        if entry.name != ".." && glob_match(&pattern, &entry.name) {
+                            if selecting {
+                                pane.marked.insert(i);
+                            } else {
+                                pane.marked.remove(&i);
+                            }
+                        }
+                    }
+                    let count = pane.marked.len();
+                    state.status_message = Some(format!("{count} files marked"));
+                }
+            }
+            InputMode::Normal | InputMode::ConfirmDelete { .. } => {}
+        }
+        return Ok(());
+    }
+
+    Ok(())
+}
+
+/// Draw the MC-style F-key bar at the bottom.
+fn draw_fkey_bar(frame: &mut Frame, area: Rect) {
+    let keys: &[(u8, &str)] = &[
+        (1, "Help"),
+        (2, ""),
+        (3, "View"),
+        (4, ""),
+        (5, "Copy"),
+        (6, "RenMov"),
+        (7, "Mkdir"),
+        (8, "Del"),
+        (9, ""),
+        (10, "Quit"),
+    ];
+
+    let num_style = Style::default().fg(Color::Black).bg(Color::Cyan);
+    let label_style = Style::default().fg(Color::White).bg(Color::DarkGray);
+
+    let mut spans = Vec::new();
+    for (num, label) in keys {
+        spans.push(Span::styled(format!("{num}"), num_style));
+        // Pad label to fill slot width evenly
+        let text = if label.is_empty() {
+            "     ".to_string()
+        } else {
+            format!("{:<5}", label)
+        };
+        spans.push(Span::styled(text, label_style));
+    }
+
+    // Fill remaining width with the bar background
+    let used: usize = keys.len() * 6; // 1 digit + 5 label chars per slot
+    let remaining = (area.width as usize).saturating_sub(used);
+    if remaining > 0 {
+        spans.push(Span::styled(" ".repeat(remaining), label_style));
+    }
+
+    frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
 /// Truncate a filename to fit within a given width.

@@ -17,7 +17,7 @@ sha256sums_x86_64=('SKIP')
 sha256sums_aarch64=('SKIP')
 
 package() {
-    cd "sshore-${CARCH}-unknown-linux-gnu" 2>/dev/null || cd .
+    cd "sshore-${CARCH}-unknown-linux-gnu"
 
     install -Dm755 sshore "${pkgdir}/usr/bin/sshore"
     install -Dm644 LICENSE "${pkgdir}/usr/share/licenses/${pkgname}/LICENSE"

@@ -174,6 +174,8 @@ pub enum SessionAction {
     ShowSnippets,
     /// Show the save-as-bookmark form.
     ShowSaveBookmark,
+    /// Show the in-session SFTP file browser.
+    ShowBrowser,
 }
 
 /// Tracks terminal escape sequence state so the trigger detectors
@@ -189,22 +191,24 @@ enum TermSeqState {
     InSs3,
 }
 
-/// Combined escape handler for snippet trigger and bookmark trigger.
-/// Handles two independent escape sequences during an SSH session.
+/// Combined escape handler for snippet, bookmark, and browser triggers.
+/// Handles three independent escape sequences during an SSH session.
 /// Tracks terminal escape sequences (CSI, SS3) to avoid intercepting
 /// function key bytes like the `~` terminator in `\x1b[21~` (F10).
 pub struct SessionEscapeHandler {
     snippet_detector: EscapeDetector,
     bookmark_detector: EscapeDetector,
+    browser_detector: EscapeDetector,
     term_seq: TermSeqState,
 }
 
 impl SessionEscapeHandler {
     /// Create a new handler with the given trigger strings.
-    pub fn new(snippet_trigger: &str, bookmark_trigger: &str) -> Self {
+    pub fn new(snippet_trigger: &str, bookmark_trigger: &str, browser_trigger: &str) -> Self {
         Self {
             snippet_detector: EscapeDetector::new(snippet_trigger),
             bookmark_detector: EscapeDetector::new(bookmark_trigger),
+            browser_detector: EscapeDetector::new(browser_trigger),
             term_seq: TermSeqState::Normal,
         }
     }
@@ -260,11 +264,20 @@ impl SessionEscapeHandler {
             }
             EscapeAction::Forward(bytes) => {
                 // Snippet detector forwarded these bytes — now check bookmark trigger
-                let mut final_forward = Vec::new();
+                let mut after_bookmark = Vec::new();
                 for &b in &bytes {
                     match self.bookmark_detector.feed(b) {
                         EscapeAction::Trigger => return SessionAction::ShowSaveBookmark,
                         EscapeAction::Buffer => {} // absorbed by bookmark detector
+                        EscapeAction::Forward(fwd) => after_bookmark.extend(fwd),
+                    }
+                }
+                // Bookmark detector forwarded these bytes — now check browser trigger
+                let mut final_forward = Vec::new();
+                for &b in &after_bookmark {
+                    match self.browser_detector.feed(b) {
+                        EscapeAction::Trigger => return SessionAction::ShowBrowser,
+                        EscapeAction::Buffer => {} // absorbed by browser detector
                         EscapeAction::Forward(fwd) => final_forward.extend(fwd),
                     }
                 }
@@ -622,7 +635,7 @@ mod tests {
 
     #[test]
     fn test_session_handler_snippet_trigger() {
-        let mut handler = SessionEscapeHandler::new("~~", "~b");
+        let mut handler = SessionEscapeHandler::new("~~", "~b", "~f");
 
         assert!(matches!(handler.feed(b'~'), SessionAction::Buffer));
         assert!(matches!(handler.feed(b'~'), SessionAction::ShowSnippets));
@@ -630,7 +643,7 @@ mod tests {
 
     #[test]
     fn test_session_handler_bookmark_trigger() {
-        let mut handler = SessionEscapeHandler::new("~~", "~b");
+        let mut handler = SessionEscapeHandler::new("~~", "~b", "~f");
 
         assert!(matches!(handler.feed(b'~'), SessionAction::Buffer));
         // After snippet detector flushes '~' + 'b', bookmark detector should catch it
@@ -643,6 +656,7 @@ mod tests {
                     SessionAction::Buffer => "Buffer".to_string(),
                     SessionAction::ShowSnippets => "ShowSnippets".to_string(),
                     SessionAction::ShowSaveBookmark => "ShowSaveBookmark".to_string(),
+                    SessionAction::ShowBrowser => "ShowBrowser".to_string(),
                 }
             ),
         }
@@ -650,7 +664,7 @@ mod tests {
 
     #[test]
     fn test_session_handler_normal_text() {
-        let mut handler = SessionEscapeHandler::new("~~", "~b");
+        let mut handler = SessionEscapeHandler::new("~~", "~b", "~f");
 
         match handler.feed(b'h') {
             SessionAction::Forward(bytes) => assert_eq!(bytes, vec![b'h']),
@@ -660,7 +674,7 @@ mod tests {
 
     #[test]
     fn test_session_handler_both_disabled() {
-        let mut handler = SessionEscapeHandler::new("", "");
+        let mut handler = SessionEscapeHandler::new("", "", "");
 
         match handler.feed(b'~') {
             SessionAction::Forward(bytes) => assert_eq!(bytes, vec![b'~']),
@@ -673,7 +687,7 @@ mod tests {
     #[test]
     fn test_session_handler_f10_csi_passthrough() {
         // F10 = \x1b[21~ — the trailing ~ must NOT start trigger matching
-        let mut handler = SessionEscapeHandler::new("~~", "~b");
+        let mut handler = SessionEscapeHandler::new("~~", "~b", "~f");
 
         let f10 = b"\x1b[21~";
         let mut forwarded = Vec::new();
@@ -690,7 +704,7 @@ mod tests {
     #[test]
     fn test_session_handler_f5_csi_passthrough() {
         // F5 = \x1b[15~
-        let mut handler = SessionEscapeHandler::new("~~", "~b");
+        let mut handler = SessionEscapeHandler::new("~~", "~b", "~f");
 
         let f5 = b"\x1b[15~";
         let mut forwarded = Vec::new();
@@ -706,7 +720,7 @@ mod tests {
     #[test]
     fn test_session_handler_arrow_key_csi_passthrough() {
         // Up arrow = \x1b[A
-        let mut handler = SessionEscapeHandler::new("~~", "~b");
+        let mut handler = SessionEscapeHandler::new("~~", "~b", "~f");
 
         let up = b"\x1b[A";
         let mut forwarded = Vec::new();
@@ -722,7 +736,7 @@ mod tests {
     #[test]
     fn test_session_handler_ss3_passthrough() {
         // Some terminals send SS3 for function keys: \x1bOP (F1)
-        let mut handler = SessionEscapeHandler::new("~~", "~b");
+        let mut handler = SessionEscapeHandler::new("~~", "~b", "~f");
 
         let f1 = b"\x1bOP";
         let mut forwarded = Vec::new();
@@ -738,7 +752,7 @@ mod tests {
     #[test]
     fn test_session_handler_csi_then_trigger_works() {
         // After a CSI sequence completes, trigger detection should still work
-        let mut handler = SessionEscapeHandler::new("~~", "~b");
+        let mut handler = SessionEscapeHandler::new("~~", "~b", "~f");
 
         // Send F10
         for &byte in b"\x1b[21~" {
@@ -753,7 +767,7 @@ mod tests {
     #[test]
     fn test_session_handler_alt_key_passthrough() {
         // Alt+x = \x1b x (two bytes)
-        let mut handler = SessionEscapeHandler::new("~~", "~b");
+        let mut handler = SessionEscapeHandler::new("~~", "~b", "~f");
 
         let alt_x = b"\x1bx";
         let mut forwarded = Vec::new();
@@ -764,5 +778,46 @@ mod tests {
             }
         }
         assert_eq!(forwarded, alt_x.to_vec());
+    }
+
+    #[test]
+    fn test_session_handler_browser_trigger() {
+        let mut handler = SessionEscapeHandler::new("~~", "~b", "~f");
+
+        assert!(matches!(handler.feed(b'~'), SessionAction::Buffer));
+        assert!(matches!(handler.feed(b'f'), SessionAction::ShowBrowser));
+    }
+
+    #[test]
+    fn test_session_handler_browser_trigger_disabled() {
+        let mut handler = SessionEscapeHandler::new("~~", "~b", "");
+
+        assert!(matches!(handler.feed(b'~'), SessionAction::Buffer));
+        // With browser trigger disabled, ~f should forward
+        match handler.feed(b'f') {
+            SessionAction::Forward(bytes) => assert_eq!(bytes, vec![b'~', b'f']),
+            _ => panic!("Expected Forward when browser trigger disabled"),
+        }
+    }
+
+    #[test]
+    fn test_session_handler_all_triggers_independent() {
+        // Verify all three triggers work in sequence
+        let mut handler = SessionEscapeHandler::new("~~", "~b", "~f");
+
+        // Snippet trigger
+        assert!(matches!(handler.feed(b'~'), SessionAction::Buffer));
+        assert!(matches!(handler.feed(b'~'), SessionAction::ShowSnippets));
+
+        // Bookmark trigger
+        assert!(matches!(handler.feed(b'~'), SessionAction::Buffer));
+        assert!(matches!(
+            handler.feed(b'b'),
+            SessionAction::ShowSaveBookmark
+        ));
+
+        // Browser trigger
+        assert!(matches!(handler.feed(b'~'), SessionAction::Buffer));
+        assert!(matches!(handler.feed(b'f'), SessionAction::ShowBrowser));
     }
 }

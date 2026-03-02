@@ -62,6 +62,28 @@ pub fn print_production_banner(
     }
 }
 
+/// Print available escape sequence hints at session start.
+fn print_escape_hints(
+    snippet_trigger: &str,
+    bookmark_trigger: &str,
+    browser_trigger: &str,
+    has_snippets: bool,
+) {
+    let mut hints = Vec::new();
+    if has_snippets && !snippet_trigger.is_empty() {
+        hints.push(format!("{snippet_trigger} snippets"));
+    }
+    if !bookmark_trigger.is_empty() {
+        hints.push(format!("{bookmark_trigger} bookmark"));
+    }
+    if !browser_trigger.is_empty() {
+        hints.push(format!("{browser_trigger} file browser"));
+    }
+    if !hints.is_empty() {
+        eprintln!("\x1b[2m[sshore] {}\x1b[0m", hints.join("  "));
+    }
+}
+
 /// Resolve the effective connection timeout for a bookmark.
 /// Priority: bookmark.connect_timeout_secs → settings.connect_timeout_secs → default (15s).
 fn effective_timeout(bookmark: &Bookmark, settings: &crate::config::model::Settings) -> u64 {
@@ -383,6 +405,16 @@ pub async fn connect(
     let global_snippets = config.settings.snippets.clone();
     let snippet_trigger = config.settings.snippet_trigger.clone();
     let bookmark_trigger = config.settings.bookmark_trigger.clone();
+    let browser_trigger = config.settings.browser_trigger.clone();
+    let bookmark_env = bookmark.env.clone();
+
+    // Print available escape triggers as a dim hint
+    print_escape_hints(
+        &snippet_trigger,
+        &bookmark_trigger,
+        &browser_trigger,
+        !bookmark_snippets.is_empty() || !config.settings.snippets.is_empty(),
+    );
 
     // Build session info for save-as-bookmark
     let session_info = SessionInfo {
@@ -403,7 +435,10 @@ pub async fn connect(
         global_snippets,
         snippet_trigger,
         bookmark_trigger,
+        browser_trigger,
         session_info,
+        &session,
+        &bookmark_env,
         cfg_override,
     )
     .await?;
@@ -731,10 +766,20 @@ async fn setup_ssh_signal_handlers() -> Result<tokio::sync::watch::Receiver<bool
     Ok(rx)
 }
 
+/// Whether the inner proxy loop should exit entirely or switch to browser mode.
+enum ProxyAction {
+    Exit,
+    Browser,
+}
+
 /// Run the interactive terminal proxy loop.
 /// Routes stdin through the main `tokio::select!` loop to enable password injection
 /// without race conditions. When a password prompt is detected in SSH output,
 /// the user can press Enter to inject the stored password or Esc to skip.
+///
+/// Supports an outer/inner loop pattern: when `~f` is typed, the inner loop
+/// breaks to launch the file browser, then the outer loop respawns the stdin
+/// reader and re-enters the proxy.
 #[allow(clippy::too_many_arguments)]
 async fn run_proxy_loop(
     channel: russh::Channel<russh::client::Msg>,
@@ -744,11 +789,13 @@ async fn run_proxy_loop(
     global_snippets: Vec<crate::config::model::Snippet>,
     snippet_trigger: String,
     bookmark_trigger: String,
+    browser_trigger: String,
     session_info: SessionInfo,
+    session: &russh::client::Handle<SshoreHandler>,
+    bookmark_env: &str,
     cfg_override: Option<&str>,
 ) -> Result<()> {
     // Put terminal in raw mode with cleanup guard
-    // Capture pre-enable state first so guard is only created after successful enable
     let was_raw = crossterm::terminal::is_raw_mode_enabled().unwrap_or(false);
     crossterm::terminal::enable_raw_mode().context("Failed to enable raw mode")?;
     let _guard = TerminalGuard { was_raw };
@@ -758,179 +805,246 @@ async fn run_proxy_loop(
     // Create a writer for stdin forwarding (clones the internal sender)
     let mut writer = channel_tx.make_writer();
 
-    // Stdin flows through an mpsc channel so the main loop controls forwarding
-    let (stdin_tx, mut stdin_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(STDIN_CHANNEL_SIZE);
-
-    // Spawn stdin reader — sends raw bytes to the mpsc channel
-    let mut stdin_handle = tokio::spawn(read_stdin(stdin_tx));
-
-    // Spawn resize handler (takes ownership of write half)
-    let mut resize_handle = tokio::spawn(handle_resize(channel_tx));
-
     let mut stdout = std::io::stdout();
     let mut awaiting_confirm = false;
 
-    // Combined escape handler for snippets and bookmark save
+    // Combined escape handler for snippets, bookmark save, and browser
     use self::snippet::{SessionAction, SessionEscapeHandler};
-    let mut escape_handler = SessionEscapeHandler::new(&snippet_trigger, &bookmark_trigger);
+    let mut escape_handler =
+        SessionEscapeHandler::new(&snippet_trigger, &bookmark_trigger, &browser_trigger);
     let has_snippets = !bookmark_snippets.is_empty() || !global_snippets.is_empty();
-    let has_escape_triggers = has_snippets || !bookmark_trigger.is_empty();
+    let has_escape_triggers =
+        has_snippets || !bookmark_trigger.is_empty() || !browser_trigger.is_empty();
 
     // Signal handlers for graceful shutdown
     let mut shutdown_rx = setup_ssh_signal_handlers().await?;
 
-    loop {
-        tokio::select! {
-            _ = shutdown_rx.changed() => {
-                if *shutdown_rx.borrow() {
-                    // Graceful shutdown — TerminalGuard will clean up on drop
-                    break;
-                }
-            }
-            msg = channel_rx.wait() => {
-                match msg {
-                    Some(ChannelMsg::Data { ref data }) => {
-                        match stdout.write_all(data) {
-                            Ok(()) => { let _ = stdout.flush(); }
-                            Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => {
-                                // Terminal is gone (window closed). Exit cleanly.
-                                break;
-                            }
-                            Err(e) => {
-                                eprintln!("stdout write error: {e}");
-                                break;
-                            }
-                        }
+    // SIGWINCH listener — inlined so channel_tx stays available after browser exits
+    #[cfg(unix)]
+    let mut sigwinch =
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::window_change()).ok();
 
-                        // Feed data to password detector
-                        if !awaiting_confirm && detector.feed(data) {
-                            awaiting_confirm = true;
-                            let mut stderr = std::io::stderr();
-                            let _ = write!(stderr, "\r\n[sshore] Password found in keychain. Press Enter to auto-fill, Esc to skip.\r\n");
-                            let _ = stderr.flush();
+    // Bookmark name for browser display
+    let browser_name = session_info
+        .bookmark_name
+        .clone()
+        .unwrap_or_else(|| session_info.host.clone());
+
+    loop {
+        // Spawn stdin reader for this iteration
+        let (stdin_tx, mut stdin_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(STDIN_CHANNEL_SIZE);
+        let mut stdin_handle = tokio::spawn(read_stdin(stdin_tx));
+
+        let action = 'proxy: loop {
+            tokio::select! {
+                _ = shutdown_rx.changed() => {
+                    if *shutdown_rx.borrow() {
+                        break 'proxy ProxyAction::Exit;
+                    }
+                }
+
+                // Inline SIGWINCH handling (Unix only)
+                _ = async {
+                    #[cfg(unix)]
+                    {
+                        if let Some(ref mut sw) = sigwinch {
+                            sw.recv().await
+                        } else {
+                            std::future::pending::<Option<()>>().await
                         }
                     }
-                    Some(ChannelMsg::ExtendedData { data, ext: 1 }) => {
-                        std::io::stderr().write_all(&data)?;
-                        std::io::stderr().flush()?;
+                    #[cfg(not(unix))]
+                    {
+                        std::future::pending::<Option<()>>().await
                     }
-                    Some(ChannelMsg::ExitStatus { .. }) => break,
-                    Some(ChannelMsg::Eof | ChannelMsg::Close) => break,
-                    Some(_) => {}
-                    None => break,
+                } => {
+                    let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
+                    let _ = channel_tx.window_change(cols as u32, rows as u32, 0, 0).await;
+                }
+
+                msg = channel_rx.wait() => {
+                    match msg {
+                        Some(ChannelMsg::Data { ref data }) => {
+                            match stdout.write_all(data) {
+                                Ok(()) => { let _ = stdout.flush(); }
+                                Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => {
+                                    break 'proxy ProxyAction::Exit;
+                                }
+                                Err(e) => {
+                                    eprintln!("stdout write error: {e}");
+                                    break 'proxy ProxyAction::Exit;
+                                }
+                            }
+
+                            // Feed data to password detector
+                            if !awaiting_confirm && detector.feed(data) {
+                                awaiting_confirm = true;
+                                let mut stderr = std::io::stderr();
+                                let _ = write!(stderr, "\r\n[sshore] Password found in keychain. Press Enter to auto-fill, Esc to skip.\r\n");
+                                let _ = stderr.flush();
+                            }
+                        }
+                        Some(ChannelMsg::ExtendedData { data, ext: 1 }) => {
+                            std::io::stderr().write_all(&data)?;
+                            std::io::stderr().flush()?;
+                        }
+                        Some(ChannelMsg::ExitStatus { .. }) => break 'proxy ProxyAction::Exit,
+                        Some(ChannelMsg::Eof | ChannelMsg::Close) => break 'proxy ProxyAction::Exit,
+                        Some(_) => {}
+                        None => break 'proxy ProxyAction::Exit,
+                    }
+                }
+
+                Some(bytes) = stdin_rx.recv() => {
+                    if awaiting_confirm {
+                        if bytes.first() == Some(&0x0d)
+                            && let Some(ref pw) = stored_password
+                        {
+                            let mut payload = Zeroizing::new(pw.as_bytes().to_vec());
+                            payload.push(b'\n');
+                            let _ = tokio::io::AsyncWriteExt::write_all(&mut writer, &payload).await;
+                        }
+                        awaiting_confirm = false;
+                        detector.clear();
+                    } else if has_escape_triggers {
+                        let mut forward_batch = Vec::new();
+                        let mut should_break = false;
+                        for &byte in &bytes {
+                            match escape_handler.feed(byte) {
+                                SessionAction::Forward(fwd) => {
+                                    forward_batch.extend(fwd);
+                                }
+                                SessionAction::Buffer => {
+                                    if !forward_batch.is_empty() {
+                                        if tokio::io::AsyncWriteExt::write_all(&mut writer, &forward_batch).await.is_err() {
+                                            should_break = true;
+                                            break;
+                                        }
+                                        forward_batch.clear();
+                                    }
+                                }
+                                SessionAction::ShowSnippets => {
+                                    if !forward_batch.is_empty() {
+                                        let _ = tokio::io::AsyncWriteExt::write_all(&mut writer, &forward_batch).await;
+                                        forward_batch.clear();
+                                    }
+                                    if let Ok(Some(command)) = snippet::show_snippet_picker(
+                                        &mut stdout,
+                                        &bookmark_snippets,
+                                        &global_snippets,
+                                    ) {
+                                        let _ = tokio::io::AsyncWriteExt::write_all(
+                                            &mut writer,
+                                            command.as_bytes(),
+                                        )
+                                        .await;
+                                    }
+                                }
+                                SessionAction::ShowSaveBookmark => {
+                                    if !forward_batch.is_empty() {
+                                        let _ = tokio::io::AsyncWriteExt::write_all(&mut writer, &forward_batch).await;
+                                        forward_batch.clear();
+                                    }
+                                    if let Ok(Some(new_bookmark)) = snippet::show_save_bookmark_form(
+                                        &mut stdout,
+                                        &session_info,
+                                    ) {
+                                        match config::locked_modify(cfg_override, |app_config| {
+                                            let bm_name = new_bookmark.name.clone();
+                                            if let Some(idx) = app_config.bookmarks.iter().position(|b| b.name == bm_name) {
+                                                app_config.bookmarks[idx] = new_bookmark;
+                                                format!("\x1b[32mBookmark '{bm_name}' updated\x1b[0m\r\n")
+                                            } else {
+                                                app_config.bookmarks.push(new_bookmark);
+                                                format!("\x1b[32mBookmark '{bm_name}' saved\x1b[0m\r\n")
+                                            }
+                                        }) {
+                                            Ok(msg) => {
+                                                let _ = write!(stdout, "{msg}");
+                                            }
+                                            Err(e) => {
+                                                let _ = write!(stdout, "\x1b[31mError saving bookmark: {e}\x1b[0m\r\n");
+                                            }
+                                        }
+                                        let _ = stdout.flush();
+                                    }
+                                }
+                                SessionAction::ShowBrowser => {
+                                    if !forward_batch.is_empty() {
+                                        let _ = tokio::io::AsyncWriteExt::write_all(&mut writer, &forward_batch).await;
+                                        forward_batch.clear();
+                                    }
+                                    break 'proxy ProxyAction::Browser;
+                                }
+                            }
+                        }
+                        if should_break {
+                            break 'proxy ProxyAction::Exit;
+                        }
+                        if !forward_batch.is_empty()
+                            && tokio::io::AsyncWriteExt::write_all(&mut writer, &forward_batch).await.is_err()
+                        {
+                            break 'proxy ProxyAction::Exit;
+                        }
+                    } else if tokio::io::AsyncWriteExt::write_all(&mut writer, &bytes).await.is_err() {
+                        break 'proxy ProxyAction::Exit;
+                    }
                 }
             }
-            Some(bytes) = stdin_rx.recv() => {
-                if awaiting_confirm {
-                    // Enter (0x0d) — inject the stored password
-                    // Any other key — skip injection
-                    // Don't forward the decision keystroke to the remote
-                    if bytes.first() == Some(&0x0d)
-                        && let Some(ref pw) = stored_password
-                    {
-                        let mut payload = Zeroizing::new(pw.as_bytes().to_vec());
-                        payload.push(b'\n');
-                        let _ = tokio::io::AsyncWriteExt::write_all(&mut writer, &payload).await;
-                        // payload is zeroed on drop via Zeroizing
-                    }
-                    awaiting_confirm = false;
-                    detector.clear();
-                } else if has_escape_triggers {
-                    // Escape detection: feed bytes through combined handler.
-                    // Batch forwarded bytes to minimize SSH channel writes.
-                    let mut forward_batch = Vec::new();
-                    for &byte in &bytes {
-                        match escape_handler.feed(byte) {
-                            SessionAction::Forward(fwd) => {
-                                forward_batch.extend(fwd);
-                            }
-                            SessionAction::Buffer => {
-                                // Flush accumulated batch before buffering
-                                if !forward_batch.is_empty() {
-                                    if tokio::io::AsyncWriteExt::write_all(&mut writer, &forward_batch).await.is_err() {
-                                        break;
-                                    }
-                                    forward_batch.clear();
-                                }
-                            }
-                            SessionAction::ShowSnippets => {
-                                // Flush batch before showing picker
-                                if !forward_batch.is_empty() {
-                                    let _ = tokio::io::AsyncWriteExt::write_all(&mut writer, &forward_batch).await;
-                                    forward_batch.clear();
-                                }
-                                // Show snippet picker, inject selected command
-                                if let Ok(Some(command)) = snippet::show_snippet_picker(
-                                    &mut stdout,
-                                    &bookmark_snippets,
-                                    &global_snippets,
-                                ) {
-                                    let _ = tokio::io::AsyncWriteExt::write_all(
-                                        &mut writer,
-                                        command.as_bytes(),
-                                    )
-                                    .await;
-                                }
-                            }
-                            SessionAction::ShowSaveBookmark => {
-                                // Flush batch before showing form
-                                if !forward_batch.is_empty() {
-                                    let _ = tokio::io::AsyncWriteExt::write_all(&mut writer, &forward_batch).await;
-                                    forward_batch.clear();
-                                }
-                                // Show save-as-bookmark form
-                                if let Ok(Some(new_bookmark)) = snippet::show_save_bookmark_form(
-                                    &mut stdout,
-                                    &session_info,
-                                ) {
-                                    // Load, merge, save with file locking to prevent
-                                    // concurrent sshore instances from losing changes
-                                    match config::locked_modify(cfg_override, |app_config| {
-                                        let bm_name = new_bookmark.name.clone();
-                                        if let Some(idx) = app_config.bookmarks.iter().position(|b| b.name == bm_name) {
-                                            app_config.bookmarks[idx] = new_bookmark;
-                                            format!("\x1b[32mBookmark '{bm_name}' updated\x1b[0m\r\n")
-                                        } else {
-                                            app_config.bookmarks.push(new_bookmark);
-                                            format!("\x1b[32mBookmark '{bm_name}' saved\x1b[0m\r\n")
-                                        }
-                                    }) {
-                                        Ok(msg) => {
-                                            let _ = write!(stdout, "{msg}");
-                                        }
-                                        Err(e) => {
-                                            let _ = write!(stdout, "\x1b[31mError saving bookmark: {e}\x1b[0m\r\n");
-                                        }
-                                    }
-                                    let _ = stdout.flush();
-                                }
-                            }
-                        }
-                    }
-                    // Flush remaining batch
-                    if !forward_batch.is_empty()
-                        && tokio::io::AsyncWriteExt::write_all(&mut writer, &forward_batch).await.is_err()
-                    {
-                        break;
-                    }
-                } else {
-                    // No escape triggers configured — fast path, skip detection
-                    if tokio::io::AsyncWriteExt::write_all(&mut writer, &bytes).await.is_err() {
-                        break;
+        };
+
+        // Clean up stdin reader for this iteration
+        drop(stdin_rx);
+        let _ = tokio::time::timeout(TASK_SHUTDOWN_TIMEOUT, &mut stdin_handle).await;
+        stdin_handle.abort();
+
+        match action {
+            ProxyAction::Exit => break,
+            ProxyAction::Browser => {
+                // Launch in-session SFTP file browser
+                match launch_browser(session, &browser_name, bookmark_env).await {
+                    Ok(()) => {}
+                    Err(e) => {
+                        let _ =
+                            write!(stdout, "\r\n\x1b[31m[sshore] Browser error: {e}\x1b[0m\r\n");
+                        let _ = stdout.flush();
                     }
                 }
+
+                // Re-enable raw mode (BrowserGuard disables it on drop)
+                crossterm::terminal::enable_raw_mode()
+                    .context("Failed to re-enable raw mode after browser")?;
+
+                // Sync terminal size with remote PTY
+                let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
+                let _ = channel_tx
+                    .window_change(cols as u32, rows as u32, 0, 0)
+                    .await;
+
+                // Outer loop continues — new stdin reader spawned at top
             }
         }
     }
 
-    // Clean up spawned tasks gracefully:
-    // Drop the stdin receiver so read_stdin's send() fails and it exits.
-    drop(stdin_rx);
-    let _ = tokio::time::timeout(TASK_SHUTDOWN_TIMEOUT, &mut stdin_handle).await;
-    stdin_handle.abort();
-    // Resize handler has no cancellation signal (event stream); abort after grace period.
-    let _ = tokio::time::timeout(TASK_SHUTDOWN_TIMEOUT, &mut resize_handle).await;
-    resize_handle.abort();
+    Ok(())
+}
+
+/// Launch the dual-pane file browser using the existing SSH session.
+async fn launch_browser(
+    session: &russh::client::Handle<SshoreHandler>,
+    name: &str,
+    env: &str,
+) -> Result<()> {
+    use crate::storage::{Backend, local_backend::LocalBackend, sftp_backend::SftpBackend};
+    use crate::tui::views::browser;
+
+    let sftp_backend = SftpBackend::from_handle(session, name).await?;
+    let local_backend = LocalBackend::new(".")?;
+
+    let mut left = Backend::Sftp(sftp_backend);
+    let mut right = Backend::Local(local_backend);
+
+    browser::run(&mut left, &mut right, name, env, false).await?;
 
     Ok(())
 }
@@ -949,44 +1063,6 @@ async fn read_stdin(tx: tokio::sync::mpsc::Sender<Vec<u8>>) {
                 }
             }
             Err(_) => break,
-        }
-    }
-}
-
-/// Handle terminal resize events and forward to SSH channel.
-/// Uses SIGWINCH signal on Unix to avoid competing with the stdin reader
-/// for stdin bytes (crossterm's EventStream reads from stdin too,
-/// which causes dropped keystrokes).
-#[cfg(unix)]
-async fn handle_resize(channel_tx: russh::ChannelWriteHalf<russh::client::Msg>) {
-    use tokio::signal::unix::{SignalKind, signal};
-
-    let mut sigwinch = match signal(SignalKind::window_change()) {
-        Ok(s) => s,
-        Err(_) => return,
-    };
-
-    while sigwinch.recv().await.is_some() {
-        let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
-        let _ = channel_tx
-            .window_change(cols as u32, rows as u32, 0, 0)
-            .await;
-    }
-}
-
-/// Handle terminal resize events via polling on non-Unix platforms.
-#[cfg(not(unix))]
-async fn handle_resize(channel_tx: russh::ChannelWriteHalf<russh::client::Msg>) {
-    let mut last_size = crossterm::terminal::size().unwrap_or((80, 24));
-    loop {
-        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-        if let Ok(size) = crossterm::terminal::size() {
-            if size != last_size {
-                last_size = size;
-                let _ = channel_tx
-                    .window_change(size.0 as u32, size.1 as u32, 0, 0)
-                    .await;
-            }
         }
     }
 }

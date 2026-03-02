@@ -127,6 +127,15 @@ pub struct BrowserState {
     pub bookmark_name: String,
     pub env: String,
     pub pending_delete: Option<PendingDelete>,
+    pub left_label: PaneLabel,
+    pub right_label: PaneLabel,
+}
+
+/// Whether a pane shows a local or remote filesystem.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum PaneLabel {
+    Local,
+    Remote,
 }
 
 pub struct PendingDelete {
@@ -162,6 +171,15 @@ pub async fn run(
     let mut left_pane = PaneState::new(left_cwd.clone());
     let mut right_pane = PaneState::new(right_cwd.clone());
 
+    let left_label = match left {
+        Backend::Local(_) => PaneLabel::Local,
+        Backend::Sftp(_) => PaneLabel::Remote,
+    };
+    let right_label = match right {
+        Backend::Local(_) => PaneLabel::Local,
+        Backend::Sftp(_) => PaneLabel::Remote,
+    };
+
     let mut state = BrowserState {
         active_pane: Side::Left,
         show_hidden,
@@ -173,6 +191,8 @@ pub async fn run(
         bookmark_name: bookmark_name.to_string(),
         env: env.to_string(),
         pending_delete: None,
+        left_label,
+        right_label,
     };
 
     // Initial load
@@ -632,14 +652,14 @@ fn draw(
         left_pane,
         pane_chunks[0],
         state.active_pane == Side::Left,
-        "Local",
+        state.left_label,
     );
     draw_pane(
         frame,
         right_pane,
         pane_chunks[1],
         state.active_pane == Side::Right,
-        "Remote",
+        state.right_label,
     );
 
     // Filter bar
@@ -671,23 +691,43 @@ fn draw(
 }
 
 /// Draw a single pane.
-fn draw_pane(frame: &mut Frame, pane: &mut PaneState, area: Rect, is_active: bool, label: &str) {
+fn draw_pane(
+    frame: &mut Frame,
+    pane: &mut PaneState,
+    area: Rect,
+    is_active: bool,
+    label: PaneLabel,
+) {
     let border_style = if is_active {
         Style::default().fg(Color::Cyan)
     } else {
         Style::default().fg(Color::DarkGray)
     };
 
-    // Truncate cwd to fit in the title
-    let max_title_len = area.width as usize - 4;
+    let (badge_text, badge_style) = match label {
+        PaneLabel::Local => (" LOCAL ", Style::default().fg(Color::White).bg(Color::Blue)),
+        PaneLabel::Remote => (
+            " REMOTE ",
+            Style::default().fg(Color::White).bg(Color::Magenta),
+        ),
+    };
+
+    // Reserve space for badge + padding in the title
+    let badge_len = badge_text.len() + 2; // " LOCAL " + " "
+    let max_title_len = (area.width as usize).saturating_sub(badge_len + 4);
     let cwd_display = if pane.cwd.len() > max_title_len {
         format!("...{}", &pane.cwd[pane.cwd.len() - max_title_len + 3..])
     } else {
         pane.cwd.clone()
     };
 
+    let title = Line::from(vec![
+        Span::styled(badge_text, badge_style),
+        Span::raw(format!(" {} ", cwd_display)),
+    ]);
+
     let block = Block::default()
-        .title(format!(" {}: {} ", label, cwd_display))
+        .title(title)
         .borders(Borders::ALL)
         .border_style(border_style);
 

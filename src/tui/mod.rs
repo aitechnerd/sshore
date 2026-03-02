@@ -166,11 +166,21 @@ impl App {
 /// Enter the alternate screen and set up the terminal for TUI rendering.
 fn enter_tui() -> Result<Terminal<CrosstermBackend<std::io::Stdout>>> {
     terminal::enable_raw_mode().context("Failed to enable raw mode")?;
+    drain_events();
     let mut stdout = std::io::stdout();
     execute!(stdout, EnterAlternateScreen).context("Failed to enter alternate screen")?;
 
     let backend = CrosstermBackend::new(stdout);
     Terminal::new(backend).context("Failed to create terminal")
+}
+
+/// Drain any stale events from crossterm's input queue.
+/// Called after re-entering raw mode (e.g. returning from SSH) to prevent
+/// leftover key-release or resize events from swallowing the first real keypress.
+fn drain_events() {
+    while event::poll(Duration::ZERO).unwrap_or(false) {
+        let _ = event::read();
+    }
 }
 
 /// Leave the alternate screen and restore the terminal for normal I/O.

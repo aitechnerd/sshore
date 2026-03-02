@@ -54,6 +54,40 @@ impl SftpBackend {
         })
     }
 
+    /// Create from an existing SSH session handle (reuses the connection).
+    /// Opens a new SSH channel for SFTP on the already-authenticated session.
+    pub async fn from_handle(
+        session: &russh::client::Handle<crate::ssh::client::SshoreHandler>,
+        display_name: &str,
+    ) -> Result<Self> {
+        let channel = session
+            .channel_open_session()
+            .await
+            .context("Failed to open SSH channel for SFTP")?;
+
+        channel
+            .request_subsystem(true, "sftp")
+            .await
+            .context("Failed to request SFTP subsystem")?;
+
+        let sftp = SftpSession::new(channel.into_stream())
+            .await
+            .context("Failed to initialize SFTP session")?;
+
+        let cwd = sftp
+            .canonicalize(".")
+            .await
+            .unwrap_or_else(|_| "/".to_string());
+
+        let display_name = format!("{display_name} (SFTP)");
+
+        Ok(Self {
+            sftp,
+            cwd,
+            display_name,
+        })
+    }
+
     /// Create from a bookmark reference with a specific starting path.
     pub async fn with_path(
         config: &AppConfig,

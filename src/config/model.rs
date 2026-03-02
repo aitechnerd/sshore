@@ -87,6 +87,11 @@ pub struct Settings {
     #[serde(default = "default_bookmark_trigger")]
     pub bookmark_trigger: String,
 
+    /// Escape sequence to trigger in-session SFTP file browser during SSH.
+    /// Default: "~f" (tilde-f). Set to "" to disable.
+    #[serde(default = "default_browser_trigger")]
+    pub browser_trigger: String,
+
     /// Host key checking mode: "strict" (default), "accept-new", "off".
     /// - "strict": reject changed keys, prompt for unknown
     /// - "accept-new": auto-accept unknown keys, reject changed keys
@@ -187,6 +192,7 @@ impl Default for Settings {
             env_colors: default_env_colors(),
             snippet_trigger: default_snippet_trigger(),
             bookmark_trigger: default_bookmark_trigger(),
+            browser_trigger: default_browser_trigger(),
             on_connect_delay_ms: default_on_connect_delay_ms(),
             snippets: Vec::new(),
             host_key_checking: default_host_key_checking(),
@@ -321,6 +327,10 @@ fn default_snippet_trigger() -> String {
 
 fn default_bookmark_trigger() -> String {
     "~b".to_string()
+}
+
+fn default_browser_trigger() -> String {
+    "~f".to_string()
 }
 
 fn default_on_connect_delay_ms() -> u64 {

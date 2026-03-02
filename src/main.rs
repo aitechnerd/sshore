@@ -58,6 +58,34 @@ fn format_bookmark_row(b: &Bookmark, settings: &config::model::Settings) -> Stri
     )
 }
 
+/// Initialize debug logging to a file in the sshore config directory.
+/// Log file: `~/.config/sshore/debug.log` (or XDG equivalent).
+/// Prints the log file path to stderr so the user knows where to look.
+fn init_debug_logging() -> Result<()> {
+    use tracing_subscriber::EnvFilter;
+
+    let config_dir = config::config_dir();
+    std::fs::create_dir_all(&config_dir)
+        .with_context(|| format!("Failed to create config dir: {}", config_dir.display()))?;
+
+    let log_path = config_dir.join("debug.log");
+    let log_file = std::fs::File::create(&log_path)
+        .with_context(|| format!("Failed to create log file: {}", log_path.display()))?;
+
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("sshore=debug")),
+        )
+        .with_target(false)
+        .with_ansi(false)
+        .with_writer(log_file)
+        .init();
+
+    eprintln!("Debug log: {}", log_path.display());
+    tracing::debug!("debug logging enabled");
+    Ok(())
+}
+
 /// Install a panic hook that restores terminal state before printing the panic.
 /// This catches panics in any thread, preventing raw mode from persisting.
 fn setup_panic_hook() {
@@ -84,6 +112,14 @@ fn setup_panic_hook() {
 async fn main() -> Result<()> {
     setup_panic_hook();
     let cli = Cli::parse();
+
+    // Initialize debug logging if --debug is passed.
+    // Writes to a log file in the config directory so it doesn't interfere
+    // with TUI rendering or SSH I/O on stderr.
+    if cli.debug {
+        init_debug_logging()?;
+    }
+
     let cfg_override = cli.config.as_deref();
 
     // Warn if a subcommand name collides with a bookmark name

@@ -21,11 +21,19 @@ use crate::config::writer::atomic_write;
 
 /// Return the XDG-compliant config file path.
 ///
+/// Return the sshore config directory.
+/// - Linux/macOS: ~/.config/sshore/
+/// - Windows: %APPDATA%\sshore\
+pub fn config_dir() -> PathBuf {
+    let base = dirs::config_dir().unwrap_or_else(|| PathBuf::from(".config"));
+    base.join("sshore")
+}
+
+/// Return the default config file path.
 /// - Linux/macOS: ~/.config/sshore/config.toml
 /// - Windows: %APPDATA%\sshore\config.toml
 pub fn config_path() -> PathBuf {
-    let config_dir = dirs::config_dir().unwrap_or_else(|| PathBuf::from(".config"));
-    config_dir.join("sshore").join("config.toml")
+    config_dir().join("config.toml")
 }
 
 /// Load config with an optional custom path override.

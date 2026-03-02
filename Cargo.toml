@@ -53,6 +53,10 @@ quick-xml = "0.37"
 csv = "1"
 percent-encoding = "2"
 
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
 # Other
 regex = "1"
 chrono = { version = "0.4", features = ["serde"] }

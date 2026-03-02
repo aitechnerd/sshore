@@ -19,6 +19,7 @@ use ratatui::widgets::{Block, Borders};
 use crate::config;
 use crate::config::model::AppConfig;
 use crate::config::ssh_import::merge_imports;
+use crate::keychain;
 use crate::ssh;
 use crate::tui::theme::{ThemeColors, resolve_theme};
 use crate::tui::views::confirm::ConfirmState;
@@ -205,6 +206,8 @@ fn leave_tui(terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>) -> Resu
 /// Terminal cleanup on panic is handled by `setup_panic_hook()` in main.rs,
 /// which covers raw mode, alternate screen, cursor, colors, and SSH theming.
 pub async fn run(config: &mut AppConfig, cfg_override: Option<&str>) -> Result<()> {
+    tracing::debug!(bookmarks = config.bookmarks.len(), "starting TUI");
+
     // First-run import wizard: show when no bookmarks and not previously dismissed
     if config.bookmarks.is_empty() && !config.settings.import_wizard_dismissed {
         match import_wizard::run_wizard(config, false, None, &[], true)? {
@@ -236,8 +239,17 @@ pub async fn run(config: &mut AppConfig, cfg_override: Option<&str>) -> Result<(
         leave_tui(&mut terminal)?;
 
         match action {
-            LoopAction::Quit => break,
+            LoopAction::Quit => {
+                tracing::debug!("user quit TUI");
+                break;
+            }
             LoopAction::Connect(bookmark_index) => {
+                let name = &app.config.bookmarks[bookmark_index].name;
+                tracing::debug!(
+                    bookmark = name,
+                    index = bookmark_index,
+                    "connecting from TUI"
+                );
                 if let Err(e) = ssh::connect(
                     &mut app.config,
                     bookmark_index,
@@ -245,17 +257,23 @@ pub async fn run(config: &mut AppConfig, cfg_override: Option<&str>) -> Result<(
                 )
                 .await
                 {
+                    tracing::debug!(error = %e, "SSH session ended with error");
                     eprintln!("SSH error: {e:#}");
                     eprintln!("Press Enter to return to sshore...");
                     let _ = wait_for_enter();
                 }
+                tracing::debug!("returned to TUI after SSH session");
             }
             LoopAction::Browse(bookmark_index) => {
+                let name = &app.config.bookmarks[bookmark_index].name;
+                tracing::debug!(bookmark = name, index = bookmark_index, "browsing from TUI");
                 if let Err(e) = launch_browse(&app.config, bookmark_index).await {
+                    tracing::debug!(error = %e, "browse ended with error");
                     eprintln!("Browse error: {e:#}");
                     eprintln!("Press Enter to return to sshore...");
                     let _ = wait_for_enter();
                 }
+                tracing::debug!("returned to TUI after browse");
             }
         }
     }
@@ -569,6 +587,21 @@ fn try_save_form(app: &mut App) {
     match form.validate_and_build(&app.config) {
         Ok(bookmark) => {
             let name = bookmark.name.clone();
+            let password_value = form.password().to_string();
+            let password_modified = form.password_modified;
+            let has_stored = form.has_stored_password;
+
+            // Handle keychain rename: if editing and name changed, migrate password
+            let old_name = if let Screen::EditForm(idx) = app.screen {
+                let orig = &app.config.bookmarks[idx].name;
+                if orig != &name {
+                    Some(orig.clone())
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
 
             match app.screen {
                 Screen::AddForm => {
@@ -590,6 +623,27 @@ fn try_save_form(app: &mut App) {
                 app.set_status(format!("Error saving config: {e}"));
             } else {
                 app.set_status(format!("Bookmark '{name}' saved"));
+            }
+
+            // Handle keychain operations after successful config save
+            if let Some(ref old) = old_name {
+                // Rename: migrate keychain entry from old name to new name
+                if let Ok(Some(pw)) = keychain::get_password(old) {
+                    let _ = keychain::set_password(&name, &pw);
+                    let _ = keychain::delete_password(old);
+                }
+            }
+
+            if password_modified {
+                if !password_value.is_empty() {
+                    // User typed a new password — save to keychain
+                    if let Err(e) = keychain::set_password(&name, &password_value) {
+                        app.set_status(format!("Warning: failed to save password: {e}"));
+                    }
+                } else if has_stored {
+                    // User cleared the password field — remove from keychain
+                    let _ = keychain::delete_password(&name);
+                }
             }
 
             app.form_state = None;
@@ -627,6 +681,9 @@ fn handle_confirm_key(app: &mut App, key: KeyEvent) {
                 } else {
                     app.set_status(format!("Bookmark '{name}' deleted"));
                 }
+
+                // Clean up keychain entry (best-effort, ignore errors)
+                let _ = keychain::delete_password(&name);
 
                 app.confirm_state = None;
                 app.screen = Screen::List;

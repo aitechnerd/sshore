@@ -9,6 +9,10 @@ pub struct Cli {
     #[arg(long, global = true, env = "SSHORE_CONFIG")]
     pub config: Option<String>,
 
+    /// Enable debug logging to ~/.config/sshore/debug.log.
+    #[arg(long, global = true)]
+    pub debug: bool,
+
     /// Connect directly to a bookmark by name (skip TUI).
     ///
     /// Note: bookmark names that collide with subcommand names (e.g., "import")

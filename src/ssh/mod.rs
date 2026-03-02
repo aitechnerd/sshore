@@ -38,6 +38,13 @@ const DEFAULT_KEY_NAMES: &[&str] = &["id_ed25519", "id_rsa", "id_ecdsa"];
 /// Can be overridden per-settings or per-bookmark.
 const DEFAULT_CONNECT_TIMEOUT_SECS: u64 = 15;
 
+/// SSH keepalive interval for interactive/SFTP sessions (seconds).
+/// Sends a keepalive packet if no data is exchanged within this period.
+const KEEPALIVE_INTERVAL_SECS: u64 = 60;
+
+/// Maximum consecutive keepalive failures before dropping the connection.
+const KEEPALIVE_MAX: usize = 3;
+
 /// Print a one-time high-visibility production banner for interactive operations.
 pub fn print_production_banner(
     bookmark: &Bookmark,
@@ -244,9 +251,11 @@ pub async fn establish_session(
     let port = bookmark.port;
 
     eprintln!("Connecting to {user}@{host}:{port}...");
+    tracing::debug!(host, port, user, "establishing SSH session");
 
     // Load SSH keys
     let keys = load_keys(bookmark)?;
+    tracing::debug!(key_count = keys.len(), "loaded SSH keys");
 
     // Build handler with host key checking
     let check_mode = HostKeyCheckMode::from_str_setting(&settings.host_key_checking);
@@ -255,11 +264,23 @@ pub async fn establish_session(
     // Configurable connection timeout
     let timeout_secs = effective_timeout(bookmark, settings);
 
-    // Connect to SSH server with timeout
+    // Connect to SSH server with timeout.
+    // No inactivity_timeout — interactive sessions must never be killed due to
+    // idle time (e.g. waiting at a `su -` password prompt). Keepalives detect
+    // dead connections without cutting live ones.
     let ssh_config = russh::client::Config {
-        inactivity_timeout: Some(std::time::Duration::from_secs(timeout_secs)),
+        inactivity_timeout: None,
+        keepalive_interval: Some(std::time::Duration::from_secs(KEEPALIVE_INTERVAL_SECS)),
+        keepalive_max: KEEPALIVE_MAX,
         ..<_>::default()
     };
+
+    tracing::debug!(
+        timeout_secs,
+        keepalive_interval = KEEPALIVE_INTERVAL_SECS,
+        keepalive_max = KEEPALIVE_MAX,
+        "connecting with timeout"
+    );
 
     let connect_future =
         russh::client::connect(Arc::new(ssh_config), (host.as_str(), port), handler);
@@ -268,8 +289,12 @@ pub async fn establish_session(
         match tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), connect_future)
             .await
         {
-            Ok(result) => result.with_context(|| format!("Failed to connect to {host}:{port}"))?,
+            Ok(result) => {
+                tracing::debug!("TCP connection established");
+                result.with_context(|| format!("Failed to connect to {host}:{port}"))?
+            }
             Err(_) => {
+                tracing::debug!("connection timed out");
                 bail!(
                     "Connection to {host}:{port} timed out after {timeout_secs}s. \
                  Adjust timeout with connect_timeout_secs in config.toml."
@@ -278,11 +303,17 @@ pub async fn establish_session(
         };
 
     // Authenticate
-    let authenticated = authenticate(&mut session, &user, &keys).await?;
+    let ctx = AuthContext {
+        bookmark_name: Some(&bookmark.name),
+        env: Some(&bookmark.env),
+    };
+    let authenticated = authenticate(&mut session, &user, &keys, &ctx).await?;
     if !authenticated {
+        tracing::debug!("authentication failed");
         bail!("Authentication failed for {user}@{host}:{port}");
     }
 
+    tracing::debug!("session established and authenticated");
     Ok(session)
 }
 
@@ -333,7 +364,11 @@ pub async fn establish_tunnel_session(
             }
         };
 
-    let authenticated = authenticate(&mut session, &user, &keys).await?;
+    let ctx = AuthContext {
+        bookmark_name: Some(&bookmark.name),
+        env: Some(&bookmark.env),
+    };
+    let authenticated = authenticate(&mut session, &user, &keys, &ctx).await?;
     if !authenticated {
         bail!("Authentication failed for {user}@{host}:{port}");
     }
@@ -359,6 +394,7 @@ pub async fn connect(
     );
 
     // Open session channel
+    tracing::debug!("opening session channel");
     let channel = session
         .channel_open_session()
         .await
@@ -366,12 +402,14 @@ pub async fn connect(
 
     // Request PTY with current terminal size
     let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
+    tracing::debug!(cols, rows, term = "xterm-256color", "requesting PTY");
     channel
         .request_pty(true, "xterm-256color", cols as u32, rows as u32, 0, 0, &[])
         .await
         .context("Failed to request PTY")?;
 
     // Request shell
+    tracing::debug!("requesting shell");
     channel
         .request_shell(true)
         .await
@@ -671,27 +709,110 @@ fn load_key_from_path(path: &str) -> Result<PrivateKeyWithHashAlg> {
     Ok(PrivateKeyWithHashAlg::new(Arc::new(key), None))
 }
 
-/// Try to authenticate using available keys, then fall back to password prompt.
+/// Context passed to `authenticate()` for keychain-aware auth.
+struct AuthContext<'a> {
+    bookmark_name: Option<&'a str>,
+    env: Option<&'a str>,
+}
+
+/// Try to authenticate using available keys, then keychain password, then user prompt.
 async fn authenticate(
     session: &mut russh::client::Handle<SshoreHandler>,
     user: &str,
     keys: &[PrivateKeyWithHashAlg],
+    ctx: &AuthContext<'_>,
 ) -> Result<bool> {
-    // Try public key auth with each available key
-    for key in keys {
+    // 1. Try public key auth with each available key
+    for (i, key) in keys.iter().enumerate() {
+        tracing::debug!(key_index = i, "trying public key auth");
         match session.authenticate_publickey(user, key.clone()).await {
-            Ok(AuthResult::Success) => return Ok(true),
-            Ok(AuthResult::Failure { .. }) => continue,
-            Err(_) => continue,
+            Ok(AuthResult::Success) => {
+                tracing::debug!(key_index = i, "public key auth succeeded");
+                return Ok(true);
+            }
+            Ok(AuthResult::Failure { .. }) => {
+                tracing::debug!(key_index = i, "public key rejected");
+                continue;
+            }
+            Err(e) => {
+                tracing::debug!(key_index = i, error = %e, "public key auth error");
+                continue;
+            }
         }
     }
 
-    // Fall back to password auth — prompt user
+    // 2. Try keychain password (if bookmark name is available)
+    if let Some(name) = ctx.bookmark_name
+        && let Ok(Some(stored)) = keychain::get_password(name)
+    {
+        tracing::debug!("trying keychain password");
+        match session.authenticate_password(user, &stored).await {
+            Ok(AuthResult::Success) => {
+                tracing::debug!("keychain password accepted");
+                return Ok(true);
+            }
+            Ok(AuthResult::Failure { .. }) => {
+                tracing::debug!("keychain password rejected");
+                eprintln!("Stored password rejected for '{name}', prompting...");
+            }
+            Err(e) => {
+                tracing::debug!(error = %e, "keychain auth error");
+                eprintln!("Warning: keychain auth error: {e}");
+            }
+        }
+    }
+
+    // 3. Prompt user for password
+    tracing::debug!("prompting for password");
     let password = prompt_password(user)?;
     match session.authenticate_password(user, password.as_str()).await {
-        Ok(AuthResult::Success) => Ok(true),
-        Ok(AuthResult::Failure { .. }) => Ok(false),
+        Ok(AuthResult::Success) => {
+            tracing::debug!("password auth succeeded");
+            // Offer to save the password to keychain
+            offer_save_password(ctx, &password);
+            Ok(true)
+        }
+        Ok(AuthResult::Failure { .. }) => {
+            tracing::debug!("password auth failed");
+            Ok(false)
+        }
         Err(e) => Err(e.into()),
+    }
+}
+
+/// After successful password auth, offer to save the password to the keychain.
+/// Prompts on stderr with y/N. Silent on I/O failure (e.g. daemon tunnels).
+fn offer_save_password(ctx: &AuthContext<'_>, password: &str) {
+    let Some(name) = ctx.bookmark_name else {
+        return;
+    };
+
+    // Check if there's already a stored password — no need to re-save the same thing
+    if let Ok(Some(_)) = keychain::get_password(name) {
+        return;
+    }
+
+    let env_label = ctx
+        .env
+        .filter(|e| e.eq_ignore_ascii_case("production"))
+        .map(|_| " \x1b[31m(PRODUCTION)\x1b[0m")
+        .unwrap_or("");
+
+    eprint!("Save password to keychain for '{name}'{env_label}? [y/N] ");
+    if std::io::Write::flush(&mut std::io::stderr()).is_err() {
+        return;
+    }
+
+    let mut input = String::new();
+    if std::io::stdin().read_line(&mut input).is_err() {
+        return;
+    }
+
+    if input.trim().eq_ignore_ascii_case("y") {
+        match keychain::set_password(name, password) {
+            Ok(()) => eprintln!("Password saved for '{name}'."),
+            Err(e) => eprintln!("Warning: failed to save password: {e}"),
+        }
     }
 }
 
@@ -795,6 +916,8 @@ async fn run_proxy_loop(
     bookmark_env: &str,
     cfg_override: Option<&str>,
 ) -> Result<()> {
+    tracing::debug!("entering interactive proxy loop");
+
     // Put terminal in raw mode with cleanup guard
     let was_raw = crossterm::terminal::is_raw_mode_enabled().unwrap_or(false);
     crossterm::terminal::enable_raw_mode().context("Failed to enable raw mode")?;
@@ -839,6 +962,7 @@ async fn run_proxy_loop(
             tokio::select! {
                 _ = shutdown_rx.changed() => {
                     if *shutdown_rx.borrow() {
+                        tracing::debug!("received shutdown signal");
                         break 'proxy ProxyAction::Exit;
                     }
                 }
@@ -868,9 +992,11 @@ async fn run_proxy_loop(
                             match stdout.write_all(data) {
                                 Ok(()) => { let _ = stdout.flush(); }
                                 Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => {
+                                    tracing::debug!("stdout broken pipe");
                                     break 'proxy ProxyAction::Exit;
                                 }
                                 Err(e) => {
+                                    tracing::debug!(error = %e, "stdout write error");
                                     eprintln!("stdout write error: {e}");
                                     break 'proxy ProxyAction::Exit;
                                 }
@@ -878,6 +1004,7 @@ async fn run_proxy_loop(
 
                             // Feed data to password detector
                             if !awaiting_confirm && detector.feed(data) {
+                                tracing::debug!("password prompt detected in output");
                                 awaiting_confirm = true;
                                 let mut stderr = std::io::stderr();
                                 let _ = write!(stderr, "\r\n[sshore] Password found in keychain. Press Enter to auto-fill, Esc to skip.\r\n");
@@ -888,10 +1015,23 @@ async fn run_proxy_loop(
                             std::io::stderr().write_all(&data)?;
                             std::io::stderr().flush()?;
                         }
-                        Some(ChannelMsg::ExitStatus { .. }) => break 'proxy ProxyAction::Exit,
-                        Some(ChannelMsg::Eof | ChannelMsg::Close) => break 'proxy ProxyAction::Exit,
+                        Some(ChannelMsg::ExitStatus { exit_status }) => {
+                            tracing::debug!(exit_status, "remote exited");
+                            break 'proxy ProxyAction::Exit;
+                        }
+                        Some(ChannelMsg::Eof) => {
+                            tracing::debug!("channel EOF");
+                            break 'proxy ProxyAction::Exit;
+                        }
+                        Some(ChannelMsg::Close) => {
+                            tracing::debug!("channel closed by server");
+                            break 'proxy ProxyAction::Exit;
+                        }
                         Some(_) => {}
-                        None => break 'proxy ProxyAction::Exit,
+                        None => {
+                            tracing::debug!("channel stream ended (connection lost)");
+                            break 'proxy ProxyAction::Exit;
+                        }
                     }
                 }
 

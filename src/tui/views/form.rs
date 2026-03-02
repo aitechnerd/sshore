@@ -11,11 +11,12 @@ use crate::config::env::detect_env;
 use crate::config::model::{
     AppConfig, Bookmark, Settings, validate_bookmark_name, validate_hostname,
 };
+use crate::keychain;
 use crate::tui::theme::ThemeColors;
 use crate::tui::widgets::env_badge;
 
 /// Number of editable fields in the form.
-const FIELD_COUNT: usize = 10;
+const FIELD_COUNT: usize = 11;
 
 /// Environment options for the cycle selector.
 const ENV_OPTIONS: &[&str] = &[
@@ -38,6 +39,7 @@ const FIELD_IDENTITY: usize = 6;
 const FIELD_PROXY: usize = 7;
 const FIELD_NOTES: usize = 8;
 const FIELD_ON_CONNECT: usize = 9;
+const FIELD_PASSWORD: usize = 10;
 
 /// Form state for add/edit bookmark.
 pub struct FormState {
@@ -49,6 +51,10 @@ pub struct FormState {
     pub original_name: Option<String>,
     /// Validation error to display.
     pub error: Option<String>,
+    /// Whether a password is already stored in the keychain for this bookmark.
+    pub has_stored_password: bool,
+    /// Whether the user has modified the password field (typed or deleted chars).
+    pub password_modified: bool,
 }
 
 impl FormState {
@@ -67,6 +73,8 @@ impl FormState {
             is_edit: false,
             original_name: None,
             error: None,
+            has_stored_password: false,
+            password_modified: false,
         }
     }
 
@@ -82,11 +90,17 @@ impl FormState {
         fields[FIELD_PROXY] = bookmark.proxy_jump.clone().unwrap_or_default();
         fields[FIELD_NOTES] = bookmark.notes.clone().unwrap_or_default();
         fields[FIELD_ON_CONNECT] = bookmark.on_connect.clone().unwrap_or_default();
+        // Password field starts empty — never load actual password into memory.
 
         let env_index = ENV_OPTIONS
             .iter()
             .position(|&e| e == bookmark.env)
             .unwrap_or(0);
+
+        // Check keychain for stored password (best-effort)
+        let has_stored_password = keychain::get_password(&bookmark.name)
+            .unwrap_or(None)
+            .is_some();
 
         Self {
             fields,
@@ -95,6 +109,8 @@ impl FormState {
             is_edit: true,
             original_name: Some(bookmark.name.clone()),
             error: None,
+            has_stored_password,
+            password_modified: false,
         }
     }
 
@@ -134,6 +150,10 @@ impl FormState {
         self.fields[self.focused].push(c);
         self.error = None;
 
+        if self.focused == FIELD_PASSWORD {
+            self.password_modified = true;
+        }
+
         // Auto-detect env when name or host changes
         if self.focused == FIELD_NAME || self.focused == FIELD_HOST {
             self.auto_detect_env();
@@ -147,6 +167,10 @@ impl FormState {
         }
         self.fields[self.focused].pop();
         self.error = None;
+
+        if self.focused == FIELD_PASSWORD {
+            self.password_modified = true;
+        }
 
         if self.focused == FIELD_NAME || self.focused == FIELD_HOST {
             self.auto_detect_env();
@@ -164,6 +188,11 @@ impl FormState {
     /// Get the selected environment string.
     pub fn selected_env(&self) -> &str {
         ENV_OPTIONS[self.env_index]
+    }
+
+    /// Get the password field value.
+    pub fn password(&self) -> &str {
+        &self.fields[FIELD_PASSWORD]
     }
 
     /// Validate the form and build a Bookmark. Returns Err with a user-facing message on failure.
@@ -303,6 +332,7 @@ pub fn render_form(
         "Proxy Jump",
         "Notes",
         "On-Connect",
+        "Password",
     ];
 
     for (i, &label) in field_labels.iter().enumerate() {
@@ -390,9 +420,11 @@ fn render_field(
     let label_line = Line::from(Span::styled(format!("  {label}{marker}"), label_style));
     frame.render_widget(Paragraph::new(label_line), label_area);
 
-    // Input value — special case for env field
+    // Input value — special cases for env and password fields
     if field_idx == FIELD_ENV {
         render_env_selector(frame, input_area, state, settings, is_focused, tc);
+    } else if field_idx == FIELD_PASSWORD {
+        render_password_field(frame, input_area, state, is_focused, tc);
     } else {
         let cursor = if is_focused { "_" } else { "" };
         let value = &state.fields[field_idx];
@@ -465,6 +497,50 @@ fn render_env_selector(
     frame.render_widget(Paragraph::new(line), area);
 }
 
+/// Render the password field with masking.
+/// - Has content → show `●` dots (one per char) + cursor
+/// - Empty + has_stored_password → show `●●●● (stored in keychain)` dim
+/// - Empty + not stored → show `(not set)` dim
+fn render_password_field(
+    frame: &mut Frame,
+    area: Rect,
+    state: &FormState,
+    is_focused: bool,
+    tc: &ThemeColors,
+) {
+    let prefix = if is_focused { "  > " } else { "    " };
+    let value = &state.fields[FIELD_PASSWORD];
+
+    let line = if !value.is_empty() {
+        // Show masked dots for each character
+        let dots: String = "●".repeat(value.len());
+        let cursor = if is_focused { "_" } else { "" };
+        let style = if is_focused {
+            Style::default().fg(tc.fg)
+        } else {
+            Style::default().fg(tc.fg_muted)
+        };
+        Line::from(Span::styled(format!("{prefix}{dots}{cursor}"), style))
+    } else if state.has_stored_password && !state.password_modified {
+        // Password exists in keychain but not loaded into memory
+        let style = Style::default().fg(tc.fg_dim);
+        let cursor = if is_focused { "_" } else { "" };
+        Line::from(vec![
+            Span::styled(prefix.to_string(), style),
+            Span::styled("●●●● ", style),
+            Span::styled("(stored in keychain)", style),
+            Span::styled(cursor.to_string(), style),
+        ])
+    } else {
+        // No password
+        let style = Style::default().fg(tc.fg_dim);
+        let cursor = if is_focused { "_" } else { "" };
+        Line::from(Span::styled(format!("{prefix}(not set){cursor}"), style))
+    };
+
+    frame.render_widget(Paragraph::new(line), area);
+}
+
 /// Create a centered rectangle with given percentage width and height.
 fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
     let vertical = Layout::vertical([
@@ -527,6 +603,9 @@ mod tests {
         assert_eq!(form.fields[FIELD_PORT], "22");
         assert_eq!(form.fields[FIELD_USER], "admin");
         assert_eq!(form.env_index, 0); // (none)
+        assert!(!form.has_stored_password);
+        assert!(!form.password_modified);
+        assert!(form.password().is_empty());
     }
 
     #[test]
@@ -543,6 +622,9 @@ mod tests {
         assert_eq!(form.fields[FIELD_PROXY], "bastion");
         assert_eq!(form.fields[FIELD_NOTES], "Primary web server");
         assert_eq!(form.selected_env(), "production");
+        // Password field starts empty (never loaded from keychain into memory)
+        assert!(form.password().is_empty());
+        assert!(!form.password_modified);
     }
 
     #[test]
@@ -745,6 +827,42 @@ mod tests {
         assert_eq!(non_empty_option("  "), None);
         assert_eq!(non_empty_option("hello"), Some("hello".into()));
         assert_eq!(non_empty_option("  hello  "), Some("hello".into()));
+    }
+
+    #[test]
+    fn test_password_field_masking_and_tracking() {
+        let settings = Settings::default();
+        let mut form = FormState::new_add(&settings);
+        form.focused = FIELD_PASSWORD;
+
+        // Initially not modified
+        assert!(!form.password_modified);
+
+        // Typing sets password_modified
+        form.insert_char('s');
+        form.insert_char('e');
+        form.insert_char('c');
+        assert!(form.password_modified);
+        assert_eq!(form.password(), "sec");
+
+        // Delete also keeps password_modified true
+        form.delete_char();
+        assert!(form.password_modified);
+        assert_eq!(form.password(), "se");
+    }
+
+    #[test]
+    fn test_password_field_clearing_marks_modified() {
+        let settings = Settings::default();
+        let mut form = FormState::new_add(&settings);
+        form.has_stored_password = true; // Simulate stored password
+        form.focused = FIELD_PASSWORD;
+
+        // Typing then clearing everything
+        form.insert_char('x');
+        form.delete_char();
+        assert!(form.password_modified);
+        assert!(form.password().is_empty());
     }
 
     #[test]

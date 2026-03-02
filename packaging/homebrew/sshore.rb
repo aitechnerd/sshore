@@ -1,3 +1,6 @@
+# Reference template — the release workflow generates the actual formula
+# pushed to the aitechnerd/homebrew-sshore tap with real SHA256 values.
+# See .github/workflows/release.yml (publish-homebrew job).
 class Sshore < Formula
   desc "Terminal-native SSH connection manager with environment-aware safety"
   homepage "https://github.com/aitechnerd/sshore"

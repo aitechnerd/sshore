@@ -24,7 +24,7 @@ jobs:
             archive: tar.gz
             use_cross: true
           - target: x86_64-apple-darwin
-            runner: macos-13
+            runner: macos-latest
             archive: tar.gz
             use_cross: false
           - target: aarch64-apple-darwin
@@ -61,17 +61,21 @@ jobs:
       - name: Package (Unix)
         if: matrix.archive == 'tar.gz'
         run: |
-          cd target/${{ matrix.target }}/release
-          tar czf ../../../sshore-${{ matrix.target }}.tar.gz sshore
-          cd ../../..
+          staging="sshore-${{ matrix.target }}"
+          mkdir -p "$staging"
+          cp target/${{ matrix.target }}/release/sshore "$staging/"
+          cp LICENSE README.md "$staging/"
+          tar czf "$staging.tar.gz" "$staging"
         shell: bash
 
       - name: Package (Windows)
         if: matrix.archive == 'zip'
         run: |
-          cd target/${{ matrix.target }}/release
-          7z a ../../../sshore-${{ matrix.target }}.zip sshore.exe
-          cd ../../..
+          staging="sshore-${{ matrix.target }}"
+          mkdir -p "$staging"
+          cp target/${{ matrix.target }}/release/sshore.exe "$staging/"
+          cp LICENSE README.md "$staging/"
+          7z a "$staging.zip" "$staging"
         shell: bash
 
       - name: Upload artifact
@@ -93,8 +97,118 @@ jobs:
           path: artifacts
           merge-multiple: true
 
+      - name: Generate checksums
+        run: |
+          cd artifacts
+          sha256sum sshore-*.tar.gz sshore-*.zip > checksums.sha256
+          cat checksums.sha256
+
       - name: Create release
         uses: softprops/action-gh-release@v2
         with:
           generate_release_notes: true
-          files: artifacts/*
+          files: |
+            artifacts/sshore-*.tar.gz
+            artifacts/sshore-*.zip
+            artifacts/checksums.sha256
+
+  publish-homebrew:
+    name: Update Homebrew tap
+    needs: release
+    runs-on: ubuntu-latest
+    steps:
+      - name: Get version from tag
+        id: version
+        run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Download release archives
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release download "$GITHUB_REF_NAME" \
+            --repo "$GITHUB_REPOSITORY" \
+            --pattern "sshore-*-apple-darwin.tar.gz" \
+            --pattern "sshore-*-unknown-linux-gnu.tar.gz"
+
+      - name: Compute SHA256 hashes
+        id: sha
+        run: |
+          echo "aarch64_darwin=$(sha256sum sshore-aarch64-apple-darwin.tar.gz | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+          echo "x86_64_darwin=$(sha256sum sshore-x86_64-apple-darwin.tar.gz | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+          echo "aarch64_linux=$(sha256sum sshore-aarch64-unknown-linux-gnu.tar.gz | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+          echo "x86_64_linux=$(sha256sum sshore-x86_64-unknown-linux-gnu.tar.gz | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+
+      - name: Generate formula
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          SHA_AARCH64_DARWIN: ${{ steps.sha.outputs.aarch64_darwin }}
+          SHA_X86_64_DARWIN: ${{ steps.sha.outputs.x86_64_darwin }}
+          SHA_AARCH64_LINUX: ${{ steps.sha.outputs.aarch64_linux }}
+          SHA_X86_64_LINUX: ${{ steps.sha.outputs.x86_64_linux }}
+        run: |
+          mkdir -p Formula
+          cat > Formula/sshore.rb << 'RUBY'
+          class Sshore < Formula
+            desc "Terminal-native SSH connection manager with environment-aware safety"
+            homepage "https://github.com/aitechnerd/sshore"
+            license "MIT"
+            version "VERSION_PLACEHOLDER"
+
+            on_macos do
+              on_arm do
+                url "https://github.com/aitechnerd/sshore/releases/download/vVERSION_PLACEHOLDER/sshore-aarch64-apple-darwin.tar.gz"
+                sha256 "SHA_AARCH64_DARWIN_PLACEHOLDER"
+              end
+
+              on_intel do
+                url "https://github.com/aitechnerd/sshore/releases/download/vVERSION_PLACEHOLDER/sshore-x86_64-apple-darwin.tar.gz"
+                sha256 "SHA_X86_64_DARWIN_PLACEHOLDER"
+              end
+            end
+
+            on_linux do
+              on_arm do
+                url "https://github.com/aitechnerd/sshore/releases/download/vVERSION_PLACEHOLDER/sshore-aarch64-unknown-linux-gnu.tar.gz"
+                sha256 "SHA_AARCH64_LINUX_PLACEHOLDER"
+              end
+
+              on_intel do
+                url "https://github.com/aitechnerd/sshore/releases/download/vVERSION_PLACEHOLDER/sshore-x86_64-unknown-linux-gnu.tar.gz"
+                sha256 "SHA_X86_64_LINUX_PLACEHOLDER"
+              end
+            end
+
+            def install
+              bin.install "sshore"
+
+              generate_completions_from_executable(bin/"sshore", "completions")
+            end
+
+            test do
+              assert_match "sshore #{version}", shell_output("#{bin}/sshore --version")
+            end
+          end
+          RUBY
+
+          sed -i "s/VERSION_PLACEHOLDER/$VERSION/g" Formula/sshore.rb
+          sed -i "s/SHA_AARCH64_DARWIN_PLACEHOLDER/$SHA_AARCH64_DARWIN/g" Formula/sshore.rb
+          sed -i "s/SHA_X86_64_DARWIN_PLACEHOLDER/$SHA_X86_64_DARWIN/g" Formula/sshore.rb
+          sed -i "s/SHA_AARCH64_LINUX_PLACEHOLDER/$SHA_AARCH64_LINUX/g" Formula/sshore.rb
+          sed -i "s/SHA_X86_64_LINUX_PLACEHOLDER/$SHA_X86_64_LINUX/g" Formula/sshore.rb
+
+          echo "--- Generated formula ---"
+          cat Formula/sshore.rb
+
+      - name: Push to Homebrew tap
+        env:
+          HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+        run: |
+          git clone https://x-access-token:${HOMEBREW_TAP_TOKEN}@github.com/aitechnerd/homebrew-sshore.git tap
+          mkdir -p tap/Formula
+          cp Formula/sshore.rb tap/Formula/sshore.rb
+          cd tap
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add Formula/sshore.rb
+          git commit -m "sshore ${{ steps.version.outputs.version }}"
+          git push

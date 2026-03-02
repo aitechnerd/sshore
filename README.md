@@ -9,7 +9,7 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/aitechnerd/sshore/actions"><img src="https://img.shields.io/github/actions/workflow/status/aitechnerd/sshore/ci.yml?branch=main&style=flat-square&logo=github&label=CI" alt="CI"></a>
+  <a href="https://github.com/aitechnerd/sshore/actions"><img src="https://img.shields.io/github/actions/workflow/status/aitechnerd/sshore/ci.yml?branch=master&style=flat-square&logo=github&label=CI" alt="CI"></a>
   <a href="https://github.com/aitechnerd/sshore/releases/latest"><img src="https://img.shields.io/github/v/release/aitechnerd/sshore?style=flat-square&color=%23f97316" alt="Release"></a>
   <a href="https://github.com/aitechnerd/sshore/blob/main/LICENSE"><img src="https://img.shields.io/github/license/aitechnerd/sshore?style=flat-square" alt="License: MIT"></a>
   <a href="https://crates.io/crates/sshore"><img src="https://img.shields.io/crates/v/sshore?style=flat-square&logo=rust" alt="Crates.io"></a>
@@ -82,11 +82,11 @@ brew install sshore
 # Or download the binary
 # Apple Silicon:
 curl -L https://github.com/aitechnerd/sshore/releases/latest/download/sshore-aarch64-apple-darwin.tar.gz | tar xz
-sudo mv sshore /usr/local/bin/
+sudo mv sshore-aarch64-apple-darwin/sshore /usr/local/bin/
 
 # Intel:
 curl -L https://github.com/aitechnerd/sshore/releases/latest/download/sshore-x86_64-apple-darwin.tar.gz | tar xz
-sudo mv sshore /usr/local/bin/
+sudo mv sshore-x86_64-apple-darwin/sshore /usr/local/bin/
 ```
 
 ### Linux
@@ -95,30 +95,15 @@ sudo mv sshore /usr/local/bin/
 # Debian / Ubuntu
 curl -LO https://github.com/aitechnerd/sshore/releases/latest/download/sshore-x86_64-unknown-linux-gnu.tar.gz
 tar xzf sshore-x86_64-unknown-linux-gnu.tar.gz
-sudo mv sshore /usr/local/bin/
+sudo mv sshore-x86_64-unknown-linux-gnu/sshore /usr/local/bin/
 
 # ARM64 (Raspberry Pi, AWS Graviton)
 curl -LO https://github.com/aitechnerd/sshore/releases/latest/download/sshore-aarch64-unknown-linux-gnu.tar.gz
 tar xzf sshore-aarch64-unknown-linux-gnu.tar.gz
-sudo mv sshore /usr/local/bin/
+sudo mv sshore-aarch64-unknown-linux-gnu/sshore /usr/local/bin/
 
 # Arch Linux (AUR)
 yay -S sshore-bin
-
-# Nix
-nix-env -iA nixpkgs.sshore
-```
-
-### Windows
-
-```powershell
-# Scoop
-scoop bucket add extras
-scoop install sshore
-
-# Or download from Releases
-# https://github.com/aitechnerd/sshore/releases/latest/download/sshore-x86_64-pc-windows-msvc.zip
-# Extract and add to PATH
 ```
 
 ### From Source (any platform)
@@ -420,7 +405,7 @@ sshore is under active development. Current priorities:
 - [ ] Interactive import wizard with preview and conflict resolution TUI
 - [ ] Daily testing and stability hardening
 - [ ] Demo GIF and terminal recordings
-- [ ] Homebrew tap and binary releases for all platforms
+- [x] Homebrew tap and binary releases for all platforms
 
 See the full plan in [CLAUDE.md](CLAUDE.md) and [CLAUDE.local.md](CLAUDE.local.md).
 

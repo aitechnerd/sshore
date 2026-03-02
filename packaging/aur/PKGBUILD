@@ -1,0 +1,33 @@
+# Maintainer: Sergey <email>
+pkgname=sshore-bin
+pkgver=0.1.0
+pkgrel=1
+pkgdesc="Terminal-native SSH connection manager with environment-aware safety"
+arch=('x86_64' 'aarch64')
+url="https://github.com/aitechnerd/sshore"
+license=('MIT')
+provides=('sshore')
+conflicts=('sshore')
+
+source_x86_64=("${url}/releases/download/v${pkgver}/sshore-x86_64-unknown-linux-gnu.tar.gz")
+source_aarch64=("${url}/releases/download/v${pkgver}/sshore-aarch64-unknown-linux-gnu.tar.gz")
+
+# Update with: updpkgsums
+sha256sums_x86_64=('SKIP')
+sha256sums_aarch64=('SKIP')
+
+package() {
+    cd "sshore-${CARCH}-unknown-linux-gnu" 2>/dev/null || cd .
+
+    install -Dm755 sshore "${pkgdir}/usr/bin/sshore"
+    install -Dm644 LICENSE "${pkgdir}/usr/share/licenses/${pkgname}/LICENSE"
+
+    # Generate shell completions
+    mkdir -p "${pkgdir}/usr/share/bash-completion/completions"
+    mkdir -p "${pkgdir}/usr/share/zsh/site-functions"
+    mkdir -p "${pkgdir}/usr/share/fish/vendor_completions.d"
+
+    ./sshore completions bash > "${pkgdir}/usr/share/bash-completion/completions/sshore"
+    ./sshore completions zsh > "${pkgdir}/usr/share/zsh/site-functions/_sshore"
+    ./sshore completions fish > "${pkgdir}/usr/share/fish/vendor_completions.d/sshore.fish"
+}

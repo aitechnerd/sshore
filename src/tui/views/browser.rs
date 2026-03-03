@@ -15,6 +15,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use crate::sftp::shortcuts::format_bytes;
 use crate::storage::{Backend, FileEntry};
+use crate::tui::theme::ThemeColors;
 
 /// Poll timeout when idle (no timed state changes pending).
 /// User input is detected instantly regardless of this value.
@@ -215,6 +216,7 @@ pub struct BrowserState {
     pub right_label: PaneLabel,
     /// Background file transfers (processed by polling in the main event loop).
     background_transfers: Vec<BackgroundTransfer>,
+    pub theme: ThemeColors,
 }
 
 /// Whether a pane shows a local or remote filesystem.
@@ -231,6 +233,7 @@ pub async fn run(
     bookmark_name: &str,
     env: &str,
     show_hidden: bool,
+    theme: &ThemeColors,
 ) -> Result<()> {
     tracing::debug!("browser starting for bookmark={bookmark_name} env={env}");
 
@@ -274,6 +277,7 @@ pub async fn run(
         left_label,
         right_label,
         background_transfers: Vec::new(),
+        theme: theme.clone(),
     };
 
     // Initial load
@@ -1030,7 +1034,7 @@ fn draw(
     }
 
     // F-key bar (always visible)
-    draw_fkey_bar(frame, main_chunks[5]);
+    draw_fkey_bar(frame, main_chunks[5], &state.theme);
 }
 
 /// Draw a single pane.
@@ -1513,42 +1517,31 @@ async fn handle_input_mode(
 }
 
 /// Draw the MC-style F-key bar at the bottom.
-fn draw_fkey_bar(frame: &mut Frame, area: Rect) {
-    let keys: &[(u8, &str)] = &[
-        (1, "Help"),
-        (2, ""),
-        (3, "View"),
-        (4, ""),
-        (5, "Copy"),
-        (6, "RenMov"),
-        (7, "Mkdir"),
-        (8, "Del"),
-        (9, ""),
-        (10, "Quit"),
-    ];
+/// Build a key badge + label span pair, matching the bookmark list status bar style.
+fn hint_pair<'a>(key: &str, action: &str, theme: &ThemeColors) -> Vec<Span<'a>> {
+    vec![
+        Span::styled(
+            format!(" {key} "),
+            Style::default()
+                .fg(theme.hint_key_fg)
+                .bg(theme.hint_key_bg)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(format!(" {action}  "), Style::default().fg(theme.fg_dim)),
+    ]
+}
 
-    let num_style = Style::default().fg(Color::Black).bg(Color::Cyan);
-    let label_style = Style::default().fg(Color::White).bg(Color::DarkGray);
-
+fn draw_fkey_bar(frame: &mut Frame, area: Rect, theme: &ThemeColors) {
     let mut spans = Vec::new();
-    for (num, label) in keys {
-        spans.push(Span::styled(format!("{num}"), num_style));
-        // Pad label to fill slot width evenly
-        let text = if label.is_empty() {
-            "     ".to_string()
-        } else {
-            format!("{:<5}", label)
-        };
-        spans.push(Span::styled(text, label_style));
-    }
-
-    // Fill remaining width with the bar background
-    let used: usize = keys.len() * 6; // 1 digit + 5 label chars per slot
-    let remaining = (area.width as usize).saturating_sub(used);
-    if remaining > 0 {
-        spans.push(Span::styled(" ".repeat(remaining), label_style));
-    }
-
+    spans.extend(hint_pair("F3", "View", theme));
+    spans.extend(hint_pair("F5", "Copy", theme));
+    spans.extend(hint_pair("F6", "RenMov", theme));
+    spans.extend(hint_pair("F7", "Mkdir", theme));
+    spans.extend(hint_pair("F8", "Del", theme));
+    spans.extend(hint_pair("v", "Mark", theme));
+    spans.extend(hint_pair("/", "Filter", theme));
+    spans.extend(hint_pair("Tab", "Switch", theme));
+    spans.extend(hint_pair("Esc", "Quit", theme));
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 

@@ -445,6 +445,7 @@ pub async fn connect(
     let bookmark_trigger = config.settings.bookmark_trigger.clone();
     let browser_trigger = config.settings.browser_trigger.clone();
     let bookmark_env = bookmark.env.clone();
+    let theme_name = config.settings.theme.clone();
 
     // Print available escape triggers as a dim hint
     print_escape_hints(
@@ -477,6 +478,7 @@ pub async fn connect(
         session_info,
         &session,
         &bookmark_env,
+        &theme_name,
         cfg_override,
     )
     .await?;
@@ -914,6 +916,7 @@ async fn run_proxy_loop(
     session_info: SessionInfo,
     session: &russh::client::Handle<SshoreHandler>,
     bookmark_env: &str,
+    theme_name: &str,
     cfg_override: Option<&str>,
 ) -> Result<()> {
     tracing::debug!("entering interactive proxy loop");
@@ -1266,7 +1269,7 @@ async fn run_proxy_loop(
             ProxyAction::Exit => break,
             ProxyAction::Browser => {
                 // Launch in-session SFTP file browser
-                match launch_browser(session, &browser_name, bookmark_env).await {
+                match launch_browser(session, &browser_name, bookmark_env, theme_name).await {
                     Ok(()) => {}
                     Err(e) => {
                         tracing::error!("browser launch failed: {e:#}");
@@ -1301,10 +1304,13 @@ async fn launch_browser(
     session: &russh::client::Handle<SshoreHandler>,
     name: &str,
     env: &str,
+    theme_name: &str,
 ) -> Result<()> {
     use crate::storage::{Backend, local_backend::LocalBackend, sftp_backend::SftpBackend};
+    use crate::tui::theme::resolve_theme;
     use crate::tui::views::browser;
 
+    let theme = resolve_theme(theme_name);
     let remote_cwd = detect_remote_cwd(session).await;
 
     let mut sftp_backend = SftpBackend::from_handle(session, name).await?;
@@ -1319,7 +1325,7 @@ async fn launch_browser(
     let mut left = Backend::Sftp(sftp_backend);
     let mut right = Backend::Local(local_backend);
 
-    browser::run(&mut left, &mut right, name, env, false).await?;
+    browser::run(&mut left, &mut right, name, env, false, &theme).await?;
 
     Ok(())
 }

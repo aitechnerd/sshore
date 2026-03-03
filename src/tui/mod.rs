@@ -303,13 +303,23 @@ async fn launch_browse(config: &AppConfig, bookmark_index: usize) -> Result<()> 
     ssh::print_production_banner(bookmark, &config.settings, "SFTP browser");
     ssh::terminal_theme::apply_theme(bookmark, &config.settings);
 
+    let theme = resolve_theme(&config.settings.theme);
+
     let remote_sftp = storage::sftp_backend::SftpBackend::new(config, bookmark_index).await?;
     let local_fs = storage::local_backend::LocalBackend::new(".")?;
 
     let mut left = storage::Backend::Sftp(remote_sftp);
     let mut right = storage::Backend::Local(local_fs);
 
-    views::browser::run(&mut left, &mut right, &bookmark.name, &bookmark.env, false).await?;
+    views::browser::run(
+        &mut left,
+        &mut right,
+        &bookmark.name,
+        &bookmark.env,
+        false,
+        &theme,
+    )
+    .await?;
 
     ssh::terminal_theme::reset_theme();
     Ok(())

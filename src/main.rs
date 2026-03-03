@@ -595,6 +595,8 @@ async fn cmd_browse(
         .context("Failed to open local directory")?;
     let mut local_backend = storage::Backend::Local(local_fs);
 
+    let theme = tui::theme::resolve_theme(&config.settings.theme);
+
     // Launch browser TUI
     tui::views::browser::run(
         &mut local_backend,
@@ -602,6 +604,7 @@ async fn cmd_browse(
         &bookmark.name,
         &bookmark.env,
         show_hidden,
+        &theme,
     )
     .await?;
 

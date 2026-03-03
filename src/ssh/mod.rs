@@ -2,6 +2,7 @@ pub mod client;
 pub mod known_hosts;
 pub mod password;
 pub mod snippet;
+pub mod stdin_reader;
 pub mod terminal_theme;
 pub mod tunnel;
 
@@ -14,7 +15,6 @@ use chrono::Utc;
 use russh::ChannelMsg;
 use russh::client::AuthResult;
 use russh::keys::PrivateKeyWithHashAlg;
-use tokio::io::AsyncReadExt;
 use zeroize::Zeroizing;
 
 use crate::config;
@@ -847,12 +847,6 @@ fn prompt_password(user: &str) -> Result<Zeroizing<String>> {
     Ok(password)
 }
 
-/// Capacity for the stdin mpsc channel.
-const STDIN_CHANNEL_SIZE: usize = 64;
-
-/// Grace period for spawned tasks to finish before aborting.
-const TASK_SHUTDOWN_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(100);
-
 /// Grace period after sending a captured sudo password before auto-saving.
 /// If another password prompt appears within this window, auth failed and
 /// the password is discarded. If the window elapses without a new prompt,
@@ -967,8 +961,8 @@ async fn run_proxy_loop(
 
     loop {
         // Spawn stdin reader for this iteration
-        let (stdin_tx, mut stdin_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(STDIN_CHANNEL_SIZE);
-        let mut stdin_handle = tokio::spawn(read_stdin(stdin_tx));
+        let (stdin_tx, mut stdin_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
+        let mut stdin_reader = stdin_reader::StdinReader::spawn(stdin_tx);
 
         let action = 'proxy: loop {
             tokio::select! {
@@ -1254,10 +1248,9 @@ async fn run_proxy_loop(
             }
         };
 
-        // Clean up stdin reader for this iteration
+        // Clean up stdin reader for this iteration — guaranteed thread exit
         drop(stdin_rx);
-        let _ = tokio::time::timeout(TASK_SHUTDOWN_TIMEOUT, &mut stdin_handle).await;
-        stdin_handle.abort();
+        stdin_reader.stop();
 
         // Save pending password if grace period has elapsed (session ending or switching to browser)
         if let Some((pw, ts)) = pending_save_pw.take()
@@ -1276,6 +1269,7 @@ async fn run_proxy_loop(
                 match launch_browser(session, &browser_name, bookmark_env).await {
                     Ok(()) => {}
                     Err(e) => {
+                        tracing::error!("browser launch failed: {e:#}");
                         let _ =
                             write!(stdout, "\r\n\x1b[31m[sshore] Browser error: {e}\x1b[0m\r\n");
                         let _ = stdout.flush();
@@ -1350,24 +1344,6 @@ async fn detect_remote_cwd(session: &russh::client::Handle<SshoreHandler>) -> Op
 
     let path = String::from_utf8_lossy(&output).trim().to_string();
     if path.is_empty() { None } else { Some(path) }
-}
-
-/// Read raw bytes from stdin and send to an mpsc channel.
-/// Runs as a spawned task so the main loop can process stdin through `tokio::select!`.
-async fn read_stdin(tx: tokio::sync::mpsc::Sender<Vec<u8>>) {
-    let mut stdin = tokio::io::stdin();
-    let mut buf = [0u8; 1024];
-    loop {
-        match stdin.read(&mut buf).await {
-            Ok(0) => break,
-            Ok(n) => {
-                if tx.send(buf[..n].to_vec()).await.is_err() {
-                    break;
-                }
-            }
-            Err(_) => break,
-        }
-    }
 }
 
 #[cfg(test)]

@@ -71,6 +71,8 @@ fn init_debug_logging() -> Result<()> {
     let log_path = config_dir.join("debug.log");
     let log_file = std::fs::File::create(&log_path)
         .with_context(|| format!("Failed to create log file: {}", log_path.display()))?;
+    // LineWriter flushes after every newline so log entries survive crashes
+    let log_writer = std::io::LineWriter::new(log_file);
 
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -78,7 +80,7 @@ fn init_debug_logging() -> Result<()> {
         )
         .with_target(false)
         .with_ansi(false)
-        .with_writer(log_file)
+        .with_writer(std::sync::Mutex::new(log_writer))
         .init();
 
     eprintln!("Debug log: {}", log_path.display());
@@ -199,7 +201,9 @@ async fn main() -> Result<()> {
         }
     }
 
-    Ok(())
+    // Safety net: terminate process to kill any lingering OS threads that
+    // might have survived normal cleanup (e.g. blocked stdin reads).
+    std::process::exit(0);
 }
 
 /// Check if the invoked subcommand name collides with an existing bookmark name.

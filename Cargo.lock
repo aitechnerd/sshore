@@ -3221,6 +3221,7 @@ dependencies = [
  "glob",
  "hmac",
  "keyring",
+ "libc",
  "percent-encoding",
  "predicates",
  "quick-xml",

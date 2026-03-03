@@ -165,6 +165,8 @@ pub async fn run(
     env: &str,
     show_hidden: bool,
 ) -> Result<()> {
+    tracing::debug!("browser starting for bookmark={bookmark_name} env={env}");
+
     // Enter TUI mode — BrowserGuard ensures cleanup on any exit path
     crossterm::terminal::enable_raw_mode()?;
     let _guard = BrowserGuard;
@@ -261,6 +263,7 @@ pub async fn run(
     }
 
     // BrowserGuard handles terminal cleanup on drop
+    tracing::debug!("browser exiting normally");
     Ok(())
 }
 
@@ -412,9 +415,15 @@ async fn handle_key(
                     match src_backend.download(src_path, &temp_file).await {
                         Ok(()) => match dst_backend.upload(&temp_file, &dst_path).await {
                             Ok(()) => copied += 1,
-                            Err(e) => last_error = Some(format!("Upload {name}: {e}")),
+                            Err(e) => {
+                                tracing::error!("upload failed: {dst_path}: {e:#}");
+                                last_error = Some(format!("Upload {name}: {e}"));
+                            }
                         },
-                        Err(e) => last_error = Some(format!("Download {name}: {e}")),
+                        Err(e) => {
+                            tracing::error!("download failed: {src_path}: {e:#}");
+                            last_error = Some(format!("Download {name}: {e}"));
+                        }
                     }
                 }
 
@@ -489,6 +498,7 @@ async fn handle_key(
                             state.status_message = None;
                         }
                         Err(e) => {
+                            tracing::error!("view download failed: {}: {e:#}", entry.path);
                             state.status_message = Some(format!("Download error: {e}"));
                         }
                     }
@@ -638,7 +648,10 @@ async fn refresh_pane(
     state: &BrowserState,
 ) -> Result<()> {
     pane.cwd = backend.cwd().unwrap_or_default();
-    let mut entries = backend.list(&pane.cwd).await?;
+    let mut entries = backend.list(&pane.cwd).await.map_err(|e| {
+        tracing::error!("failed to list directory '{}': {e:#}", pane.cwd);
+        e
+    })?;
 
     // Filter hidden files
     if !state.show_hidden {
@@ -1068,6 +1081,7 @@ async fn handle_input_mode(
                             refresh_pane(pane, backend, state).await?;
                         }
                         Err(e) => {
+                            tracing::error!("mkdir failed: {path}: {e:#}");
                             state.status_message = Some(format!("Mkdir error: {e}"));
                         }
                     }
@@ -1093,6 +1107,7 @@ async fn handle_input_mode(
                             refresh_pane(pane, backend, state).await?;
                         }
                         Err(e) => {
+                            tracing::error!("rename failed: {} → {new_path}: {e:#}", source.path);
                             state.status_message = Some(format!("Rename error: {e}"));
                         }
                     }

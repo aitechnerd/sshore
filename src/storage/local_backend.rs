@@ -1,9 +1,14 @@
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use super::FileEntry;
+
+/// Buffer size for local file transfers with progress tracking (256 KB).
+const LOCAL_CHUNK_SIZE: usize = 256 * 1024;
 
 /// Local filesystem implementation of StorageBackend.
 pub struct LocalBackend {
@@ -88,22 +93,92 @@ impl LocalBackend {
     }
 
     pub async fn download(&self, remote_path: &str, local_path: &Path) -> Result<()> {
-        // For local backend, download is just a copy
-        tokio::fs::copy(remote_path, local_path)
+        self.download_with_progress(remote_path, local_path, None, None)
             .await
-            .with_context(|| {
-                format!("Failed to copy {} to {}", remote_path, local_path.display())
+    }
+
+    /// Download (local copy) with optional progress tracking and cancellation.
+    pub async fn download_with_progress(
+        &self,
+        src_path: &str,
+        dst_path: &Path,
+        progress: Option<&AtomicU64>,
+        cancel: Option<&AtomicBool>,
+    ) -> Result<()> {
+        // Fast path: no progress tracking needed
+        if progress.is_none() && cancel.is_none() {
+            tokio::fs::copy(src_path, dst_path).await.with_context(|| {
+                format!("Failed to copy {} to {}", src_path, dst_path.display())
             })?;
+            return Ok(());
+        }
+
+        let mut src = tokio::fs::File::open(src_path)
+            .await
+            .with_context(|| format!("Failed to open: {src_path}"))?;
+        let mut dst = tokio::fs::File::create(dst_path)
+            .await
+            .with_context(|| format!("Failed to create: {}", dst_path.display()))?;
+
+        let mut buf = vec![0u8; LOCAL_CHUNK_SIZE];
+        loop {
+            if cancel.is_some_and(|c| c.load(Ordering::Relaxed)) {
+                anyhow::bail!("Transfer cancelled");
+            }
+            let n = src.read(&mut buf).await?;
+            if n == 0 {
+                break;
+            }
+            dst.write_all(&buf[..n]).await?;
+            if let Some(p) = progress {
+                p.fetch_add(n as u64, Ordering::Relaxed);
+            }
+        }
         Ok(())
     }
 
     pub async fn upload(&self, local_path: &Path, remote_path: &str) -> Result<()> {
-        // For local backend, upload is just a copy
-        tokio::fs::copy(local_path, remote_path)
+        self.upload_with_progress(local_path, remote_path, None, None)
             .await
-            .with_context(|| {
-                format!("Failed to copy {} to {}", local_path.display(), remote_path)
+    }
+
+    /// Upload (local copy) with optional progress tracking and cancellation.
+    pub async fn upload_with_progress(
+        &self,
+        src_path: &Path,
+        dst_path: &str,
+        progress: Option<&AtomicU64>,
+        cancel: Option<&AtomicBool>,
+    ) -> Result<()> {
+        // Fast path: no progress tracking needed
+        if progress.is_none() && cancel.is_none() {
+            tokio::fs::copy(src_path, dst_path).await.with_context(|| {
+                format!("Failed to copy {} to {}", src_path.display(), dst_path)
             })?;
+            return Ok(());
+        }
+
+        let mut src = tokio::fs::File::open(src_path)
+            .await
+            .with_context(|| format!("Failed to open: {}", src_path.display()))?;
+        let mut dst = tokio::fs::File::create(dst_path)
+            .await
+            .with_context(|| format!("Failed to create: {dst_path}"))?;
+
+        let mut buf = vec![0u8; LOCAL_CHUNK_SIZE];
+        loop {
+            if cancel.is_some_and(|c| c.load(Ordering::Relaxed)) {
+                anyhow::bail!("Transfer cancelled");
+            }
+            let n = src.read(&mut buf).await?;
+            if n == 0 {
+                break;
+            }
+            dst.write_all(&buf[..n]).await?;
+            if let Some(p) = progress {
+                p.fetch_add(n as u64, Ordering::Relaxed);
+            }
+        }
         Ok(())
     }
 

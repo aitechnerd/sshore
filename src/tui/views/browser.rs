@@ -1,13 +1,17 @@
 use std::collections::HashSet;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph};
+use russh_sftp::client::SftpSession;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use crate::sftp::shortcuts::format_bytes;
 use crate::storage::{Backend, FileEntry};
@@ -15,6 +19,12 @@ use crate::storage::{Backend, FileEntry};
 /// Poll timeout when idle (no timed state changes pending).
 /// User input is detected instantly regardless of this value.
 const POLL_RATE: Duration = Duration::from_secs(1);
+
+/// Faster poll rate when background transfers are active, for progress updates.
+const PROGRESS_POLL_RATE: Duration = Duration::from_millis(100);
+
+/// Buffer size for background file transfers (256 KB).
+const TRANSFER_CHUNK_SIZE: usize = 256 * 1024;
 
 /// Drop guard that restores terminal state when the browser exits (normally or on error).
 struct BrowserGuard;
@@ -127,12 +137,67 @@ pub enum InputMode {
         source: FileEntry,
     },
     ConfirmDelete {
-        entries: Vec<(String, String, bool)>,
-    }, // (path, name, is_dir)
+        entries: Vec<(String, String, bool, u64)>,
+    }, // (path, name, is_dir, size)
     SelectPattern {
         input: String,
         selecting: bool,
     },
+}
+
+/// Transfer direction for background file copies.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum TransferDirection {
+    LocalToRemote,
+    RemoteToLocal,
+}
+
+/// A single file to transfer in a background copy job.
+struct TransferTarget {
+    src_path: String,
+    dst_path: String,
+    name: String,
+    size: u64,
+}
+
+/// Shared atomic progress counters for a background transfer, read by the main event loop.
+struct TransferProgress {
+    current_file: AtomicU64,
+    total_files: AtomicU64,
+    bytes_done: AtomicU64,
+    bytes_total: AtomicU64,
+    current_name: std::sync::Mutex<String>,
+    files_done: AtomicU64,
+}
+
+impl TransferProgress {
+    fn new(total_files: u64) -> Self {
+        Self {
+            current_file: AtomicU64::new(0),
+            total_files: AtomicU64::new(total_files),
+            bytes_done: AtomicU64::new(0),
+            bytes_total: AtomicU64::new(0),
+            current_name: std::sync::Mutex::new(String::new()),
+            files_done: AtomicU64::new(0),
+        }
+    }
+}
+
+/// Result of a completed background transfer.
+struct TransferResult {
+    copied: usize,
+    total: usize,
+    last_error: Option<String>,
+}
+
+/// A background file transfer running in a separate tokio task.
+struct BackgroundTransfer {
+    handle: tokio::task::JoinHandle<TransferResult>,
+    progress: Arc<TransferProgress>,
+    cancel: Arc<AtomicBool>,
+    dest_side: Side,
+    direction: TransferDirection,
+    description: String,
 }
 
 /// Overall browser state.
@@ -148,6 +213,8 @@ pub struct BrowserState {
     pub env: String,
     pub left_label: PaneLabel,
     pub right_label: PaneLabel,
+    /// Background file transfers (processed by polling in the main event loop).
+    background_transfers: Vec<BackgroundTransfer>,
 }
 
 /// Whether a pane shows a local or remote filesystem.
@@ -206,6 +273,7 @@ pub async fn run(
         env: env.to_string(),
         left_label,
         right_label,
+        background_transfers: Vec::new(),
     };
 
     // Initial load
@@ -215,12 +283,54 @@ pub async fn run(
     let mut needs_redraw = true;
 
     loop {
+        // === Poll background transfers for completion ===
+        {
+            let mut i = 0;
+            while i < state.background_transfers.len() {
+                if state.background_transfers[i].handle.is_finished() {
+                    let transfer = state.background_transfers.remove(i);
+                    let result = match transfer.handle.await {
+                        Ok(r) => r,
+                        Err(_) => TransferResult {
+                            copied: 0,
+                            total: 0,
+                            last_error: Some("Transfer task panicked".into()),
+                        },
+                    };
+                    state.status_message =
+                        Some(format_transfer_result(&result, &transfer.description));
+
+                    // Refresh destination pane
+                    match transfer.dest_side {
+                        Side::Left => refresh_pane(&mut left_pane, left, &state).await?,
+                        Side::Right => refresh_pane(&mut right_pane, right, &state).await?,
+                    }
+                    needs_redraw = true;
+                } else {
+                    i += 1;
+                }
+            }
+
+            // Update progress display for active transfers
+            if !state.background_transfers.is_empty() {
+                state.status_message =
+                    Some(format_background_progress(&state.background_transfers));
+                needs_redraw = true;
+            }
+        }
+
+        // === Normal rendering and event processing ===
         if needs_redraw {
             terminal.draw(|frame| draw(frame, &mut left_pane, &mut right_pane, &state))?;
             needs_redraw = false;
         }
 
-        if event::poll(POLL_RATE)? {
+        let poll_timeout = if state.background_transfers.is_empty() {
+            POLL_RATE
+        } else {
+            PROGRESS_POLL_RATE
+        };
+        if event::poll(poll_timeout)? {
             match event::read()? {
                 Event::Key(key) => {
                     // Handle input modes (filter, mkdir, rename, confirm, pattern select)
@@ -305,13 +415,33 @@ async fn handle_key(
     right: &mut Backend,
 ) -> Result<BrowserAction> {
     match key.code {
-        KeyCode::Char('q') | KeyCode::Esc | KeyCode::F(10) => return Ok(BrowserAction::Quit),
+        KeyCode::Char('q') | KeyCode::F(10) => return Ok(BrowserAction::Quit),
+
+        KeyCode::Esc => {
+            if !state.background_transfers.is_empty() {
+                for t in &state.background_transfers {
+                    t.cancel.store(true, Ordering::Relaxed);
+                }
+                state.status_message = Some("Cancelling transfers...".to_string());
+            } else {
+                return Ok(BrowserAction::Quit);
+            }
+        }
 
         KeyCode::F(1) => {
             state.status_message = Some(
                 "F3=View F5=Copy F6=Move F7=Mkdir F8=Del F10=Quit | v=Mark *=Invert +=Select -=Deselect Tab=Switch"
                     .to_string(),
             );
+        }
+
+        KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            if !state.background_transfers.is_empty() {
+                for t in &state.background_transfers {
+                    t.cancel.store(true, Ordering::Relaxed);
+                }
+                state.status_message = Some("Cancelling transfers...".to_string());
+            }
         }
 
         KeyCode::Char('r') if key.modifiers.contains(KeyModifiers::CONTROL) => {
@@ -389,60 +519,112 @@ async fn handle_key(
         }
 
         KeyCode::Char(' ') | KeyCode::F(5) => {
-            // Batch-aware copy to other pane
+            // Spawn a background transfer (user keeps browsing while it runs).
             let pane = active_pane_mut(left_pane, right_pane, state);
             let targets = collect_batch_targets(pane);
-            if !targets.is_empty() {
-                let total = targets.len();
-                let temp_dir = tempfile::tempdir()?;
-                let mut copied = 0usize;
-                let mut last_error: Option<String> = None;
+            if targets.is_empty() {
+                // Nothing to copy
+            } else if !state.background_transfers.is_empty() {
+                state.status_message = Some("Transfer already in progress".to_string());
+            } else {
+                let source_side = state.active_pane;
+                let (src_label, dst_label) = match source_side {
+                    Side::Left => (state.left_label, state.right_label),
+                    Side::Right => (state.right_label, state.left_label),
+                };
 
-                for (i, (src_path, name, _is_dir)) in targets.iter().enumerate() {
-                    state.status_message = Some(if total == 1 {
-                        format!("Copying {name}...")
+                if src_label == dst_label {
+                    state.status_message =
+                        Some("Copy requires one local and one remote pane".to_string());
+                } else {
+                    let direction = if src_label == PaneLabel::Local {
+                        TransferDirection::LocalToRemote
                     } else {
-                        format!("Copying {}/{total}: {name}...", i + 1)
-                    });
-
-                    let temp_file = temp_dir.path().join(name);
-                    let (src_backend, dst_backend, dst_pane) = match state.active_pane {
-                        Side::Left => (left as &Backend, right as &mut Backend, &mut *right_pane),
-                        Side::Right => (right as &Backend, left as &mut Backend, &mut *left_pane),
+                        TransferDirection::RemoteToLocal
                     };
-                    let dst_path = format!("{}/{}", dst_pane.cwd.trim_end_matches('/'), name);
 
-                    match src_backend.download(src_path, &temp_file).await {
-                        Ok(()) => match dst_backend.upload(&temp_file, &dst_path).await {
-                            Ok(()) => copied += 1,
-                            Err(e) => {
-                                tracing::error!("upload failed: {dst_path}: {e:#}");
-                                last_error = Some(format!("Upload {name}: {e}"));
-                            }
-                        },
+                    // Open a new SFTP channel for the background task
+                    let remote_backend = if src_label == PaneLabel::Remote {
+                        match source_side {
+                            Side::Left => &*left,
+                            Side::Right => &*right,
+                        }
+                    } else {
+                        match source_side {
+                            Side::Left => &*right,
+                            Side::Right => &*left,
+                        }
+                    };
+
+                    match remote_backend.open_sftp_session().await {
+                        Ok(sftp) => {
+                            let dest_side = match source_side {
+                                Side::Left => Side::Right,
+                                Side::Right => Side::Left,
+                            };
+                            let dst_cwd = match dest_side {
+                                Side::Left => &left_pane.cwd,
+                                Side::Right => &right_pane.cwd,
+                            };
+
+                            let transfer_targets: Vec<TransferTarget> = targets
+                                .iter()
+                                .map(|(src, name, _, size)| TransferTarget {
+                                    src_path: src.clone(),
+                                    dst_path: format!("{}/{}", dst_cwd.trim_end_matches('/'), name),
+                                    name: name.clone(),
+                                    size: *size,
+                                })
+                                .collect();
+
+                            let description = if transfer_targets.len() == 1 {
+                                transfer_targets[0].name.clone()
+                            } else {
+                                format!("{} files", transfer_targets.len())
+                            };
+
+                            let progress =
+                                Arc::new(TransferProgress::new(transfer_targets.len() as u64));
+                            let cancel = Arc::new(AtomicBool::new(false));
+
+                            let bg_progress = Arc::clone(&progress);
+                            let bg_cancel = Arc::clone(&cancel);
+                            let handle = tokio::spawn(async move {
+                                run_background_transfer(
+                                    sftp,
+                                    transfer_targets,
+                                    bg_progress,
+                                    bg_cancel,
+                                    direction,
+                                )
+                                .await
+                            });
+
+                            state.background_transfers.push(BackgroundTransfer {
+                                handle,
+                                progress,
+                                cancel,
+                                dest_side,
+                                direction,
+                                description: description.clone(),
+                            });
+
+                            // Clear source marks immediately
+                            let src_pane = match source_side {
+                                Side::Left => &mut *left_pane,
+                                Side::Right => &mut *right_pane,
+                            };
+                            src_pane.marked.clear();
+
+                            state.status_message =
+                                Some(format!("Copying {description} in background..."));
+                        }
                         Err(e) => {
-                            tracing::error!("download failed: {src_path}: {e:#}");
-                            last_error = Some(format!("Download {name}: {e}"));
+                            state.status_message =
+                                Some(format!("Failed to open SFTP channel: {e}"));
                         }
                     }
                 }
-
-                state.status_message = Some(if let Some(err) = last_error {
-                    format!("Copied {copied}/{total}, error: {err}")
-                } else if total == 1 {
-                    format!("Copied: {}", targets[0].1)
-                } else {
-                    format!("Copied {total} items")
-                });
-
-                // Refresh destination pane and clear source marks
-                let (dst_pane, dst_backend) = match state.active_pane {
-                    Side::Left => (&mut *right_pane, right as &mut Backend),
-                    Side::Right => (&mut *left_pane, left as &mut Backend),
-                };
-                refresh_pane(dst_pane, dst_backend, state).await?;
-                let src_pane = active_pane_mut(left_pane, right_pane, state);
-                src_pane.marked.clear();
             }
         }
 
@@ -544,7 +726,7 @@ async fn handle_key(
             if !targets.is_empty() {
                 let requires_confirm = is_production_remote(state);
                 if requires_confirm {
-                    let names: Vec<_> = targets.iter().map(|(_, n, _)| n.as_str()).collect();
+                    let names: Vec<_> = targets.iter().map(|(_, n, _, _)| n.as_str()).collect();
                     state.status_message = Some(format!(
                         "PROD delete {}: press y to confirm, n/Esc to cancel",
                         if names.len() == 1 {
@@ -556,7 +738,7 @@ async fn handle_key(
                     state.input_mode = InputMode::ConfirmDelete { entries: targets };
                 } else {
                     let backend = active_backend_mut(left, right, state);
-                    for (path, _, is_dir) in &targets {
+                    for (path, _, is_dir, _) in &targets {
                         if *is_dir {
                             backend.rmdir(path).await?;
                         } else {
@@ -951,21 +1133,213 @@ fn is_production_remote(state: &BrowserState) -> bool {
 }
 
 /// Collect batch operation targets: marked entries if any, otherwise the selected entry (skip `..`).
-fn collect_batch_targets(pane: &PaneState) -> Vec<(String, String, bool)> {
+fn collect_batch_targets(pane: &PaneState) -> Vec<(String, String, bool, u64)> {
     if !pane.marked.is_empty() {
         pane.marked
             .iter()
             .filter_map(|&idx| pane.entries.get(idx))
             .filter(|e| e.name != "..")
-            .map(|e| (e.path.clone(), e.name.clone(), e.is_dir))
+            .map(|e| (e.path.clone(), e.name.clone(), e.is_dir, e.size))
             .collect()
     } else if let Some(entry) = pane.selected_entry()
         && entry.name != ".."
     {
-        vec![(entry.path.clone(), entry.name.clone(), entry.is_dir)]
+        vec![(
+            entry.path.clone(),
+            entry.name.clone(),
+            entry.is_dir,
+            entry.size,
+        )]
     } else {
         vec![]
     }
+}
+
+/// Format a progress indicator for active background transfers.
+fn format_background_progress(transfers: &[BackgroundTransfer]) -> String {
+    let t = &transfers[0]; // v1: only one active transfer at a time
+    let p = &t.progress;
+    let done = p.bytes_done.load(Ordering::Relaxed);
+    let total = p.bytes_total.load(Ordering::Relaxed);
+    let current_file = p.current_file.load(Ordering::Relaxed);
+    let total_files = p.total_files.load(Ordering::Relaxed);
+    let name = p.current_name.lock().unwrap().clone();
+
+    let arrow = match t.direction {
+        TransferDirection::LocalToRemote => "\u{2191}",
+        TransferDirection::RemoteToLocal => "\u{2193}",
+    };
+
+    let pct = if total > 0 {
+        (done as f64 / total as f64 * 100.0).min(100.0)
+    } else {
+        0.0
+    };
+
+    if total_files <= 1 {
+        format!(
+            "{arrow} {name} [{}/{} {pct:.0}%]",
+            format_bytes(done),
+            format_bytes(total)
+        )
+    } else {
+        format!(
+            "{arrow} {current_file}/{total_files}: {name} [{}/{} {pct:.0}%]",
+            format_bytes(done),
+            format_bytes(total)
+        )
+    }
+}
+
+/// Format a completion message for a finished background transfer.
+fn format_transfer_result(result: &TransferResult, description: &str) -> String {
+    if result.copied == 0 && result.last_error.is_none() {
+        "Copy cancelled".to_string()
+    } else if let Some(ref err) = result.last_error {
+        format!("Copied {}/{}, error: {err}", result.copied, result.total)
+    } else if result.total == 1 {
+        format!("Copied: {description}")
+    } else {
+        format!("Copied {} items", result.total)
+    }
+}
+
+/// Run a file transfer in a background tokio task.
+/// Owns the SftpSession so it operates on a dedicated SFTP channel.
+async fn run_background_transfer(
+    sftp: SftpSession,
+    targets: Vec<TransferTarget>,
+    progress: Arc<TransferProgress>,
+    cancel: Arc<AtomicBool>,
+    direction: TransferDirection,
+) -> TransferResult {
+    let total = targets.len();
+    let mut copied = 0;
+    let mut last_error = None;
+
+    for (i, target) in targets.iter().enumerate() {
+        if cancel.load(Ordering::Relaxed) {
+            break;
+        }
+
+        progress
+            .current_file
+            .store((i + 1) as u64, Ordering::Relaxed);
+        {
+            let mut name = progress.current_name.lock().unwrap();
+            *name = target.name.clone();
+        }
+        progress.bytes_done.store(0, Ordering::Relaxed);
+        progress.bytes_total.store(target.size, Ordering::Relaxed);
+
+        let result = match direction {
+            TransferDirection::LocalToRemote => {
+                transfer_local_to_remote(
+                    &sftp,
+                    &target.src_path,
+                    &target.dst_path,
+                    &progress,
+                    &cancel,
+                )
+                .await
+            }
+            TransferDirection::RemoteToLocal => {
+                transfer_remote_to_local(
+                    &sftp,
+                    &target.src_path,
+                    &target.dst_path,
+                    &progress,
+                    &cancel,
+                )
+                .await
+            }
+        };
+
+        match result {
+            Ok(()) => {
+                copied += 1;
+                progress.files_done.fetch_add(1, Ordering::Relaxed);
+            }
+            Err(_) if cancel.load(Ordering::Relaxed) => break,
+            Err(e) => {
+                tracing::error!("transfer failed: {}: {e:#}", target.name);
+                last_error = Some(format!("{}: {e}", target.name));
+            }
+        }
+    }
+
+    TransferResult {
+        copied,
+        total,
+        last_error,
+    }
+}
+
+/// Upload a local file to a remote SFTP destination.
+async fn transfer_local_to_remote(
+    sftp: &SftpSession,
+    local_path: &str,
+    remote_path: &str,
+    progress: &TransferProgress,
+    cancel: &AtomicBool,
+) -> Result<()> {
+    let mut local_file = tokio::fs::File::open(local_path)
+        .await
+        .with_context(|| format!("Failed to open: {local_path}"))?;
+
+    let mut remote_file = sftp
+        .create(remote_path)
+        .await
+        .with_context(|| format!("Failed to create remote file: {remote_path}"))?;
+
+    let mut buf = vec![0u8; TRANSFER_CHUNK_SIZE];
+    loop {
+        if cancel.load(Ordering::Relaxed) {
+            anyhow::bail!("Transfer cancelled");
+        }
+        let n = local_file.read(&mut buf).await?;
+        if n == 0 {
+            break;
+        }
+        remote_file.write_all(&buf[..n]).await?;
+        progress.bytes_done.fetch_add(n as u64, Ordering::Relaxed);
+    }
+
+    remote_file.shutdown().await?;
+    Ok(())
+}
+
+/// Download a remote SFTP file to a local destination.
+async fn transfer_remote_to_local(
+    sftp: &SftpSession,
+    remote_path: &str,
+    local_path: &str,
+    progress: &TransferProgress,
+    cancel: &AtomicBool,
+) -> Result<()> {
+    let mut remote_file = sftp
+        .open(remote_path)
+        .await
+        .with_context(|| format!("Failed to open remote file: {remote_path}"))?;
+
+    let mut local_file = tokio::fs::File::create(local_path)
+        .await
+        .with_context(|| format!("Failed to create: {local_path}"))?;
+
+    let mut buf = vec![0u8; TRANSFER_CHUNK_SIZE];
+    loop {
+        if cancel.load(Ordering::Relaxed) {
+            anyhow::bail!("Transfer cancelled");
+        }
+        let n = remote_file.read(&mut buf).await?;
+        if n == 0 {
+            break;
+        }
+        local_file.write_all(&buf[..n]).await?;
+        progress.bytes_done.fetch_add(n as u64, Ordering::Relaxed);
+    }
+
+    Ok(())
 }
 
 /// Handle input modes: filter, mkdir prompt, rename prompt, confirm delete, pattern select.
@@ -1013,7 +1387,7 @@ async fn handle_input_mode(
         match key.code {
             KeyCode::Char('y') | KeyCode::Char('Y') => {
                 let backend = active_backend_mut(left, right, state);
-                for (path, _, is_dir) in &entries {
+                for (path, _, is_dir, _) in &entries {
                     if *is_dir {
                         backend.rmdir(path).await?;
                     } else {

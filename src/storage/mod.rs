@@ -2,9 +2,12 @@ pub mod local_backend;
 pub mod sftp_backend;
 
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, AtomicU64};
 
 use anyhow::Result;
 use chrono::{DateTime, Utc};
+
+use russh_sftp::client::SftpSession;
 
 use self::local_backend::LocalBackend;
 use self::sftp_backend::SftpBackend;
@@ -70,11 +73,51 @@ impl Backend {
         }
     }
 
+    /// Download with progress tracking and cancellation support.
+    pub async fn download_with_progress(
+        &self,
+        remote_path: &str,
+        local_path: &Path,
+        progress: &AtomicU64,
+        cancel: &AtomicBool,
+    ) -> Result<()> {
+        match self {
+            Backend::Local(b) => {
+                b.download_with_progress(remote_path, local_path, Some(progress), Some(cancel))
+                    .await
+            }
+            Backend::Sftp(b) => {
+                b.download_with_progress(remote_path, local_path, Some(progress), Some(cancel))
+                    .await
+            }
+        }
+    }
+
     /// Upload a local file to a remote path.
     pub async fn upload(&self, local_path: &Path, remote_path: &str) -> Result<()> {
         match self {
             Backend::Local(b) => b.upload(local_path, remote_path).await,
             Backend::Sftp(b) => b.upload(local_path, remote_path).await,
+        }
+    }
+
+    /// Upload with progress tracking and cancellation support.
+    pub async fn upload_with_progress(
+        &self,
+        local_path: &Path,
+        remote_path: &str,
+        progress: &AtomicU64,
+        cancel: &AtomicBool,
+    ) -> Result<()> {
+        match self {
+            Backend::Local(b) => {
+                b.upload_with_progress(local_path, remote_path, Some(progress), Some(cancel))
+                    .await
+            }
+            Backend::Sftp(b) => {
+                b.upload_with_progress(local_path, remote_path, Some(progress), Some(cancel))
+                    .await
+            }
         }
     }
 
@@ -107,6 +150,15 @@ impl Backend {
         match self {
             Backend::Local(b) => b.rename(from, to).await,
             Backend::Sftp(b) => b.rename(from, to).await,
+        }
+    }
+
+    /// Open a new SFTP session on the existing SSH connection.
+    /// Returns an error for local backends.
+    pub async fn open_sftp_session(&self) -> Result<SftpSession> {
+        match self {
+            Backend::Local(_) => anyhow::bail!("Local backend has no SFTP session"),
+            Backend::Sftp(b) => b.open_sftp_session().await,
         }
     }
 }

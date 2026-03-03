@@ -1,4 +1,5 @@
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use anyhow::{Context, Result};
 use russh_sftp::client::SftpSession;
@@ -15,10 +16,13 @@ pub struct SftpBackend {
     cwd: String,
     #[allow(dead_code)]
     display_name: String,
+    /// SSH connection handle for spawning additional SFTP channels (background transfers).
+    ssh_handle: Option<russh::client::Handle<crate::ssh::client::SshoreHandler>>,
 }
 
-/// Buffer size for SFTP file transfers (32 KB).
-const SFTP_CHUNK_SIZE: usize = 32 * 1024;
+/// Buffer size for SFTP file transfers (256 KB).
+/// 256 KB is safe for >95% of SFTP servers (OpenSSH default buffer is 262 KB).
+const SFTP_CHUNK_SIZE: usize = 256 * 1024;
 
 impl SftpBackend {
     /// Create a new SFTP backend connected to a bookmark.
@@ -51,6 +55,7 @@ impl SftpBackend {
             sftp,
             cwd,
             display_name,
+            ssh_handle: Some(session),
         })
     }
 
@@ -85,6 +90,7 @@ impl SftpBackend {
             sftp,
             cwd,
             display_name,
+            ssh_handle: None,
         })
     }
 
@@ -162,6 +168,18 @@ impl SftpBackend {
     }
 
     pub async fn download(&self, remote_path: &str, local_path: &Path) -> Result<()> {
+        self.download_with_progress(remote_path, local_path, None, None)
+            .await
+    }
+
+    /// Download with optional progress tracking and cancellation.
+    pub async fn download_with_progress(
+        &self,
+        remote_path: &str,
+        local_path: &Path,
+        progress: Option<&AtomicU64>,
+        cancel: Option<&AtomicBool>,
+    ) -> Result<()> {
         let mut remote_file = self
             .sftp
             .open(remote_path)
@@ -174,17 +192,35 @@ impl SftpBackend {
 
         let mut buf = vec![0u8; SFTP_CHUNK_SIZE];
         loop {
+            if cancel.is_some_and(|c| c.load(Ordering::Relaxed)) {
+                anyhow::bail!("Transfer cancelled");
+            }
             let n = remote_file.read(&mut buf).await?;
             if n == 0 {
                 break;
             }
             local_file.write_all(&buf[..n]).await?;
+            if let Some(p) = progress {
+                p.fetch_add(n as u64, Ordering::Relaxed);
+            }
         }
 
         Ok(())
     }
 
     pub async fn upload(&self, local_path: &Path, remote_path: &str) -> Result<()> {
+        self.upload_with_progress(local_path, remote_path, None, None)
+            .await
+    }
+
+    /// Upload with optional progress tracking and cancellation.
+    pub async fn upload_with_progress(
+        &self,
+        local_path: &Path,
+        remote_path: &str,
+        progress: Option<&AtomicU64>,
+        cancel: Option<&AtomicBool>,
+    ) -> Result<()> {
         let mut local_file = tokio::fs::File::open(local_path)
             .await
             .with_context(|| format!("Failed to open: {}", local_path.display()))?;
@@ -197,11 +233,17 @@ impl SftpBackend {
 
         let mut buf = vec![0u8; SFTP_CHUNK_SIZE];
         loop {
+            if cancel.is_some_and(|c| c.load(Ordering::Relaxed)) {
+                anyhow::bail!("Transfer cancelled");
+            }
             let n = local_file.read(&mut buf).await?;
             if n == 0 {
                 break;
             }
             remote_file.write_all(&buf[..n]).await?;
+            if let Some(p) = progress {
+                p.fetch_add(n as u64, Ordering::Relaxed);
+            }
         }
 
         remote_file.shutdown().await?;
@@ -232,6 +274,29 @@ impl SftpBackend {
             .rename(from, to)
             .await
             .with_context(|| format!("Failed to rename {from} to {to}"))
+    }
+
+    /// Open a new SFTP session on the existing SSH connection.
+    /// Used for background transfers so they don't share a channel with the browser.
+    pub async fn open_sftp_session(&self) -> Result<SftpSession> {
+        let handle = self
+            .ssh_handle
+            .as_ref()
+            .context("No SSH handle available for opening new SFTP sessions")?;
+
+        let channel = handle
+            .channel_open_session()
+            .await
+            .context("Failed to open SSH channel for background SFTP")?;
+
+        channel
+            .request_subsystem(true, "sftp")
+            .await
+            .context("Failed to request SFTP subsystem")?;
+
+        SftpSession::new(channel.into_stream())
+            .await
+            .context("Failed to initialize background SFTP session")
     }
 }
 

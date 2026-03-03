@@ -9,11 +9,11 @@ use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph};
+use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph};
 use russh_sftp::client::SftpSession;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-use crate::sftp::shortcuts::format_bytes;
+use crate::sftp::shortcuts::{format_bytes, format_bytes_per_sec, format_duration};
 use crate::storage::{Backend, FileEntry};
 use crate::tui::theme::ThemeColors;
 
@@ -144,6 +144,10 @@ pub enum InputMode {
         input: String,
         selecting: bool,
     },
+    /// Transfer progress popup overlay (reads from background_transfers[0]).
+    TransferPopup,
+    /// Transfer complete popup with summary message (any key to close).
+    TransferComplete(String),
 }
 
 /// Transfer direction for background file copies.
@@ -169,10 +173,14 @@ struct TransferProgress {
     bytes_total: AtomicU64,
     current_name: std::sync::Mutex<String>,
     files_done: AtomicU64,
+    /// Sum of all target file sizes, set once at start.
+    total_bytes_all: AtomicU64,
+    /// Cumulative bytes transferred across all files.
+    bytes_done_all: AtomicU64,
 }
 
 impl TransferProgress {
-    fn new(total_files: u64) -> Self {
+    fn new(total_files: u64, total_bytes_all: u64) -> Self {
         Self {
             current_file: AtomicU64::new(0),
             total_files: AtomicU64::new(total_files),
@@ -180,6 +188,8 @@ impl TransferProgress {
             bytes_total: AtomicU64::new(0),
             current_name: std::sync::Mutex::new(String::new()),
             files_done: AtomicU64::new(0),
+            total_bytes_all: AtomicU64::new(total_bytes_all),
+            bytes_done_all: AtomicU64::new(0),
         }
     }
 }
@@ -199,6 +209,7 @@ struct BackgroundTransfer {
     dest_side: Side,
     direction: TransferDirection,
     description: String,
+    started_at: std::time::Instant,
 }
 
 /// Overall browser state.
@@ -293,6 +304,7 @@ pub async fn run(
             while i < state.background_transfers.len() {
                 if state.background_transfers[i].handle.is_finished() {
                     let transfer = state.background_transfers.remove(i);
+                    let elapsed = transfer.started_at.elapsed();
                     let result = match transfer.handle.await {
                         Ok(r) => r,
                         Err(_) => TransferResult {
@@ -301,8 +313,18 @@ pub async fn run(
                             last_error: Some("Transfer task panicked".into()),
                         },
                     };
-                    state.status_message =
-                        Some(format_transfer_result(&result, &transfer.description));
+
+                    let summary = format_transfer_result(&result, &transfer.description);
+
+                    // If popup is showing, switch to completion overlay
+                    if matches!(state.input_mode, InputMode::TransferPopup) {
+                        let total_bytes = transfer.progress.bytes_done_all.load(Ordering::Relaxed);
+                        let completion_msg =
+                            format_transfer_complete(&result, total_bytes, elapsed);
+                        state.input_mode = InputMode::TransferComplete(completion_msg);
+                    }
+
+                    state.status_message = Some(summary);
 
                     // Refresh destination pane
                     match transfer.dest_side {
@@ -315,10 +337,17 @@ pub async fn run(
                 }
             }
 
-            // Update progress display for active transfers
-            if !state.background_transfers.is_empty() {
+            // Update progress display for active transfers (background mode)
+            if !state.background_transfers.is_empty()
+                && !matches!(state.input_mode, InputMode::TransferPopup)
+            {
                 state.status_message =
                     Some(format_background_progress(&state.background_transfers));
+                needs_redraw = true;
+            }
+
+            // Force redraw while popup is active for progress updates
+            if matches!(state.input_mode, InputMode::TransferPopup) {
                 needs_redraw = true;
             }
         }
@@ -587,8 +616,12 @@ async fn handle_key(
                                 format!("{} files", transfer_targets.len())
                             };
 
-                            let progress =
-                                Arc::new(TransferProgress::new(transfer_targets.len() as u64));
+                            let total_bytes_all: u64 =
+                                transfer_targets.iter().map(|t| t.size).sum();
+                            let progress = Arc::new(TransferProgress::new(
+                                transfer_targets.len() as u64,
+                                total_bytes_all,
+                            ));
                             let cancel = Arc::new(AtomicBool::new(false));
 
                             let bg_progress = Arc::clone(&progress);
@@ -611,6 +644,7 @@ async fn handle_key(
                                 dest_side,
                                 direction,
                                 description: description.clone(),
+                                started_at: std::time::Instant::now(),
                             });
 
                             // Clear source marks immediately
@@ -620,8 +654,7 @@ async fn handle_key(
                             };
                             src_pane.marked.clear();
 
-                            state.status_message =
-                                Some(format!("Copying {description} in background..."));
+                            state.input_mode = InputMode::TransferPopup;
                         }
                         Err(e) => {
                             state.status_message =
@@ -1035,6 +1068,231 @@ fn draw(
 
     // F-key bar (always visible)
     draw_fkey_bar(frame, main_chunks[5], &state.theme);
+
+    // Transfer popup overlays (rendered on top of everything)
+    match &state.input_mode {
+        InputMode::TransferPopup => {
+            draw_transfer_popup(frame, size, state);
+        }
+        InputMode::TransferComplete(msg) => {
+            draw_transfer_complete_popup(frame, size, msg);
+        }
+        _ => {}
+    }
+}
+
+/// Create a centered rectangle with fixed dimensions, clamped to the available area.
+fn centered_fixed_rect(width: u16, height: u16, area: Rect) -> Rect {
+    let w = width.min(area.width);
+    let h = height.min(area.height);
+    let x = area.x + (area.width.saturating_sub(w)) / 2;
+    let y = area.y + (area.height.saturating_sub(h)) / 2;
+    Rect::new(x, y, w, h)
+}
+
+/// Render a text-based progress bar.
+fn render_progress_bar(ratio: f64, width: usize) -> String {
+    let clamped = ratio.clamp(0.0, 1.0);
+    let filled = (clamped * width as f64) as usize;
+    let empty = width.saturating_sub(filled);
+    format!(
+        "[{}{}]",
+        "\u{2588}".repeat(filled),
+        "\u{2591}".repeat(empty)
+    )
+}
+
+/// Fixed popup width for transfer dialogs.
+const POPUP_WIDTH: u16 = 48;
+
+/// Draw the transfer progress popup overlay.
+fn draw_transfer_popup(frame: &mut Frame, area: Rect, state: &BrowserState) {
+    let Some(transfer) = state.background_transfers.first() else {
+        return;
+    };
+    let p = &transfer.progress;
+
+    let current_file = p.current_file.load(Ordering::Relaxed);
+    let total_files = p.total_files.load(Ordering::Relaxed);
+    let bytes_done = p.bytes_done.load(Ordering::Relaxed);
+    let bytes_total = p.bytes_total.load(Ordering::Relaxed);
+    let bytes_done_all = p.bytes_done_all.load(Ordering::Relaxed);
+    let total_bytes_all = p.total_bytes_all.load(Ordering::Relaxed);
+    let current_name = p.current_name.lock().unwrap().clone();
+
+    let elapsed = transfer.started_at.elapsed();
+    let elapsed_secs = elapsed.as_secs_f64();
+    let speed = if elapsed_secs > 0.1 {
+        bytes_done_all as f64 / elapsed_secs
+    } else {
+        0.0
+    };
+    let eta_secs = if speed > 0.0 && total_bytes_all > bytes_done_all {
+        ((total_bytes_all - bytes_done_all) as f64 / speed) as u64
+    } else {
+        0
+    };
+
+    let arrow = match transfer.direction {
+        TransferDirection::LocalToRemote => "\u{2191}",
+        TransferDirection::RemoteToLocal => "\u{2193}",
+    };
+    let title = match transfer.direction {
+        TransferDirection::LocalToRemote => " Copying to Remote ",
+        TransferDirection::RemoteToLocal => " Copying to Local ",
+    };
+
+    // Single-file: 9 rows content, multi-file: 13 rows content (+ 2 border = total)
+    let popup_h: u16 = if total_files > 1 { 15 } else { 11 };
+    let popup_area = centered_fixed_rect(POPUP_WIDTH, popup_h, area);
+    if popup_area.width < 30 || popup_area.height < 8 {
+        return;
+    }
+    // Bar fits inside border + 2-char padding each side
+    let bar_width = (popup_area.width as usize).saturating_sub(10);
+
+    let current_pct = if bytes_total > 0 {
+        bytes_done as f64 / bytes_total as f64
+    } else {
+        0.0
+    };
+    let overall_pct = if total_bytes_all > 0 {
+        bytes_done_all as f64 / total_bytes_all as f64
+    } else {
+        0.0
+    };
+
+    let mut lines: Vec<Line> = Vec::new();
+
+    // Header: arrow + file counter
+    let file_label = if total_files <= 1 {
+        format!(" {arrow} Uploading 1 file")
+    } else {
+        format!(" {arrow} Uploading {current_file}/{total_files} files")
+    };
+    lines.push(Line::from(Span::styled(
+        file_label,
+        Style::default().add_modifier(Modifier::BOLD),
+    )));
+    lines.push(Line::from(""));
+
+    // Current file name + bar + size on one compact block
+    let max_name_len = (popup_area.width as usize).saturating_sub(6);
+    let display_name = truncate_name(&current_name, max_name_len);
+    lines.push(Line::from(format!(" {display_name}")));
+    let current_bar = render_progress_bar(current_pct, bar_width);
+    lines.push(Line::from(format!(
+        " {current_bar} {:.0}%",
+        current_pct * 100.0
+    )));
+    // Size + speed + ETA on one line
+    let size_line = if speed > 0.0 {
+        format!(
+            " {} / {}  {}  ETA {}",
+            format_bytes(bytes_done),
+            format_bytes(bytes_total),
+            format_bytes_per_sec(speed),
+            format_duration(eta_secs),
+        )
+    } else {
+        format!(
+            " {} / {}",
+            format_bytes(bytes_done),
+            format_bytes(bytes_total)
+        )
+    };
+    lines.push(Line::from(size_line));
+
+    // Overall section (only for multi-file transfers)
+    if total_files > 1 {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            " Overall:",
+            Style::default().add_modifier(Modifier::BOLD),
+        )));
+        let overall_bar = render_progress_bar(overall_pct, bar_width);
+        lines.push(Line::from(format!(
+            " {overall_bar} {:.0}%",
+            overall_pct * 100.0
+        )));
+        lines.push(Line::from(format!(
+            " {} / {}",
+            format_bytes(bytes_done_all),
+            format_bytes(total_bytes_all),
+        )));
+    }
+
+    lines.push(Line::from(""));
+    lines.push(Line::from(vec![
+        Span::raw(" "),
+        Span::styled("Ctrl+B", Style::default().add_modifier(Modifier::BOLD)),
+        Span::raw(" Background  "),
+        Span::styled("Esc", Style::default().add_modifier(Modifier::BOLD)),
+        Span::raw(" Cancel"),
+    ]));
+
+    let block = Block::default()
+        .title(title)
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan));
+
+    frame.render_widget(Clear, popup_area);
+    frame.render_widget(Paragraph::new(lines).block(block), popup_area);
+}
+
+/// Draw the transfer complete popup overlay.
+fn draw_transfer_complete_popup(frame: &mut Frame, area: Rect, msg: &str) {
+    let popup_area = centered_fixed_rect(POPUP_WIDTH, 5, area);
+    if popup_area.width < 20 || popup_area.height < 5 {
+        return;
+    }
+
+    let lines = vec![
+        Line::from(Span::styled(
+            format!(" {msg}"),
+            Style::default().add_modifier(Modifier::BOLD),
+        )),
+        Line::from(""),
+        Line::from(" Press any key to close"),
+    ];
+
+    let block = Block::default()
+        .title(" Copy Complete ")
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Green));
+
+    frame.render_widget(Clear, popup_area);
+    frame.render_widget(Paragraph::new(lines).block(block), popup_area);
+}
+
+/// Format a completion message for the transfer complete popup.
+fn format_transfer_complete(
+    result: &TransferResult,
+    total_bytes: u64,
+    elapsed: Duration,
+) -> String {
+    let elapsed_secs = elapsed.as_secs();
+    if result.copied == 0 && result.last_error.is_none() {
+        "Copy cancelled".to_string()
+    } else if let Some(ref err) = result.last_error {
+        format!(
+            "Copied {}/{} files, error: {err}",
+            result.copied, result.total
+        )
+    } else if result.total == 1 {
+        format!(
+            "\u{2713} Copied 1 file ({}) in {}",
+            format_bytes(total_bytes),
+            format_duration(elapsed_secs),
+        )
+    } else {
+        format!(
+            "\u{2713} Copied {} files ({}) in {}",
+            result.total,
+            format_bytes(total_bytes),
+            format_duration(elapsed_secs),
+        )
+    }
 }
 
 /// Draw a single pane.
@@ -1310,6 +1568,9 @@ async fn transfer_local_to_remote(
         }
         remote_file.write_all(&buf[..n]).await?;
         progress.bytes_done.fetch_add(n as u64, Ordering::Relaxed);
+        progress
+            .bytes_done_all
+            .fetch_add(n as u64, Ordering::Relaxed);
     }
 
     remote_file.shutdown().await?;
@@ -1344,12 +1605,16 @@ async fn transfer_remote_to_local(
         }
         local_file.write_all(&buf[..n]).await?;
         progress.bytes_done.fetch_add(n as u64, Ordering::Relaxed);
+        progress
+            .bytes_done_all
+            .fetch_add(n as u64, Ordering::Relaxed);
     }
 
     Ok(())
 }
 
-/// Handle input modes: filter, mkdir prompt, rename prompt, confirm delete, pattern select.
+/// Handle input modes: filter, mkdir prompt, rename prompt, confirm delete, pattern select,
+/// transfer progress popup, transfer complete popup.
 async fn handle_input_mode(
     key: KeyEvent,
     left_pane: &mut PaneState,
@@ -1358,6 +1623,30 @@ async fn handle_input_mode(
     left: &mut Backend,
     right: &mut Backend,
 ) -> Result<()> {
+    // Transfer complete popup: any key dismisses
+    if matches!(state.input_mode, InputMode::TransferComplete(_)) {
+        state.input_mode = InputMode::Normal;
+        return Ok(());
+    }
+
+    // Transfer progress popup: Ctrl+B backgrounds, Esc cancels, all others ignored
+    if matches!(state.input_mode, InputMode::TransferPopup) {
+        match key.code {
+            KeyCode::Char('b') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                state.input_mode = InputMode::Normal;
+            }
+            KeyCode::Esc => {
+                for t in &state.background_transfers {
+                    t.cancel.store(true, Ordering::Relaxed);
+                }
+                state.input_mode = InputMode::Normal;
+                state.status_message = Some("Cancelling transfers...".to_string());
+            }
+            _ => {} // Ignore all other keys
+        }
+        return Ok(());
+    }
+
     // Handle char/backspace editing for text input modes
     if matches!(key.code, KeyCode::Char(_) | KeyCode::Backspace) {
         let input_ref = match &mut state.input_mode {
@@ -1511,7 +1800,10 @@ async fn handle_input_mode(
                     state.status_message = Some(format!("{count} files marked"));
                 }
             }
-            InputMode::Normal | InputMode::ConfirmDelete { .. } => {}
+            InputMode::Normal
+            | InputMode::ConfirmDelete { .. }
+            | InputMode::TransferPopup
+            | InputMode::TransferComplete(_) => {}
         }
         return Ok(());
     }

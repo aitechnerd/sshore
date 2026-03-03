@@ -387,7 +387,7 @@ pub fn format_bytes(n: u64) -> String {
 }
 
 /// Format bytes-per-second speed for display.
-fn format_bytes_per_sec(bps: f64) -> String {
+pub fn format_bytes_per_sec(bps: f64) -> String {
     const KB: f64 = 1024.0;
     const MB: f64 = 1024.0 * KB;
 

@@ -111,13 +111,11 @@ impl PasswordDetector {
 
         // Cap buffer size — keep only the tail
         if self.buffer.len() > BUFFER_CAP {
-            let start = self.buffer.len() - BUFFER_CAP;
-            // Find a char boundary at or after `start` to avoid splitting multi-byte chars
-            let boundary = self.buffer[start..]
-                .char_indices()
-                .next()
-                .map(|(i, _)| start + i)
-                .unwrap_or(self.buffer.len());
+            let mut boundary = self.buffer.len() - BUFFER_CAP;
+            // Advance to the next char boundary to avoid slicing mid-character
+            while !self.buffer.is_char_boundary(boundary) {
+                boundary += 1;
+            }
             self.buffer = self.buffer[boundary..].to_string();
         }
 
@@ -214,6 +212,18 @@ mod tests {
         d.feed(filler.as_bytes());
         // Buffer should be capped
         assert!(d.buffer.len() <= BUFFER_CAP);
+    }
+
+    #[test]
+    fn test_rolling_buffer_multibyte_boundary() {
+        let mut d = PasswordDetector::new(true);
+        // Fill buffer near capacity with multi-byte characters so the trim
+        // point is likely to land inside a character.
+        let filler = "\u{1F600}".repeat(80); // 4 bytes each = 320 bytes
+        d.feed(filler.as_bytes());
+        assert!(d.buffer.len() <= BUFFER_CAP);
+        // Must still be valid UTF-8 (no panic, no corruption)
+        assert!(std::str::from_utf8(d.buffer.as_bytes()).is_ok());
     }
 
     #[test]

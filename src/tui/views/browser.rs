@@ -1061,9 +1061,12 @@ fn draw_pane(
 
     // Reserve space for badge + padding in the title
     let badge_len = badge_text.len() + 2; // " LOCAL " + " "
-    let max_title_len = (area.width as usize).saturating_sub(badge_len + 4);
-    let cwd_display = if pane.cwd.len() > max_title_len {
-        format!("...{}", &pane.cwd[pane.cwd.len() - max_title_len + 3..])
+    let max_chars = (area.width as usize).saturating_sub(badge_len + 4);
+    let char_count = pane.cwd.chars().count();
+    let cwd_display = if char_count > max_chars {
+        let skip = char_count - (max_chars.saturating_sub(3));
+        let tail: String = pane.cwd.chars().skip(skip).collect();
+        format!("...{tail}")
     } else {
         pane.cwd.clone()
     };

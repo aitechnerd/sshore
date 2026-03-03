@@ -853,6 +853,12 @@ const STDIN_CHANNEL_SIZE: usize = 64;
 /// Grace period for spawned tasks to finish before aborting.
 const TASK_SHUTDOWN_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(100);
 
+/// Grace period after sending a captured sudo password before auto-saving.
+/// If another password prompt appears within this window, auth failed and
+/// the password is discarded. If the window elapses without a new prompt,
+/// auth succeeded and the password is saved to the keychain.
+const SUDO_SAVE_GRACE: std::time::Duration = std::time::Duration::from_millis(1500);
+
 /// Set up signal handlers for graceful SSH session shutdown.
 #[cfg(unix)]
 async fn setup_ssh_signal_handlers() -> Result<tokio::sync::watch::Receiver<bool>> {
@@ -931,7 +937,11 @@ async fn run_proxy_loop(
     let mut stdout = std::io::stdout();
     let mut awaiting_confirm = false;
     let mut capturing_pw: Option<Zeroizing<String>> = None;
-    let mut offering_save_pw: Option<Zeroizing<String>> = None;
+    // Captured sudo password waiting for auth confirmation from the remote.
+    // After the password is sent, we watch remote output: if another password
+    // prompt appears, auth failed and we discard; if the grace period elapses
+    // without a new prompt, auth succeeded and we auto-save to keychain.
+    let mut pending_save_pw: Option<(Zeroizing<String>, std::time::Instant)> = None;
 
     // Combined escape handler for snippets, bookmark save, and browser
     use self::snippet::{SessionAction, SessionEscapeHandler};
@@ -1006,26 +1016,51 @@ async fn run_proxy_loop(
 
                             // Feed data to password detector
                             let sudo_active = awaiting_confirm
-                                || capturing_pw.is_some()
-                                || offering_save_pw.is_some();
+                                || capturing_pw.is_some();
                             if !sudo_active {
-                                let prompt = detector.feed(data);
-                                if prompt.detected() {
-                                    tracing::debug!(?prompt, "password prompt detected");
-                                    if stored_password.is_some() {
-                                        // Auto-fill works for any prompt type
-                                        awaiting_confirm = true;
-                                        let mut stderr = std::io::stderr();
-                                        let _ = write!(stderr, "\r\n[sshore] Password found in keychain. Press Enter to auto-fill, Esc to skip.\r\n");
-                                        let _ = stderr.flush();
-                                    } else if prompt == PromptKind::Sudo
-                                        && session_info.bookmark_name.is_some()
-                                    {
-                                        // Only capture-and-save for explicit sudo prompts;
-                                        // generic "Password:" could be su, mysql, etc.
-                                        tracing::debug!("no stored password — capturing sudo password");
-                                        capturing_pw =
-                                            Some(Zeroizing::new(String::new()));
+                                if pending_save_pw.is_some() {
+                                    // Check if auth failed (another prompt appeared)
+                                    let prompt = detector.feed(data);
+                                    if prompt == PromptKind::Sudo {
+                                        tracing::debug!("auth failed — another sudo prompt, discarding captured password");
+                                        pending_save_pw = None;
+                                        capturing_pw = Some(Zeroizing::new(String::new()));
+                                        detector.clear();
+                                    } else if pending_save_pw.as_ref().is_some_and(|(_, ts)| ts.elapsed() > SUDO_SAVE_GRACE) {
+                                        // Grace period elapsed without another prompt — auth succeeded
+                                        let (pw, _) = pending_save_pw.take().unwrap();
+                                        if let Some(ref name) = session_info.bookmark_name {
+                                            match keychain::set_password(name, &pw) {
+                                                Ok(()) => {
+                                                    tracing::debug!("password auto-saved to keychain");
+                                                    stored_password = Some(pw);
+                                                }
+                                                Err(e) => {
+                                                    tracing::debug!(error = %e, "failed to save password to keychain");
+                                                }
+                                            }
+                                        }
+                                        detector.clear();
+                                    }
+                                } else {
+                                    let prompt = detector.feed(data);
+                                    if prompt.detected() {
+                                        tracing::debug!(?prompt, "password prompt detected");
+                                        if stored_password.is_some() {
+                                            // Auto-fill works for any prompt type
+                                            awaiting_confirm = true;
+                                            let mut stderr = std::io::stderr();
+                                            let _ = write!(stderr, "\r\n[sshore] Password found in keychain. Press Enter to auto-fill, Esc to skip.\r\n");
+                                            let _ = stderr.flush();
+                                        } else if prompt == PromptKind::Sudo
+                                            && session_info.bookmark_name.is_some()
+                                        {
+                                            // Only capture-and-save for explicit sudo prompts;
+                                            // generic "Password:" could be su, mysql, etc.
+                                            tracing::debug!("no stored password — capturing sudo password");
+                                            capturing_pw =
+                                                Some(Zeroizing::new(String::new()));
+                                        }
                                     }
                                 }
                             }
@@ -1094,65 +1129,44 @@ async fn run_proxy_loop(
                         if enter_pressed {
                             let pw = capturing_pw.take().unwrap();
                             if !pw.is_empty()
-                                && let Some(ref name) = session_info.bookmark_name
+                                && session_info.bookmark_name.is_some()
                             {
-                                tracing::debug!("password captured, offering save");
-                                let mut stderr = std::io::stderr();
-                                let _ = write!(
-                                    stderr,
-                                    "\r\n\x1b[2m[sshore] Save password to keychain \
-                                     for '{name}'? [y/N]\x1b[0m "
-                                );
-                                let _ = stderr.flush();
-                                offering_save_pw = Some(pw);
+                                tracing::debug!("password captured, waiting to confirm auth");
+                                pending_save_pw = Some((pw, std::time::Instant::now()));
                             }
                             detector.clear();
                         }
-                    } else if offering_save_pw.is_some() {
-                        // Handle y/N response for password save offer
-                        let pw = offering_save_pw.take().unwrap();
-                        let first = bytes.first().copied();
-                        let mut stderr = std::io::stderr();
-                        if first == Some(b'y') || first == Some(b'Y') {
+                    } else if pending_save_pw.is_some() {
+                        // User is typing into the session after sudo — auth succeeded.
+                        // Auto-save the captured password then forward input normally.
+                        if pending_save_pw.as_ref().is_some_and(|(_, ts)| ts.elapsed() > SUDO_SAVE_GRACE) {
+                            let (pw, _) = pending_save_pw.take().unwrap();
                             if let Some(ref name) = session_info.bookmark_name {
                                 match keychain::set_password(name, &pw) {
                                     Ok(()) => {
-                                        tracing::debug!("password saved to keychain");
-                                        let _ = write!(
-                                            stderr,
-                                            "\r\n\x1b[2m[sshore] Password saved \
-                                             for '{name}'.\x1b[0m\r\n"
-                                        );
-                                        // Enable auto-fill for subsequent prompts
+                                        tracing::debug!("password auto-saved to keychain (on stdin)");
                                         stored_password = Some(pw);
                                     }
                                     Err(e) => {
-                                        let _ = write!(
-                                            stderr,
-                                            "\r\n\x1b[2mWarning: failed to save: \
-                                             {e}\x1b[0m\r\n"
-                                        );
+                                        tracing::debug!(error = %e, "failed to save password to keychain");
                                     }
                                 }
                             }
-                        } else if first == Some(b'n')
-                            || first == Some(b'N')
-                            || first == Some(0x0d)
-                            || first == Some(0x1b)
-                        {
-                            // Explicit decline — consume the keystroke
-                            let _ = write!(stderr, "\r\n");
+                            detector.clear();
                         } else {
-                            // Any other key — dismiss prompt and forward to remote
-                            let _ = write!(stderr, "\r\n");
-                            if tokio::io::AsyncWriteExt::write_all(&mut writer, &bytes)
-                                .await
-                                .is_err()
-                            {
-                                break 'proxy ProxyAction::Exit;
-                            }
+                            // Still within grace period — discard (might be wrong password)
+                            tracing::debug!("stdin during sudo grace period, discarding pending save");
+                            pending_save_pw = None;
+                            detector.clear();
                         }
-                        let _ = stderr.flush();
+
+                        // Always forward user input to remote
+                        if tokio::io::AsyncWriteExt::write_all(&mut writer, &bytes)
+                            .await
+                            .is_err()
+                        {
+                            break 'proxy ProxyAction::Exit;
+                        }
                     } else if has_escape_triggers {
                         let mut forward_batch = Vec::new();
                         let mut should_break = false;
@@ -1244,6 +1258,16 @@ async fn run_proxy_loop(
         drop(stdin_rx);
         let _ = tokio::time::timeout(TASK_SHUTDOWN_TIMEOUT, &mut stdin_handle).await;
         stdin_handle.abort();
+
+        // Save pending password if grace period has elapsed (session ending or switching to browser)
+        if let Some((pw, ts)) = pending_save_pw.take()
+            && ts.elapsed() > SUDO_SAVE_GRACE
+            && let Some(ref name) = session_info.bookmark_name
+            && let Ok(()) = keychain::set_password(name, &pw)
+        {
+            tracing::debug!("password auto-saved to keychain (on session end)");
+            stored_password = Some(pw);
+        }
 
         match action {
             ProxyAction::Exit => break,

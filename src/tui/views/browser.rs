@@ -1178,12 +1178,14 @@ fn draw_fkey_bar(frame: &mut Frame, area: Rect) {
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
-/// Truncate a filename to fit within a given width.
+/// Truncate a filename to fit within a given character width.
+/// Uses `char` boundaries so multi-byte UTF-8 filenames don't panic.
 fn truncate_name(name: &str, max_len: usize) -> String {
-    if name.len() <= max_len {
+    if name.chars().count() <= max_len {
         name.to_string()
     } else {
-        format!("{}...", &name[..max_len - 3])
+        let truncated: String = name.chars().take(max_len.saturating_sub(3)).collect();
+        format!("{truncated}...")
     }
 }
 
@@ -1457,5 +1459,17 @@ mod tests {
     fn test_truncate_name_minimum() {
         // With max_len=3, we get "..."
         assert_eq!(truncate_name("abcd", 3), "...");
+    }
+
+    #[test]
+    fn test_truncate_name_multibyte_utf8() {
+        // Must not panic on multi-byte characters (Cyrillic, CJK, emoji)
+        let cyrillic = "Библиотека_файлов.txt";
+        let result = truncate_name(cyrillic, 10);
+        assert_eq!(result, "Библиот...");
+
+        let emoji = "📁documents_folder";
+        let result = truncate_name(emoji, 8);
+        assert_eq!(result, "📁docu...");
     }
 }

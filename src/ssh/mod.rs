@@ -306,6 +306,7 @@ pub async fn establish_session(
     let ctx = AuthContext {
         bookmark_name: Some(&bookmark.name),
         env: Some(&bookmark.env),
+        has_identity_file: bookmark.identity_file.is_some(),
     };
     let authenticated = authenticate(&mut session, &user, &keys, &ctx).await?;
     if !authenticated {
@@ -367,6 +368,7 @@ pub async fn establish_tunnel_session(
     let ctx = AuthContext {
         bookmark_name: Some(&bookmark.name),
         env: Some(&bookmark.env),
+        has_identity_file: bookmark.identity_file.is_some(),
     };
     let authenticated = authenticate(&mut session, &user, &keys, &ctx).await?;
     if !authenticated {
@@ -657,6 +659,7 @@ async fn exec_command_quiet(
 
 /// Load SSH private keys for authentication.
 /// If bookmark has identity_file, load that (with env var expansion). Otherwise try default keys.
+/// Prompts for passphrase when an encrypted key is encountered.
 fn load_keys(bookmark: &Bookmark) -> Result<Vec<PrivateKeyWithHashAlg>> {
     let mut keys = Vec::new();
 
@@ -666,9 +669,15 @@ fn load_keys(bookmark: &Bookmark) -> Result<Vec<PrivateKeyWithHashAlg>> {
                 let expanded = PathBuf::from(&path);
                 if expanded.exists() {
                     match load_key_from_path(&path) {
-                        Ok(key) => keys.push(key),
-                        Err(e) => {
-                            eprintln!("Warning: failed to load key {path}: {e}");
+                        Ok(loaded) => keys.extend(loaded),
+                        Err(_) => {
+                            // Key failed to load without passphrase — prompt for one
+                            match load_key_with_passphrase_prompt(&path) {
+                                Ok(loaded) => keys.extend(loaded),
+                                Err(e) => {
+                                    eprintln!("Warning: failed to load key {path}: {e}");
+                                }
+                            }
                         }
                     }
                 } else {
@@ -694,8 +703,8 @@ fn load_keys(bookmark: &Bookmark) -> Result<Vec<PrivateKeyWithHashAlg>> {
             let path = ssh_dir.join(name);
             if path.exists() {
                 match load_key_from_path(&path.to_string_lossy()) {
-                    Ok(key) => keys.push(key),
-                    Err(_) => continue, // Silently skip keys that fail to load
+                    Ok(loaded) => keys.extend(loaded),
+                    Err(_) => continue, // Silently skip default keys that fail to load
                 }
             }
         }
@@ -704,17 +713,72 @@ fn load_keys(bookmark: &Bookmark) -> Result<Vec<PrivateKeyWithHashAlg>> {
     Ok(keys)
 }
 
-/// Load a single private key from a file path.
-fn load_key_from_path(path: &str) -> Result<PrivateKeyWithHashAlg> {
+/// Wrap a loaded private key into one or more `PrivateKeyWithHashAlg` entries.
+/// For RSA keys, returns SHA-256 and SHA-512 variants (modern algorithms first)
+/// so the auth loop tries `rsa-sha2-256` before the deprecated `ssh-rsa` (SHA-1).
+/// For non-RSA keys (Ed25519, ECDSA), returns a single entry with no hash override.
+fn wrap_key(key: russh::keys::PrivateKey) -> Vec<PrivateKeyWithHashAlg> {
+    use russh::keys::HashAlg;
+
+    let arc = Arc::new(key);
+    if arc.algorithm().is_rsa() {
+        // Try SHA-256 first (most widely accepted), then SHA-512
+        vec![
+            PrivateKeyWithHashAlg::new(Arc::clone(&arc), Some(HashAlg::Sha256)),
+            PrivateKeyWithHashAlg::new(Arc::clone(&arc), Some(HashAlg::Sha512)),
+        ]
+    } else {
+        vec![PrivateKeyWithHashAlg::new(arc, None)]
+    }
+}
+
+/// Load a single private key from a file path (no passphrase).
+fn load_key_from_path(path: &str) -> Result<Vec<PrivateKeyWithHashAlg>> {
     let key = russh::keys::load_secret_key(path, None)
         .with_context(|| format!("Failed to load SSH key: {path}"))?;
-    Ok(PrivateKeyWithHashAlg::new(Arc::new(key), None))
+    Ok(wrap_key(key))
+}
+
+/// Prompt for a passphrase and load an encrypted private key.
+fn load_key_with_passphrase_prompt(path: &str) -> Result<Vec<PrivateKeyWithHashAlg>> {
+    eprintln!("Key {path} requires a passphrase.");
+    eprint!("Passphrase: ");
+    std::io::stderr().flush()?;
+
+    crossterm::terminal::enable_raw_mode()?;
+    let mut passphrase = Zeroizing::new(String::new());
+    loop {
+        if let crossterm::event::Event::Key(key) = crossterm::event::read()? {
+            match key.code {
+                crossterm::event::KeyCode::Enter => break,
+                crossterm::event::KeyCode::Char(c) => passphrase.push(c),
+                crossterm::event::KeyCode::Backspace => {
+                    passphrase.pop();
+                }
+                crossterm::event::KeyCode::Esc => {
+                    crossterm::terminal::disable_raw_mode()?;
+                    eprintln!();
+                    bail!("Passphrase entry cancelled");
+                }
+                _ => {}
+            }
+        }
+    }
+    crossterm::terminal::disable_raw_mode()?;
+    eprintln!(); // newline after hidden input
+
+    let key = russh::keys::load_secret_key(path, Some(passphrase.as_str()))
+        .with_context(|| format!("Failed to decrypt SSH key: {path}"))?;
+    Ok(wrap_key(key))
 }
 
 /// Context passed to `authenticate()` for keychain-aware auth.
 struct AuthContext<'a> {
     bookmark_name: Option<&'a str>,
     env: Option<&'a str>,
+    /// When true, the bookmark has an explicit identity_file configured.
+    /// Password auth should not be attempted as a fallback.
+    has_identity_file: bool,
 }
 
 /// Try to authenticate using available keys, then keychain password, then user prompt.
@@ -741,6 +805,15 @@ async fn authenticate(
                 continue;
             }
         }
+    }
+
+    // If the bookmark has an explicit identity_file AND we actually tried
+    // keys, don't fall through to password auth — the user intended key-based
+    // authentication. But if no keys were loaded (file missing, wrong format,
+    // passphrase cancelled), still allow password fallback.
+    if ctx.has_identity_file && !keys.is_empty() {
+        tracing::debug!("identity_file configured and keys were tried, skipping password fallback");
+        return Ok(false);
     }
 
     // 2. Try keychain password (if bookmark name is available)

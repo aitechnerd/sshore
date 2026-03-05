@@ -1,6 +1,6 @@
 [package]
 name = "sshore"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2024"
 authors = ["Sergey <email>"]
 description = "A terminal-native SSH connection manager with environment-aware safety"

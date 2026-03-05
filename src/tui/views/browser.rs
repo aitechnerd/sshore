@@ -154,6 +154,8 @@ pub enum InputMode {
     SelectPattern {
         input: String,
         selecting: bool,
+        files_only: bool,
+        case_sensitive: bool,
     },
     /// Pre-copy/move confirmation popup (MC-style).
     CopyConfirm {
@@ -717,6 +719,7 @@ async fn handle_key(
                 pane.list_state.select(Some(0));
                 pane.marked.clear();
                 state.filter = None;
+                state.status_message = None;
                 let pane = active_pane_mut(left_pane, right_pane, state);
                 let backend = active_backend_mut(left, right, state);
                 refresh_pane(pane, backend, state).await?;
@@ -786,6 +789,7 @@ async fn handle_key(
                     pane.list_state.select(Some(0));
                     pane.marked.clear();
                     state.filter = None;
+                    state.status_message = None;
                     let pane = active_pane_mut(left_pane, right_pane, state);
                     let backend = active_backend_mut(left, right, state);
                     refresh_pane(pane, backend, state).await?;
@@ -832,6 +836,12 @@ async fn handle_key(
             let pane = active_pane_mut(left_pane, right_pane, state);
             pane.toggle_mark();
             pane.move_down();
+            let count = pane.marked.len();
+            state.status_message = if count > 0 {
+                Some(format!("{count} files marked"))
+            } else {
+                None
+            };
         }
 
         KeyCode::Char('.') => {
@@ -937,6 +947,8 @@ async fn handle_key(
             state.input_mode = InputMode::SelectPattern {
                 input: "*".to_string(),
                 selecting: true,
+                files_only: false,
+                case_sensitive: true,
             };
         }
 
@@ -945,6 +957,8 @@ async fn handle_key(
             state.input_mode = InputMode::SelectPattern {
                 input: "*".to_string(),
                 selecting: false,
+                files_only: false,
+                case_sensitive: true,
             };
         }
 
@@ -959,6 +973,7 @@ async fn handle_key(
             pane.list_state.select(Some(0));
             pane.marked.clear();
             state.filter = None;
+            state.status_message = None;
             let pane = active_pane_mut(left_pane, right_pane, state);
             let backend = active_backend_mut(left, right, state);
             refresh_pane(pane, backend, state).await?;
@@ -1042,7 +1057,13 @@ fn sort_entries(entries: &mut [FileEntry], sort_by: SortField, ascending: bool) 
 
 /// Simple glob matching (reused from config module).
 fn glob_match(pattern: &str, text: &str) -> bool {
-    let regex_pattern = format!("^{}$", regex::escape(pattern).replace(r"\*", ".*"));
+    glob_match_opts(pattern, text, true)
+}
+
+/// Glob matching with case sensitivity option.
+fn glob_match_opts(pattern: &str, text: &str, case_sensitive: bool) -> bool {
+    let prefix = if case_sensitive { "" } else { "(?i)" };
+    let regex_pattern = format!("{prefix}^{}$", regex::escape(pattern).replace(r"\*", ".*"));
     regex::Regex::new(&regex_pattern)
         .map(|re| re.is_match(text))
         .unwrap_or(false)
@@ -1190,8 +1211,21 @@ fn draw(
             let is_production = is_production_remote(state);
             draw_delete_confirm_popup(frame, size, entries, is_production, state.popup_focus);
         }
-        InputMode::SelectPattern { input, selecting } => {
-            draw_select_popup(frame, size, input, *selecting, state.popup_focus);
+        InputMode::SelectPattern {
+            input,
+            selecting,
+            files_only,
+            case_sensitive,
+        } => {
+            draw_select_popup(
+                frame,
+                size,
+                input,
+                *selecting,
+                *files_only,
+                *case_sensitive,
+                state.popup_focus,
+            );
         }
         _ => {}
     }
@@ -1428,10 +1462,12 @@ fn draw_select_popup(
     area: Rect,
     input: &str,
     selecting: bool,
+    files_only: bool,
+    case_sensitive: bool,
     popup_focus: usize,
 ) {
     let title = if selecting { " Select " } else { " Deselect " };
-    let popup_h: u16 = 8;
+    let popup_h: u16 = 10;
     let popup_area = centered_fixed_rect(POPUP_WIDTH, popup_h, area);
     if popup_area.width < 20 || popup_area.height < popup_h {
         return;
@@ -1464,9 +1500,11 @@ fn draw_select_popup(
     );
 
     // Input field with background
+    // Focus: 0=Input, 1=Files only, 2=Case sensitive, 3=OK, 4=Cancel
     let field_y = inner.y + 1;
     let field_w = inner.width;
     let field_area = Rect::new(inner.x, field_y, field_w, 1);
+    let input_focused = popup_focus == 0;
 
     let max_visible = field_w.saturating_sub(1) as usize;
     let display_input = if input.len() > max_visible {
@@ -1475,7 +1513,12 @@ fn draw_select_popup(
         input
     };
 
-    let cursor_char = if display_input.len() < max_visible {
+    let field_bg = if input_focused {
+        Color::DarkGray
+    } else {
+        Color::Rgb(40, 40, 40)
+    };
+    let cursor_char = if input_focused && display_input.len() < max_visible {
         "\u{2588}"
     } else {
         ""
@@ -1485,27 +1528,56 @@ fn draw_select_popup(
     let field_line = Line::from(vec![
         Span::styled(
             display_input.to_string(),
-            Style::default().fg(Color::White).bg(Color::DarkGray),
+            Style::default().fg(Color::White).bg(field_bg),
         ),
         Span::styled(
             cursor_char.to_string(),
-            Style::default().fg(Color::White).bg(Color::DarkGray),
+            Style::default().fg(Color::White).bg(field_bg),
         ),
-        Span::styled(" ".repeat(pad), Style::default().bg(Color::DarkGray)),
+        Span::styled(" ".repeat(pad), Style::default().bg(field_bg)),
     ]);
     frame.render_widget(Paragraph::new(field_line), field_area);
 
+    // Checkbox row: [x] Files only    [x] Case sensitive
+    let chk_y = inner.y + 3;
+    let files_mark = if files_only { "x" } else { " " };
+    let case_mark = if case_sensitive { "x" } else { " " };
+    let files_style = if popup_focus == 1 {
+        Style::default().fg(Color::Black).bg(Color::Cyan)
+    } else {
+        Style::default().fg(Color::White)
+    };
+    let case_style = if popup_focus == 2 {
+        Style::default().fg(Color::Black).bg(Color::Cyan)
+    } else {
+        Style::default().fg(Color::White)
+    };
+    let chk_line = Line::from(vec![
+        Span::styled(format!("[{files_mark}] Files only"), files_style),
+        Span::raw("    "),
+        Span::styled(format!("[{case_mark}] Case sensitive"), case_style),
+    ]);
+    frame.render_widget(
+        Paragraph::new(chk_line),
+        Rect::new(inner.x, chk_y, inner.width, 1),
+    );
+
     // Separator line
-    let sep_y = inner.y + 3;
+    let sep_y = inner.y + 5;
     let sep_line = "\u{2500}".repeat(inner.width as usize);
     frame.render_widget(
         Paragraph::new(sep_line).style(Style::default().fg(Color::Cyan)),
         Rect::new(inner.x, sep_y, inner.width, 1),
     );
 
-    // Buttons
-    let btn_y = inner.y + 4;
-    render_button_row(&["OK", "Cancel"], popup_focus, inner, btn_y, frame);
+    // Buttons — focus 3=OK, 4=Cancel; usize::MAX = no button focused
+    let btn_y = inner.y + 6;
+    let btn_focus = if popup_focus >= 3 {
+        popup_focus - 3
+    } else {
+        usize::MAX
+    };
+    render_button_row(&["OK", "Cancel"], btn_focus, inner, btn_y, frame);
 }
 
 /// Draw the MC-style delete confirmation popup.
@@ -3126,14 +3198,50 @@ async fn handle_input_mode(
         return Ok(());
     }
 
-    // Popup button navigation: Tab/Right = next, Shift+Tab/Left = prev
+    // SelectPattern popup — MC-style dialog navigation:
+    // Focus items: 0=Input, 1=Files only, 2=Case sensitive, 3=OK, 4=Cancel
+    // Tab/Shift+Tab cycles focus. Space toggles checkboxes.
+    // Enter always submits (OK) unless Cancel (4) is focused.
+    // Left/Right reserved for input cursor (no widget nav).
+    // Chars/Backspace always edit the input field regardless of focus.
+    if matches!(state.input_mode, InputMode::SelectPattern { .. }) {
+        const SELECT_FOCUS_COUNT: usize = 5;
+        match key.code {
+            KeyCode::Tab => {
+                state.popup_focus = (state.popup_focus + 1) % SELECT_FOCUS_COUNT;
+                return Ok(());
+            }
+            KeyCode::BackTab => {
+                state.popup_focus =
+                    (state.popup_focus + SELECT_FOCUS_COUNT - 1) % SELECT_FOCUS_COUNT;
+                return Ok(());
+            }
+            KeyCode::Char(' ') if state.popup_focus == 1 || state.popup_focus == 2 => {
+                // Space toggles checkboxes
+                if let InputMode::SelectPattern {
+                    files_only,
+                    case_sensitive,
+                    ..
+                } = &mut state.input_mode
+                {
+                    if state.popup_focus == 1 {
+                        *files_only = !*files_only;
+                    } else {
+                        *case_sensitive = !*case_sensitive;
+                    }
+                }
+                return Ok(());
+            }
+            _ => {}
+        }
+    }
+
     if matches!(
         state.input_mode,
         InputMode::MkdirPrompt(_)
             | InputMode::RenamePrompt { .. }
             | InputMode::ConfirmDelete { .. }
             | InputMode::CopyConfirm { .. }
-            | InputMode::SelectPattern { .. }
     ) {
         let button_count = if matches!(state.input_mode, InputMode::CopyConfirm { .. }) {
             3
@@ -3413,14 +3521,27 @@ async fn handle_input_mode(
                 }
                 // else: Cancel — mode already set to Normal
             }
-            InputMode::SelectPattern { input, selecting } => {
-                if state.popup_focus == 0 {
-                    // OK
+            InputMode::SelectPattern {
+                input,
+                selecting,
+                files_only,
+                case_sensitive,
+            } => {
+                if state.popup_focus == 4 {
+                    // Cancel — mode already set to Normal
+                } else {
+                    // Enter always submits (OK) from input, checkboxes, or OK button
                     let pattern = input.trim().to_string();
                     if !pattern.is_empty() {
                         let pane = active_pane_mut(left_pane, right_pane, state);
                         for (i, entry) in pane.entries.iter().enumerate() {
-                            if entry.name != ".." && glob_match(&pattern, &entry.name) {
+                            if entry.name == ".." {
+                                continue;
+                            }
+                            if files_only && entry.is_dir {
+                                continue;
+                            }
+                            if glob_match_opts(&pattern, &entry.name, case_sensitive) {
                                 if selecting {
                                     pane.marked.insert(i);
                                 } else {
@@ -3429,10 +3550,14 @@ async fn handle_input_mode(
                             }
                         }
                         let count = pane.marked.len();
-                        state.status_message = Some(format!("{count} files marked"));
+                        state.status_message = if count > 0 {
+                            Some(format!("{count} files marked"))
+                        } else {
+                            None
+                        };
                     }
+                    // mode already set to Normal
                 }
-                // else: Cancel — mode already set to Normal
             }
             InputMode::Normal
             | InputMode::ConfirmDelete { .. }
@@ -3750,6 +3875,22 @@ mod tests {
     fn test_glob_match_all() {
         assert!(glob_match("*", "anything"));
         assert!(glob_match("*", ""));
+    }
+
+    // --- glob_match_opts (case sensitivity) ---
+
+    #[test]
+    fn test_glob_match_case_insensitive() {
+        assert!(glob_match_opts("*.TXT", "readme.txt", false));
+        assert!(glob_match_opts("*.txt", "README.TXT", false));
+        assert!(!glob_match_opts("*.TXT", "readme.txt", true));
+    }
+
+    #[test]
+    fn test_glob_match_case_sensitive_default() {
+        // glob_match delegates to glob_match_opts with case_sensitive=true
+        assert!(!glob_match("*.TXT", "readme.txt"));
+        assert!(glob_match("*.txt", "readme.txt"));
     }
 
     // --- truncate_name ---

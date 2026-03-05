@@ -3217,6 +3217,7 @@ dependencies = [
  "csv",
  "dirs",
  "fs2",
+ "futures",
  "fuzzy-matcher",
  "glob",
  "hmac",

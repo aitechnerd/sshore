@@ -38,6 +38,7 @@ impl HostKeyCheckMode {
 
 /// SSH client handler for sshore connections.
 /// Implements the russh `client::Handler` trait to handle SSH protocol events.
+#[derive(Clone)]
 pub struct SshoreHandler {
     /// Registered remote forwards: maps server-side (address, port) to local (host, port).
     pub remote_forwards: RemoteForwardMap,

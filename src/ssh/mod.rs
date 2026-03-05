@@ -385,7 +385,7 @@ pub async fn connect(
     bookmark_index: usize,
     cfg_override: Option<&str>,
 ) -> Result<()> {
-    let session = establish_session(config, bookmark_index).await?;
+    let session = Arc::new(establish_session(config, bookmark_index).await?);
 
     // Apply terminal theming
     terminal_theme::apply_theme(&config.bookmarks[bookmark_index], &config.settings);
@@ -478,7 +478,7 @@ pub async fn connect(
         bookmark_trigger,
         browser_trigger,
         session_info,
-        &session,
+        Arc::clone(&session),
         &bookmark_env,
         &theme_name,
         cfg_override,
@@ -987,7 +987,7 @@ async fn run_proxy_loop(
     bookmark_trigger: String,
     browser_trigger: String,
     session_info: SessionInfo,
-    session: &russh::client::Handle<SshoreHandler>,
+    session: Arc<russh::client::Handle<SshoreHandler>>,
     bookmark_env: &str,
     theme_name: &str,
     cfg_override: Option<&str>,
@@ -1342,7 +1342,14 @@ async fn run_proxy_loop(
             ProxyAction::Exit => break,
             ProxyAction::Browser => {
                 // Launch in-session SFTP file browser
-                match launch_browser(session, &browser_name, bookmark_env, theme_name).await {
+                match launch_browser(
+                    Arc::clone(&session),
+                    &browser_name,
+                    bookmark_env,
+                    theme_name,
+                )
+                .await
+                {
                     Ok(()) => {}
                     Err(e) => {
                         tracing::error!("browser launch failed: {e:#}");
@@ -1374,7 +1381,7 @@ async fn run_proxy_loop(
 /// Detects the remote shell's current directory via `pwd` so the browser
 /// starts where the user left off.
 async fn launch_browser(
-    session: &russh::client::Handle<SshoreHandler>,
+    session: Arc<russh::client::Handle<SshoreHandler>>,
     name: &str,
     env: &str,
     theme_name: &str,
@@ -1384,9 +1391,10 @@ async fn launch_browser(
     use crate::tui::views::browser;
 
     let theme = resolve_theme(theme_name);
-    let remote_cwd = detect_remote_cwd(session).await;
+    let remote_cwd = detect_remote_cwd(&session).await;
 
-    let mut sftp_backend = SftpBackend::from_handle(session, name).await?;
+    let mut sftp_backend = SftpBackend::from_handle(&session, name).await?;
+    sftp_backend.set_ssh_handle(Arc::clone(&session));
     if let Some(ref cwd) = remote_cwd
         && let Err(e) = sftp_backend.cd(cwd).await
     {

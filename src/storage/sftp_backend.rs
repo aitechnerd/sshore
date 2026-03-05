@@ -1,4 +1,5 @@
 use std::path::Path;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use anyhow::{Context, Result};
@@ -17,7 +18,7 @@ pub struct SftpBackend {
     #[allow(dead_code)]
     display_name: String,
     /// SSH connection handle for spawning additional SFTP channels (background transfers).
-    ssh_handle: Option<russh::client::Handle<crate::ssh::client::SshoreHandler>>,
+    ssh_handle: Option<Arc<russh::client::Handle<crate::ssh::client::SshoreHandler>>>,
 }
 
 /// Buffer size for SFTP file transfers (256 KB).
@@ -55,7 +56,7 @@ impl SftpBackend {
             sftp,
             cwd,
             display_name,
-            ssh_handle: Some(session),
+            ssh_handle: Some(Arc::new(session)),
         })
     }
 
@@ -103,6 +104,15 @@ impl SftpBackend {
         let mut backend = Self::new(config, bookmark_index).await?;
         backend.cd(start_path).await?;
         Ok(backend)
+    }
+
+    /// Set the SSH handle for spawning additional SFTP sessions.
+    /// Used when the handle was not available at construction time (e.g. `from_handle`).
+    pub fn set_ssh_handle(
+        &mut self,
+        handle: Arc<russh::client::Handle<crate::ssh::client::SshoreHandler>>,
+    ) {
+        self.ssh_handle = Some(handle);
     }
 
     pub fn display_name(&self) -> &str {
@@ -297,6 +307,11 @@ impl SftpBackend {
         SftpSession::new(channel.into_stream())
             .await
             .context("Failed to initialize background SFTP session")
+    }
+
+    /// Get a reference to the SSH handle for spawning additional SFTP sessions.
+    pub fn ssh_handle(&self) -> Option<&russh::client::Handle<crate::ssh::client::SshoreHandler>> {
+        self.ssh_handle.as_deref()
     }
 }
 

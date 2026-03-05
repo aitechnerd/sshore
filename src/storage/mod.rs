@@ -161,4 +161,13 @@ impl Backend {
             Backend::Sftp(b) => b.open_sftp_session().await,
         }
     }
+
+    /// Get a reference to the SSH handle for spawning additional SFTP channels.
+    /// Returns `None` for local backends or SFTP backends without a handle.
+    pub fn ssh_handle(&self) -> Option<&russh::client::Handle<crate::ssh::client::SshoreHandler>> {
+        match self {
+            Backend::Local(_) => None,
+            Backend::Sftp(b) => b.ssh_handle(),
+        }
+    }
 }

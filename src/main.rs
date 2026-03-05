@@ -190,6 +190,9 @@ async fn main() -> Result<()> {
         }) => {
             cmd_export(env, tag, name, output, include_settings, cfg_override)?;
         }
+        Some(Commands::ResetTab) => {
+            ssh::terminal_theme::reset_theme();
+        }
         None => {
             if let Some(name) = cli.connect {
                 cmd_connect(&name, cfg_override).await?;
@@ -221,6 +224,7 @@ fn check_bookmark_subcommand_collision(cmd: &Commands, cfg_override: Option<&str
         Commands::Export { .. } => "export",
         Commands::Password { .. } => "password",
         Commands::Completions { .. } => "completions",
+        Commands::ResetTab => "reset-tab",
     };
 
     if let Ok(app_config) = config::load_with_override(cfg_override)

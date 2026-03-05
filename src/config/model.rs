@@ -318,7 +318,7 @@ fn default_theme() -> String {
 }
 
 fn default_tab_title_template() -> String {
-    "{badge} {label} — {name}".to_string()
+    "{badge} [{label}] — {name}".to_string()
 }
 
 fn default_snippet_trigger() -> String {
@@ -365,8 +365,8 @@ fn default_env_colors() -> EnvColorMap {
         "development".into(),
         EnvColor {
             fg: "#FFFFFF".into(),
-            bg: "#00AA00".into(),
-            badge: "🟢".into(),
+            bg: "#0066CC".into(),
+            badge: "🔵".into(),
             label: "DEV".into(),
         },
     );
@@ -374,8 +374,8 @@ fn default_env_colors() -> EnvColorMap {
         "local".into(),
         EnvColor {
             fg: "#FFFFFF".into(),
-            bg: "#0066CC".into(),
-            badge: "🔵".into(),
+            bg: "#00AA00".into(),
+            badge: "🟢".into(),
             label: "LOCAL".into(),
         },
     );
@@ -451,7 +451,7 @@ mod tests {
         assert!(config.settings.show_env_column);
         assert_eq!(
             config.settings.tab_title_template,
-            "{badge} {label} — {name}"
+            "{badge} [{label}] — {name}"
         );
         assert!(config.settings.default_user.is_none());
         assert!(config.bookmarks.is_empty());

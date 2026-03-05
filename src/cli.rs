@@ -145,6 +145,9 @@ pub enum Commands {
         concurrency: usize,
     },
 
+    /// Reset terminal tab title and color (use after abnormal sshore exit).
+    ResetTab,
+
     /// Export bookmarks to a portable TOML file.
     Export {
         /// Filter by environment.

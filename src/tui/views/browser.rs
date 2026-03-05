@@ -1119,12 +1119,50 @@ fn draw(
         .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
         .split(main_chunks[1]);
 
+    // Build remote context for environment-colored remote pane indicators
+    let remote_ctx = {
+        let env_color = match state.env.to_lowercase().as_str() {
+            "production" => Color::Red,
+            "staging" => Color::Yellow,
+            "development" => Color::Green,
+            "local" => Color::Blue,
+            "testing" => Color::Cyan,
+            _ => Color::White,
+        };
+        let env_label = match state.env.to_lowercase().as_str() {
+            "production" => "PROD",
+            "staging" => "STG",
+            "development" => "DEV",
+            "local" => "LOCAL",
+            "testing" => "TEST",
+            _ => &state.env,
+        };
+        RemoteContext {
+            env_color,
+            env_tint: dim_color(env_color, 55),
+            env_label: env_label.to_uppercase(),
+            bookmark_name: state.bookmark_name.clone(),
+        }
+    };
+
+    let left_ctx = if state.left_label == PaneLabel::Remote {
+        Some(&remote_ctx)
+    } else {
+        None
+    };
+    let right_ctx = if state.right_label == PaneLabel::Remote {
+        Some(&remote_ctx)
+    } else {
+        None
+    };
+
     draw_pane(
         frame,
         left_pane,
         pane_chunks[0],
         state.active_pane == Side::Left,
         state.left_label,
+        left_ctx,
     );
     draw_pane(
         frame,
@@ -1132,6 +1170,7 @@ fn draw(
         pane_chunks[1],
         state.active_pane == Side::Right,
         state.right_label,
+        right_ctx,
     );
 
     // Filter bar
@@ -2166,29 +2205,87 @@ fn format_transfer_complete(
 }
 
 /// Draw a single pane.
+/// Context passed to `draw_pane` for remote-panel visual indicators.
+struct RemoteContext {
+    /// Environment background color (e.g. red for production).
+    env_color: Color,
+    /// Dimmed version of env_color for subtle background tint.
+    env_tint: Color,
+    /// Short env label (e.g. "PROD").
+    env_label: String,
+    /// Bookmark name (e.g. "prod-web-01").
+    bookmark_name: String,
+}
+
+/// Dim an RGB color to ~15% intensity for a subtle background tint.
+/// For non-RGB colors, returns a conservative dark tint.
+fn dim_color(color: Color, intensity: u8) -> Color {
+    match color {
+        Color::Rgb(r, g, b) => Color::Rgb(
+            (r as u16 * intensity as u16 / 255) as u8,
+            (g as u16 * intensity as u16 / 255) as u8,
+            (b as u16 * intensity as u16 / 255) as u8,
+        ),
+        Color::Red => Color::Rgb(intensity, 0, 0),
+        Color::Yellow => Color::Rgb(intensity, intensity, 0),
+        Color::Green => Color::Rgb(0, intensity, 0),
+        Color::Blue => Color::Rgb(0, 0, intensity),
+        Color::Cyan => Color::Rgb(0, intensity, intensity),
+        Color::Magenta => Color::Rgb(intensity, 0, intensity),
+        _ => Color::Rgb(intensity / 3, intensity / 3, intensity / 3),
+    }
+}
+
 fn draw_pane(
     frame: &mut Frame,
     pane: &mut PaneState,
     area: Rect,
     is_active: bool,
     label: PaneLabel,
+    remote_ctx: Option<&RemoteContext>,
 ) {
-    let border_style = if is_active {
+    let is_remote = label == PaneLabel::Remote;
+
+    // 1. Border color: env color for remote, default for local
+    let border_style = if is_remote {
+        if let Some(ctx) = remote_ctx {
+            let border_color = if is_active {
+                ctx.env_color
+            } else {
+                dim_color(ctx.env_color, 128)
+            };
+            Style::default().fg(border_color)
+        } else if is_active {
+            Style::default().fg(Color::Cyan)
+        } else {
+            Style::default().fg(Color::DarkGray)
+        }
+    } else if is_active {
         Style::default().fg(Color::Cyan)
     } else {
         Style::default().fg(Color::DarkGray)
     };
 
-    let (badge_text, badge_style) = match label {
-        PaneLabel::Local => (" LOCAL ", Style::default().fg(Color::White).bg(Color::Blue)),
-        PaneLabel::Remote => (
-            " REMOTE ",
+    // 2. Title with colored env badge for remote pane
+    //    Remote panes always show "◆" prefix so they're visually distinct from local
+    //    panes even when the env tier is "local".
+    let (badge_text, badge_style) = match (label, remote_ctx) {
+        (PaneLabel::Remote, Some(ctx)) => (
+            format!(" \u{25c6} {} {} ", ctx.env_label, ctx.bookmark_name),
+            Style::default().fg(Color::White).bg(ctx.env_color),
+        ),
+        (PaneLabel::Remote, None) => (
+            " \u{25c6} REMOTE ".to_string(),
             Style::default().fg(Color::White).bg(Color::Magenta),
+        ),
+        (PaneLabel::Local, _) => (
+            " LOCAL ".to_string(),
+            Style::default().fg(Color::White).bg(Color::Blue),
         ),
     };
 
     // Reserve space for badge + padding in the title
-    let badge_len = badge_text.len() + 2; // " LOCAL " + " "
+    let badge_len = badge_text.len() + 2;
     let max_chars = (area.width as usize).saturating_sub(badge_len + 4);
     let char_count = pane.cwd.chars().count();
     let cwd_display = if char_count > max_chars {
@@ -2200,7 +2297,7 @@ fn draw_pane(
     };
 
     let title = Line::from(vec![
-        Span::styled(badge_text, badge_style),
+        Span::styled(&badge_text, badge_style),
         Span::raw(format!(" {} ", cwd_display)),
     ]);
 
@@ -2208,6 +2305,13 @@ fn draw_pane(
         .title(title)
         .borders(Borders::ALL)
         .border_style(border_style);
+
+    // 3. Background tint for remote pane cells
+    let bg_tint = if is_remote {
+        remote_ctx.map(|ctx| ctx.env_tint)
+    } else {
+        None
+    };
 
     let items: Vec<ListItem> = pane
         .entries
@@ -2231,7 +2335,7 @@ fn draw_pane(
                 size_str,
             );
 
-            let style = if is_marked {
+            let mut style = if is_marked {
                 Style::default()
                     .fg(Color::Yellow)
                     .add_modifier(Modifier::BOLD)
@@ -2241,17 +2345,29 @@ fn draw_pane(
                 Style::default()
             };
 
+            // Apply subtle background tint for remote pane
+            if let Some(tint) = bg_tint {
+                style = style.bg(tint);
+            }
+
             ListItem::new(text).style(style)
         })
         .collect();
 
+    let highlight_bg = if is_active {
+        if let Some(ctx) = remote_ctx {
+            // Brighter tint for the selected row in remote pane
+            dim_color(ctx.env_color, 100)
+        } else {
+            Color::DarkGray
+        }
+    } else {
+        Color::Black
+    };
+
     let list = List::new(items).block(block).highlight_style(
         Style::default()
-            .bg(if is_active {
-                Color::DarkGray
-            } else {
-                Color::Black
-            })
+            .bg(highlight_bg)
             .add_modifier(Modifier::BOLD),
     );
 

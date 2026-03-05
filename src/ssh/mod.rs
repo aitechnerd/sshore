@@ -1005,6 +1005,7 @@ async fn run_proxy_loop(
     let mut writer = channel_tx.make_writer();
 
     let mut stdout = std::io::stdout();
+    let mut osc_stripper = terminal_theme::OscTitleStripper::new();
     let mut awaiting_confirm = false;
     let mut capturing_pw: Option<Zeroizing<String>> = None;
     // Captured sudo password waiting for auth confirmation from the remote.
@@ -1071,7 +1072,9 @@ async fn run_proxy_loop(
                 msg = channel_rx.wait() => {
                     match msg {
                         Some(ChannelMsg::Data { ref data }) => {
-                            match stdout.write_all(data) {
+                            // Strip remote shell title sequences to preserve sshore's tab title
+                            let filtered = osc_stripper.strip(data);
+                            match stdout.write_all(&filtered) {
                                 Ok(()) => { let _ = stdout.flush(); }
                                 Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => {
                                     tracing::debug!("stdout broken pipe");
@@ -1356,6 +1359,18 @@ async fn run_proxy_loop(
                         let _ =
                             write!(stdout, "\r\n\x1b[31m[sshore] Browser error: {e}\x1b[0m\r\n");
                         let _ = stdout.flush();
+                    }
+                }
+
+                // Re-apply SSH session theming (BrowserGuard resets it on drop)
+                if let Ok(cfg) = config::load_with_override(cfg_override) {
+                    let bm_name = session_info.bookmark_name.as_deref();
+                    if let Some(bm) = cfg
+                        .bookmarks
+                        .iter()
+                        .find(|b| Some(b.name.as_str()) == bm_name)
+                    {
+                        terminal_theme::reapply_theme(bm, &cfg.settings);
                     }
                 }
 

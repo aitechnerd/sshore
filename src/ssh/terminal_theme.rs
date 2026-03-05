@@ -40,9 +40,16 @@ fn set_tab_title(title: &str) {
     let _ = stdout.flush();
 }
 
-/// Restore the previous window title from the terminal's title stack (xterm CSI 23;0t).
+/// Restore the previous window title.
+/// First sets an empty title via OSC 0 (tells the terminal to use its default title),
+/// then pops the title stack via CSI 23;0t for terminals that support it.
+/// The empty-title approach works universally (iTerm2, Terminal.app, kitty, etc.)
+/// while the stack pop is a best-effort bonus for xterm-compatible terminals.
 fn reset_tab_title() {
     let mut stdout = std::io::stdout();
+    // Set empty title — terminal reverts to its default (e.g. shell process name)
+    let _ = write!(stdout, "\x1b]0;\x07");
+    // Also try popping the title stack for xterm-compatible terminals
     let _ = write!(stdout, "\x1b[23;0t");
     let _ = stdout.flush();
 }

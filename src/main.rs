@@ -204,9 +204,7 @@ async fn main() -> Result<()> {
         }
     }
 
-    // Safety net: terminate process to kill any lingering OS threads that
-    // might have survived normal cleanup (e.g. blocked stdin reads).
-    std::process::exit(0);
+    Ok(())
 }
 
 /// Check if the invoked subcommand name collides with an existing bookmark name.

@@ -908,11 +908,30 @@ fn offer_save_password(ctx: &AuthContext<'_>, password: &str) {
 
 /// Prompt the user for a password on stderr (so it doesn't interfere with SSH I/O).
 fn prompt_password(user: &str) -> Result<Zeroizing<String>> {
+    struct RawModeGuard {
+        disable_on_drop: bool,
+    }
+
+    impl Drop for RawModeGuard {
+        fn drop(&mut self) {
+            if self.disable_on_drop {
+                let _ = crossterm::terminal::disable_raw_mode();
+            }
+        }
+    }
+
     eprint!("{user}'s password: ");
     std::io::stderr().flush()?;
 
     // Read password without echo
-    crossterm::terminal::enable_raw_mode()?;
+    let was_raw = crossterm::terminal::is_raw_mode_enabled().unwrap_or(false);
+    if !was_raw {
+        crossterm::terminal::enable_raw_mode()?;
+    }
+    let _raw_guard = RawModeGuard {
+        disable_on_drop: !was_raw,
+    };
+
     let mut password = Zeroizing::new(String::new());
     loop {
         if let crossterm::event::Event::Key(key) = crossterm::event::read()? {
@@ -923,7 +942,6 @@ fn prompt_password(user: &str) -> Result<Zeroizing<String>> {
                     password.pop();
                 }
                 crossterm::event::KeyCode::Esc => {
-                    crossterm::terminal::disable_raw_mode()?;
                     eprintln!();
                     bail!("Authentication cancelled");
                 }
@@ -931,7 +949,6 @@ fn prompt_password(user: &str) -> Result<Zeroizing<String>> {
             }
         }
     }
-    crossterm::terminal::disable_raw_mode()?;
     eprintln!(); // Newline after password entry
 
     Ok(password)

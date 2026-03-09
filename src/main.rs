@@ -701,10 +701,29 @@ fn cmd_password_list(cfg_override: Option<&str>) -> Result<()> {
 
 /// Read a password from the terminal without echoing characters.
 fn read_password_from_tty(prompt: &str) -> Result<Zeroizing<String>> {
+    struct RawModeGuard {
+        disable_on_drop: bool,
+    }
+
+    impl Drop for RawModeGuard {
+        fn drop(&mut self) {
+            if self.disable_on_drop {
+                let _ = crossterm::terminal::disable_raw_mode();
+            }
+        }
+    }
+
     eprint!("{prompt}");
     io::stderr().flush()?;
 
-    crossterm::terminal::enable_raw_mode()?;
+    let was_raw = crossterm::terminal::is_raw_mode_enabled().unwrap_or(false);
+    if !was_raw {
+        crossterm::terminal::enable_raw_mode()?;
+    }
+    let _raw_guard = RawModeGuard {
+        disable_on_drop: !was_raw,
+    };
+
     let mut password = Zeroizing::new(String::new());
     loop {
         if let crossterm::event::Event::Key(key) = crossterm::event::read()? {
@@ -715,7 +734,6 @@ fn read_password_from_tty(prompt: &str) -> Result<Zeroizing<String>> {
                     password.pop();
                 }
                 crossterm::event::KeyCode::Esc => {
-                    crossterm::terminal::disable_raw_mode()?;
                     eprintln!();
                     bail!("Cancelled");
                 }
@@ -723,7 +741,6 @@ fn read_password_from_tty(prompt: &str) -> Result<Zeroizing<String>> {
             }
         }
     }
-    crossterm::terminal::disable_raw_mode()?;
     eprintln!(); // Newline after password entry
 
     Ok(password)

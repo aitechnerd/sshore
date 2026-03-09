@@ -943,38 +943,57 @@ fn prompt_password(user: &str) -> Result<Zeroizing<String>> {
 /// auth succeeded and the password is saved to the keychain.
 const SUDO_SAVE_GRACE: std::time::Duration = std::time::Duration::from_millis(1500);
 
+/// Owns SSH signal watcher tasks for the lifetime of one proxy session.
+/// Tasks are aborted on drop so repeated sessions don't leak detached listeners.
+struct SshSignalHandlers {
+    shutdown_rx: tokio::sync::watch::Receiver<bool>,
+    tasks: Vec<tokio::task::JoinHandle<()>>,
+}
+
+impl Drop for SshSignalHandlers {
+    fn drop(&mut self) {
+        for task in &self.tasks {
+            task.abort();
+        }
+    }
+}
+
 /// Set up signal handlers for graceful SSH session shutdown.
 #[cfg(unix)]
-async fn setup_ssh_signal_handlers() -> Result<tokio::sync::watch::Receiver<bool>> {
+async fn setup_ssh_signal_handlers() -> Result<SshSignalHandlers> {
     use tokio::signal::unix::{SignalKind, signal};
 
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let mut tasks = Vec::new();
 
     // SIGTERM — kill <pid>
     let tx = shutdown_tx.clone();
-    tokio::spawn(async move {
+    tasks.push(tokio::spawn(async move {
         if let Ok(mut sig) = signal(SignalKind::terminate()) {
             sig.recv().await;
             let _ = tx.send(true);
         }
-    });
+    }));
 
     // SIGHUP — terminal closed
     let tx = shutdown_tx.clone();
-    tokio::spawn(async move {
+    tasks.push(tokio::spawn(async move {
         if let Ok(mut sig) = signal(SignalKind::hangup()) {
             sig.recv().await;
             let _ = tx.send(true);
         }
-    });
+    }));
 
-    Ok(shutdown_rx)
+    Ok(SshSignalHandlers { shutdown_rx, tasks })
 }
 
 #[cfg(not(unix))]
-async fn setup_ssh_signal_handlers() -> Result<tokio::sync::watch::Receiver<bool>> {
+async fn setup_ssh_signal_handlers() -> Result<SshSignalHandlers> {
     let (_tx, rx) = tokio::sync::watch::channel(false);
-    Ok(rx)
+    Ok(SshSignalHandlers {
+        shutdown_rx: rx,
+        tasks: Vec::new(),
+    })
 }
 
 /// Whether the inner proxy loop should exit entirely or switch to browser mode.
@@ -1044,7 +1063,8 @@ async fn run_proxy_loop(
         has_snippets || !bookmark_trigger.is_empty() || !browser_trigger.is_empty();
 
     // Signal handlers for graceful shutdown
-    let mut shutdown_rx = setup_ssh_signal_handlers().await?;
+    let signal_handlers = setup_ssh_signal_handlers().await?;
+    let mut shutdown_rx = signal_handlers.shutdown_rx.clone();
 
     // SIGWINCH listener — inlined so channel_tx stays available after browser exits
     #[cfg(unix)]

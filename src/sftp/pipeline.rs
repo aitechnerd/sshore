@@ -2,26 +2,28 @@
 ///
 /// SFTP protocol allows multiple in-flight requests on a single channel.
 /// OpenSSH's sftp client uses 64 concurrent requests to keep the network pipe
-/// full regardless of RTT. This module implements the same approach using
-/// `RawSftpSession`, achieving near-zero application-level CPU overhead by
-/// reducing per-byte async wake-ups from ~3,000/sec to ~50/sec.
+/// full regardless of RTT. This module keeps a bounded set of in-flight
+/// requests without spawning a Tokio task per chunk.
 ///
-/// **Architecture**: Fire N concurrent `SSH_FXP_READ` requests via `JoinSet`,
+/// **Architecture**: Fire N concurrent `SSH_FXP_READ` requests via a bounded
+/// future queue,
 /// buffer out-of-order responses, and write to the local file in sequential
 /// order (preserving resume compatibility with `.part` files).
 use std::collections::HashMap;
+use std::future::Future;
 use std::io::{Read, Write};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::{Context, Result};
+use futures::stream::{FuturesUnordered, StreamExt};
 use russh_sftp::client::RawSftpSession;
+use russh_sftp::client::error::Error as SftpError;
 use russh_sftp::protocol::{FileAttributes, OpenFlags};
-use tokio::task::JoinSet;
 
 /// Max bytes per SFTP read/write request.
 /// Matches russh-sftp's internal `MAX_READ_LENGTH` (261,120 bytes ≈ 255 KB).
-const CHUNK_SIZE: u64 = 261_120;
+pub(crate) const CHUNK_SIZE: u64 = 261_120;
 
 /// Concurrent in-flight SFTP requests.
 /// OpenSSH uses 64. With 32 requests × 255 KB = ~8 MB in flight, which
@@ -115,23 +117,27 @@ async fn download_inner<F: FnMut(u64)>(
 ) -> Result<()> {
     let mut next_request_offset = start_offset;
     let mut next_write_offset = start_offset;
-    let mut set = JoinSet::new();
+    let mut inflight = FuturesUnordered::new();
     let mut buffer: HashMap<u64, Vec<u8>> = HashMap::new();
 
     // Seed the pipeline with concurrent read requests.
-    while set.len() < PIPELINE_DEPTH && next_request_offset < total_size {
-        spawn_read(&mut set, raw, handle_str, next_request_offset, total_size);
+    while inflight.len() < PIPELINE_DEPTH && next_request_offset < total_size {
+        queue_read(
+            &mut inflight,
+            raw,
+            handle_str,
+            next_request_offset,
+            total_size,
+        );
         next_request_offset += chunk_len(next_request_offset, total_size);
     }
 
     // Process responses and refill pipeline.
-    while let Some(join_result) = set.join_next().await {
+    while let Some((offset, sftp_result)) = inflight.next().await {
         if cancel.is_some_and(|c| c.load(Ordering::Relaxed)) {
-            set.abort_all();
             anyhow::bail!("Transfer cancelled");
         }
 
-        let (offset, sftp_result) = join_result.context("SFTP read task panicked")?;
         let data = sftp_result.map_err(|e| anyhow::anyhow!("SFTP read failed: {e}"))?;
 
         // Buffer the response (may arrive out of order).
@@ -149,7 +155,13 @@ async fn download_inner<F: FnMut(u64)>(
 
         // Refill pipeline.
         if next_request_offset < total_size {
-            spawn_read(&mut set, raw, handle_str, next_request_offset, total_size);
+            queue_read(
+                &mut inflight,
+                raw,
+                handle_str,
+                next_request_offset,
+                total_size,
+            );
             next_request_offset += chunk_len(next_request_offset, total_size);
         }
     }
@@ -214,28 +226,27 @@ async fn upload_inner<F: FnMut(u64)>(
     cancel: Option<&AtomicBool>,
 ) -> Result<()> {
     let mut offset = 0u64;
-    let mut set = JoinSet::new();
+    let mut inflight = FuturesUnordered::new();
 
     // Seed the pipeline.
-    while set.len() < PIPELINE_DEPTH && offset < total_size {
+    while inflight.len() < PIPELINE_DEPTH && offset < total_size {
         let len = chunk_len(offset, total_size) as usize;
         let n = read_chunk(local_file, len)?;
         if n.is_empty() {
             break;
         }
-        spawn_write(&mut set, raw, handle_str, offset, n);
-        offset += len as u64;
+        let written = n.len() as u64;
+        queue_write(&mut inflight, raw, handle_str, offset, n);
+        offset += written;
     }
 
     // Process ACKs and refill.
-    while let Some(join_result) = set.join_next().await {
+    while let Some(write_result) = inflight.next().await {
         if cancel.is_some_and(|c| c.load(Ordering::Relaxed)) {
-            set.abort_all();
             anyhow::bail!("Transfer cancelled");
         }
 
-        let bytes_written = join_result.context("SFTP write task panicked")?;
-        let bytes_written = bytes_written.map_err(|e| anyhow::anyhow!("SFTP write failed: {e}"))?;
+        let bytes_written = write_result.map_err(|e| anyhow::anyhow!("SFTP write failed: {e}"))?;
         on_bytes_written(bytes_written as u64);
 
         // Refill.
@@ -243,8 +254,9 @@ async fn upload_inner<F: FnMut(u64)>(
             let len = chunk_len(offset, total_size) as usize;
             let n = read_chunk(local_file, len)?;
             if !n.is_empty() {
-                spawn_write(&mut set, raw, handle_str, offset, n);
-                offset += len as u64;
+                let written = n.len() as u64;
+                queue_write(&mut inflight, raw, handle_str, offset, n);
+                offset += written;
             }
         }
     }
@@ -269,12 +281,14 @@ fn read_chunk(file: &mut impl Read, len: usize) -> Result<Vec<u8>> {
     Ok(buf)
 }
 
-/// Spawn a pipelined SFTP read request.
-fn spawn_read(
-    set: &mut JoinSet<(
-        u64,
-        Result<russh_sftp::protocol::Data, russh_sftp::client::error::Error>,
-    )>,
+type ReadRequest = std::pin::Pin<
+    Box<dyn Future<Output = (u64, Result<russh_sftp::protocol::Data, SftpError>)> + Send>,
+>;
+type WriteRequest = std::pin::Pin<Box<dyn Future<Output = Result<usize, SftpError>> + Send>>;
+
+/// Queue a pipelined SFTP read request without spawning a task.
+fn queue_read(
+    inflight: &mut FuturesUnordered<ReadRequest>,
     raw: &Arc<RawSftpSession>,
     handle_str: &str,
     offset: u64,
@@ -283,12 +297,14 @@ fn spawn_read(
     let len = chunk_len(offset, total_size) as u32;
     let r = Arc::clone(raw);
     let h = handle_str.to_string();
-    set.spawn(async move { (offset, r.read(h, offset, len).await) });
+    inflight.push(Box::pin(
+        async move { (offset, r.read(h, offset, len).await) },
+    ));
 }
 
-/// Spawn a pipelined SFTP write request.
-fn spawn_write(
-    set: &mut JoinSet<Result<usize, russh_sftp::client::error::Error>>,
+/// Queue a pipelined SFTP write request without spawning a task.
+fn queue_write(
+    inflight: &mut FuturesUnordered<WriteRequest>,
     raw: &Arc<RawSftpSession>,
     handle_str: &str,
     offset: u64,
@@ -297,10 +313,10 @@ fn spawn_write(
     let r = Arc::clone(raw);
     let h = handle_str.to_string();
     let len = data.len();
-    set.spawn(async move {
+    inflight.push(Box::pin(async move {
         r.write(h, offset, data).await?;
         Ok(len)
-    });
+    }));
 }
 
 /// Calculate chunk length, clamping to file boundary.

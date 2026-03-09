@@ -1,7 +1,7 @@
 pub mod pipeline;
 pub mod shortcuts;
 
-use std::io::{self, BufRead, BufWriter, Write};
+use std::io::{self, BufRead, BufReader, BufWriter, Write};
 
 use anyhow::{Context, Result, bail};
 use russh_sftp::client::SftpSession;
@@ -302,10 +302,9 @@ async fn cmd_get(
         .context("Failed to open transfer channel")?;
     let raw = pipeline::create_raw_session(channel).await?;
 
-    let mut local_file = BufWriter::new(
-        std::fs::File::create(local)
-            .with_context(|| format!("Failed to create local file {local}"))?,
-    );
+    let local_file = std::fs::File::create(local)
+        .with_context(|| format!("Failed to create local file {local}"))?;
+    let mut local_file = BufWriter::with_capacity((pipeline::CHUNK_SIZE * 2) as usize, local_file);
 
     let mut progress = ProgressBar::new(total);
     pipeline::download(
@@ -345,8 +344,9 @@ async fn cmd_put(
         .context("Failed to open transfer channel")?;
     let raw = pipeline::create_raw_session(channel).await?;
 
-    let mut local_file =
+    let local_file =
         std::fs::File::open(local).with_context(|| format!("Failed to open local file {local}"))?;
+    let mut local_file = BufReader::with_capacity((pipeline::CHUNK_SIZE * 2) as usize, local_file);
 
     let mut progress = ProgressBar::new(total);
     pipeline::upload(

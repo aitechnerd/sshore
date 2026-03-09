@@ -1,4 +1,4 @@
-use std::io::BufWriter;
+use std::io::{BufReader, BufWriter};
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -180,7 +180,7 @@ impl SftpBackend {
     }
 
     /// Download with optional progress tracking and cancellation.
-    /// Uses pipelined SFTP (32 concurrent requests) for near-zero CPU overhead.
+    /// Uses pipelined SFTP with bounded in-flight requests.
     pub async fn download_with_progress(
         &self,
         remote_path: &str,
@@ -210,7 +210,8 @@ impl SftpBackend {
 
         let local_file = std::fs::File::create(local_path)
             .with_context(|| format!("Failed to create: {}", local_path.display()))?;
-        let mut local_file = BufWriter::new(local_file);
+        let mut local_file =
+            BufWriter::with_capacity((pipeline::CHUNK_SIZE * 2) as usize, local_file);
 
         pipeline::download(
             &raw,
@@ -234,7 +235,7 @@ impl SftpBackend {
     }
 
     /// Upload with optional progress tracking and cancellation.
-    /// Uses pipelined SFTP (32 concurrent requests) for near-zero CPU overhead.
+    /// Uses pipelined SFTP with bounded in-flight requests.
     pub async fn upload_with_progress(
         &self,
         local_path: &Path,
@@ -258,8 +259,10 @@ impl SftpBackend {
             .context("Failed to open transfer channel")?;
         let raw = pipeline::create_raw_session(channel).await?;
 
-        let mut local_file = std::fs::File::open(local_path)
+        let local_file = std::fs::File::open(local_path)
             .with_context(|| format!("Failed to open: {}", local_path.display()))?;
+        let mut local_file =
+            BufReader::with_capacity((pipeline::CHUNK_SIZE * 2) as usize, local_file);
 
         pipeline::upload(
             &raw,

@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 use tokio::io::copy_bidirectional;
 use tokio::net::TcpListener;
 use tokio::sync::Mutex;
+use tokio::sync::oneshot;
 
 use crate::config::model::{AppConfig, validate_hostname};
 
@@ -17,6 +18,12 @@ use super::client::RemoteForwardMap;
 
 /// Shared handle to an SSH session, wrapped for concurrent access.
 type SharedSession = Arc<Mutex<russh::client::Handle<super::client::SshoreHandler>>>;
+
+/// Runtime handle for a local (-L) forward listener task.
+struct LocalForwardRuntime {
+    shutdown_tx: Option<oneshot::Sender<()>>,
+    task: tokio::task::JoinHandle<()>,
+}
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -369,7 +376,10 @@ pub fn active_tunnel_bookmarks() -> HashSet<String> {
 
 /// Run a local port forward (-L): binds a local listener and bridges each
 /// accepted connection through the SSH session to the remote target.
-async fn run_local_forward(session: SharedSession, spec: &ForwardSpec) -> Result<()> {
+async fn run_local_forward(
+    session: SharedSession,
+    spec: &ForwardSpec,
+) -> Result<LocalForwardRuntime> {
     let addr = format!("127.0.0.1:{}", spec.local_port);
     let listener = TcpListener::bind(&addr)
         .await
@@ -382,46 +392,70 @@ async fn run_local_forward(session: SharedSession, spec: &ForwardSpec) -> Result
 
     let remote_host = spec.remote_host.clone();
     let remote_port = spec.remote_port as u32;
+    let (shutdown_tx, mut shutdown_rx) = oneshot::channel::<()>();
 
-    tokio::spawn(async move {
+    let task = tokio::spawn(async move {
         loop {
-            let (mut tcp_stream, _peer) = match listener.accept().await {
-                Ok(conn) => conn,
-                Err(e) => {
-                    eprintln!("Warning: failed to accept connection: {e}");
-                    continue;
+            tokio::select! {
+                _ = &mut shutdown_rx => {
+                    break;
                 }
-            };
-
-            let session = Arc::clone(&session);
-            let host = remote_host.clone();
-
-            tokio::spawn(async move {
-                let channel = {
-                    let handle = session.lock().await;
-                    handle
-                        .channel_open_direct_tcpip(&host, remote_port, "127.0.0.1", 0)
-                        .await
-                };
-
-                match channel {
-                    Ok(channel) => {
-                        let mut channel_stream = channel.into_stream();
-                        if let Err(e) =
-                            copy_bidirectional(&mut tcp_stream, &mut channel_stream).await
-                        {
-                            let _ = e; // Normal when either side closes
+                accept_result = listener.accept() => {
+                    let (mut tcp_stream, _peer) = match accept_result {
+                        Ok(conn) => conn,
+                        Err(e) => {
+                            eprintln!("Warning: failed to accept connection: {e}");
+                            continue;
                         }
-                    }
-                    Err(e) => {
-                        eprintln!("Warning: failed to open direct-tcpip channel: {e}");
-                    }
+                    };
+
+                    let session = Arc::clone(&session);
+                    let host = remote_host.clone();
+
+                    tokio::spawn(async move {
+                        let channel = {
+                            let handle = session.lock().await;
+                            handle
+                                .channel_open_direct_tcpip(&host, remote_port, "127.0.0.1", 0)
+                                .await
+                        };
+
+                        match channel {
+                            Ok(channel) => {
+                                let mut channel_stream = channel.into_stream();
+                                if let Err(e) =
+                                    copy_bidirectional(&mut tcp_stream, &mut channel_stream).await
+                                {
+                                    let _ = e; // Normal when either side closes
+                                }
+                            }
+                            Err(e) => {
+                                eprintln!("Warning: failed to open direct-tcpip channel: {e}");
+                            }
+                        }
+                    });
                 }
-            });
+            }
         }
     });
 
-    Ok(())
+    Ok(LocalForwardRuntime {
+        shutdown_tx: Some(shutdown_tx),
+        task,
+    })
+}
+
+/// Stop local forward listener tasks and wait for them to exit.
+async fn stop_local_forwards(local_forwards: &mut Vec<LocalForwardRuntime>) {
+    for forward in local_forwards.iter_mut() {
+        if let Some(tx) = forward.shutdown_tx.take() {
+            let _ = tx.send(());
+        }
+    }
+
+    while let Some(forward) = local_forwards.pop() {
+        let _ = forward.task.await;
+    }
 }
 
 /// Set up a remote port forward (-R): requests the server to listen on a port,
@@ -487,11 +521,12 @@ pub async fn run_foreground(
 ) -> Result<()> {
     let (session, remote_map) = super::establish_tunnel_session(config, bookmark_index).await?;
     let session = Arc::new(Mutex::new(session));
+    let mut local_forwards = Vec::new();
 
     for spec in forwards {
         match spec.direction {
             ForwardDirection::Local => {
-                run_local_forward(Arc::clone(&session), spec).await?;
+                local_forwards.push(run_local_forward(Arc::clone(&session), spec).await?);
             }
             ForwardDirection::Remote => {
                 setup_remote_forward(&session, spec, &remote_map).await?;
@@ -519,6 +554,7 @@ pub async fn run_foreground(
         .context("Failed to listen for Ctrl+C")?;
 
     eprintln!("\nShutting down tunnel...");
+    stop_local_forwards(&mut local_forwards).await;
     unregister_tunnel(&config.bookmarks[bookmark_index].name)?;
 
     Ok(())
@@ -595,6 +631,7 @@ async fn run_single_session(
 ) -> Result<()> {
     let (session, remote_map) = super::establish_tunnel_session(config, bookmark_index).await?;
     let session = Arc::new(Mutex::new(session));
+    let mut local_forwards = Vec::new();
 
     let bookmark_name = &config.bookmarks[bookmark_index].name;
     let _ = update_tunnel_status(bookmark_name, TunnelStatus::Connected, 0);
@@ -602,7 +639,7 @@ async fn run_single_session(
     for spec in forwards {
         match spec.direction {
             ForwardDirection::Local => {
-                run_local_forward(Arc::clone(&session), spec).await?;
+                local_forwards.push(run_local_forward(Arc::clone(&session), spec).await?);
             }
             ForwardDirection::Remote => {
                 setup_remote_forward(&session, spec, &remote_map).await?;
@@ -620,15 +657,18 @@ async fn run_single_session(
     };
 
     // Wait for the session to die or Ctrl+C
-    tokio::select! {
+    let result = tokio::select! {
         _ = wait_for_channel_close(channel) => {
-            bail!("SSH session closed unexpectedly");
+            Err(anyhow::anyhow!("SSH session closed unexpectedly"))
         }
         _ = tokio::signal::ctrl_c() => {
             // Clean exit
             Ok(())
         }
-    }
+    };
+
+    stop_local_forwards(&mut local_forwards).await;
+    result
 }
 
 /// Wait for an SSH channel to close (used to detect session death).

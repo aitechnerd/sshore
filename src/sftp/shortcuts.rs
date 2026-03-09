@@ -1,16 +1,15 @@
-use std::io::Write;
+use std::io::{BufWriter, Write};
 use std::time::Instant;
 
 use anyhow::{Context, Result, bail};
 use russh_sftp::client::SftpSession;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use crate::config::model::AppConfig;
 use crate::ssh;
+use crate::ssh::client::SshoreHandler;
 use crate::ssh::terminal_theme;
 
-/// Buffer size for file transfer chunks (32 KB).
-const TRANSFER_CHUNK_SIZE: usize = 32 * 1024;
+use super::pipeline;
 
 /// Minimum interval between progress bar redraws (100ms).
 const PROGRESS_THROTTLE_MS: u128 = 100;
@@ -87,8 +86,12 @@ fn find_bookmark_index(config: &AppConfig, name: &str) -> Result<usize> {
         })
 }
 
-/// Establish an SFTP session with theming applied.
-async fn open_sftp(config: &AppConfig, bookmark_name: &str) -> Result<(SftpSession, usize)> {
+/// Establish SSH session with theming applied. Returns the session handle and
+/// an `SftpSession` on the first channel (for metadata queries).
+async fn open_ssh_and_sftp(
+    config: &AppConfig,
+    bookmark_name: &str,
+) -> Result<(russh::client::Handle<SshoreHandler>, SftpSession, usize)> {
     let index = find_bookmark_index(config, bookmark_name)?;
     let session = ssh::establish_session(config, index).await?;
 
@@ -102,7 +105,7 @@ async fn open_sftp(config: &AppConfig, bookmark_name: &str) -> Result<(SftpSessi
     );
     terminal_theme::apply_theme_with_title(bookmark, settings, &title);
 
-    // Open SFTP subsystem
+    // Open SFTP subsystem on first channel (for metadata).
     let channel = session
         .channel_open_session()
         .await
@@ -117,14 +120,14 @@ async fn open_sftp(config: &AppConfig, bookmark_name: &str) -> Result<(SftpSessi
         .await
         .context("Failed to initialize SFTP session")?;
 
-    Ok((sftp, index))
+    Ok((session, sftp, index))
 }
 
-/// Download a file from a remote server.
+/// Download a file from a remote server using pipelined SFTP.
 ///
 /// Writes to a `.part` tempfile first and renames to the final path on success,
 /// preventing partial failures from leaving corrupted files at the target path.
-/// If `resume` is true and a partial `.part` file exists, seek to its end and continue.
+/// If `resume` is true and a partial `.part` file exists, continue from its end.
 async fn download(
     config: &AppConfig,
     bookmark_name: &str,
@@ -132,7 +135,7 @@ async fn download(
     local_path: &str,
     resume: bool,
 ) -> Result<()> {
-    let (sftp, index) = open_sftp(config, bookmark_name).await?;
+    let (session, sftp, index) = open_ssh_and_sftp(config, bookmark_name).await?;
     let display_name = &config.bookmarks[index].name;
 
     let meta = sftp
@@ -142,17 +145,12 @@ async fn download(
 
     let total = meta.size.unwrap_or(0);
 
-    let mut remote_file = sftp
-        .open(remote_path)
-        .await
-        .with_context(|| format!("Failed to open {display_name}:{remote_path}"))?;
-
-    // Write to a .part file to avoid corrupting the final path on partial failure
+    // Write to a .part file to avoid corrupting the final path on partial failure.
     let part_path = format!("{local_path}.part");
 
-    // Check if the final file is already complete
+    // Check if the final file is already complete.
     if resume
-        && let Ok(local_meta) = tokio::fs::metadata(local_path).await
+        && let Ok(local_meta) = std::fs::metadata(local_path)
         && local_meta.len() >= total
     {
         eprintln!(
@@ -163,63 +161,57 @@ async fn download(
         return Ok(());
     }
 
-    // Resume support: check the .part file for a previous incomplete download
+    // Resume support: check the .part file for a previous incomplete download.
     let mut offset: u64 = 0;
-    let mut local_file = if resume {
-        if let Ok(part_meta) = tokio::fs::metadata(&part_path).await {
+    let local_file: std::fs::File = if resume {
+        if let Ok(part_meta) = std::fs::metadata(&part_path) {
             let part_size = part_meta.len();
             if part_size > 0 && part_size < total {
                 eprintln!("Resuming from {}", format_bytes(part_size));
-                use tokio::io::AsyncSeekExt;
-                remote_file
-                    .seek(std::io::SeekFrom::Start(part_size))
-                    .await
-                    .with_context(|| format!("Failed to seek remote file to offset {part_size}"))?;
                 offset = part_size;
-                tokio::fs::OpenOptions::new()
+                std::fs::OpenOptions::new()
                     .append(true)
                     .open(&part_path)
-                    .await
                     .with_context(|| format!("Failed to open {part_path} for append"))?
             } else {
-                tokio::fs::File::create(&part_path)
-                    .await
+                std::fs::File::create(&part_path)
                     .with_context(|| format!("Failed to create {part_path}"))?
             }
         } else {
-            tokio::fs::File::create(&part_path)
-                .await
+            std::fs::File::create(&part_path)
                 .with_context(|| format!("Failed to create {part_path}"))?
         }
     } else {
-        tokio::fs::File::create(&part_path)
-            .await
+        std::fs::File::create(&part_path)
             .with_context(|| format!("Failed to create {part_path}"))?
     };
 
     eprintln!("{display_name}:{remote_path}");
+
+    // Open a dedicated pipelined SFTP channel for the transfer.
+    let channel = session
+        .channel_open_session()
+        .await
+        .context("Failed to open transfer channel")?;
+    let raw = pipeline::create_raw_session(channel).await?;
+
+    let mut local_file = BufWriter::new(local_file);
     let mut progress = ProgressBar::new(total);
     progress.transferred = offset;
-    let mut buf = vec![0u8; TRANSFER_CHUNK_SIZE];
 
-    loop {
-        let n = remote_file
-            .read(&mut buf)
-            .await
-            .context("Failed to read from remote file")?;
-        if n == 0 {
-            break;
-        }
-        local_file
-            .write_all(&buf[..n])
-            .await
-            .context("Failed to write to local file")?;
-        progress.update(n as u64);
-    }
+    pipeline::download(
+        &raw,
+        remote_path,
+        &mut local_file,
+        total,
+        offset,
+        |bytes| progress.update(bytes),
+        None,
+    )
+    .await?;
 
-    // Rename .part to final path on success
-    tokio::fs::rename(&part_path, local_path)
-        .await
+    // Rename .part to final path on success.
+    std::fs::rename(&part_path, local_path)
         .with_context(|| format!("Failed to rename {part_path} to {local_path}"))?;
 
     progress.finish();
@@ -227,19 +219,18 @@ async fn download(
     Ok(())
 }
 
-/// Upload a file to a remote server.
+/// Upload a file to a remote server using pipelined SFTP.
 async fn upload(
     config: &AppConfig,
     bookmark_name: &str,
     local_path: &str,
     remote_path: &str,
 ) -> Result<()> {
-    let (sftp, index) = open_sftp(config, bookmark_name).await?;
+    let (session, _sftp, index) = open_ssh_and_sftp(config, bookmark_name).await?;
     let display_name = &config.bookmarks[index].name;
 
-    let local_meta = tokio::fs::metadata(local_path)
-        .await
-        .with_context(|| format!("Failed to stat local file {local_path}"))?;
+    let local_meta =
+        std::fs::metadata(local_path).with_context(|| format!("Failed to stat {local_path}"))?;
 
     if !local_meta.is_file() {
         terminal_theme::reset_theme();
@@ -248,38 +239,29 @@ async fn upload(
 
     let total = local_meta.len();
 
-    let mut local_file = tokio::fs::File::open(local_path)
+    eprintln!("{display_name}:{remote_path}");
+
+    // Open a dedicated pipelined SFTP channel for the transfer.
+    let channel = session
+        .channel_open_session()
         .await
+        .context("Failed to open transfer channel")?;
+    let raw = pipeline::create_raw_session(channel).await?;
+
+    let mut local_file = std::fs::File::open(local_path)
         .with_context(|| format!("Failed to open local file {local_path}"))?;
 
-    let mut remote_file = sftp
-        .create(remote_path)
-        .await
-        .with_context(|| format!("Failed to create {display_name}:{remote_path}"))?;
-
-    eprintln!("{display_name}:{remote_path}");
     let mut progress = ProgressBar::new(total);
-    let mut buf = vec![0u8; TRANSFER_CHUNK_SIZE];
 
-    loop {
-        let n = local_file
-            .read(&mut buf)
-            .await
-            .context("Failed to read local file")?;
-        if n == 0 {
-            break;
-        }
-        remote_file
-            .write_all(&buf[..n])
-            .await
-            .context("Failed to write to remote file")?;
-        progress.update(n as u64);
-    }
-
-    remote_file
-        .shutdown()
-        .await
-        .context("Failed to close remote file")?;
+    pipeline::upload(
+        &raw,
+        remote_path,
+        &mut local_file,
+        total,
+        |bytes| progress.update(bytes),
+        None,
+    )
+    .await?;
 
     progress.finish();
     terminal_theme::reset_theme();
@@ -289,7 +271,7 @@ async fn upload(
 /// Simple stderr-based progress bar for file transfers.
 pub struct ProgressBar {
     total_bytes: u64,
-    transferred: u64,
+    pub transferred: u64,
     start_time: Instant,
     last_draw: Instant,
 }

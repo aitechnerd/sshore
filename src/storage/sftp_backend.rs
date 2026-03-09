@@ -1,12 +1,13 @@
+use std::io::BufWriter;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use anyhow::{Context, Result};
 use russh_sftp::client::SftpSession;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use crate::config::model::AppConfig;
+use crate::sftp::pipeline;
 use crate::ssh;
 
 use super::FileEntry;
@@ -20,10 +21,6 @@ pub struct SftpBackend {
     /// SSH connection handle for spawning additional SFTP channels (background transfers).
     ssh_handle: Option<Arc<russh::client::Handle<crate::ssh::client::SshoreHandler>>>,
 }
-
-/// Buffer size for SFTP file transfers (256 KB).
-/// 256 KB is safe for >95% of SFTP servers (OpenSSH default buffer is 262 KB).
-const SFTP_CHUNK_SIZE: usize = 256 * 1024;
 
 impl SftpBackend {
     /// Create a new SFTP backend connected to a bookmark.
@@ -183,6 +180,7 @@ impl SftpBackend {
     }
 
     /// Download with optional progress tracking and cancellation.
+    /// Uses pipelined SFTP (32 concurrent requests) for near-zero CPU overhead.
     pub async fn download_with_progress(
         &self,
         remote_path: &str,
@@ -190,32 +188,44 @@ impl SftpBackend {
         progress: Option<&AtomicU64>,
         cancel: Option<&AtomicBool>,
     ) -> Result<()> {
-        let mut remote_file = self
+        let handle = self
+            .ssh_handle
+            .as_ref()
+            .context("No SSH handle available for transfer")?;
+
+        // Get file size for the pipeline.
+        let meta = self
             .sftp
-            .open(remote_path)
+            .metadata(remote_path)
             .await
-            .with_context(|| format!("Failed to open remote file: {remote_path}"))?;
+            .with_context(|| format!("Failed to stat remote file: {remote_path}"))?;
+        let total = meta.size.unwrap_or(0);
 
-        let mut local_file = tokio::fs::File::create(local_path)
+        // Open a dedicated channel for the pipelined transfer.
+        let channel = handle
+            .channel_open_session()
             .await
+            .context("Failed to open transfer channel")?;
+        let raw = pipeline::create_raw_session(channel).await?;
+
+        let local_file = std::fs::File::create(local_path)
             .with_context(|| format!("Failed to create: {}", local_path.display()))?;
+        let mut local_file = BufWriter::new(local_file);
 
-        let mut buf = vec![0u8; SFTP_CHUNK_SIZE];
-        loop {
-            if cancel.is_some_and(|c| c.load(Ordering::Relaxed)) {
-                anyhow::bail!("Transfer cancelled");
-            }
-            let n = remote_file.read(&mut buf).await?;
-            if n == 0 {
-                break;
-            }
-            local_file.write_all(&buf[..n]).await?;
-            if let Some(p) = progress {
-                p.fetch_add(n as u64, Ordering::Relaxed);
-            }
-        }
-
-        Ok(())
+        pipeline::download(
+            &raw,
+            remote_path,
+            &mut local_file,
+            total,
+            0,
+            |bytes| {
+                if let Some(p) = progress {
+                    p.fetch_add(bytes, Ordering::Relaxed);
+                }
+            },
+            cancel,
+        )
+        .await
     }
 
     pub async fn upload(&self, local_path: &Path, remote_path: &str) -> Result<()> {
@@ -224,6 +234,7 @@ impl SftpBackend {
     }
 
     /// Upload with optional progress tracking and cancellation.
+    /// Uses pipelined SFTP (32 concurrent requests) for near-zero CPU overhead.
     pub async fn upload_with_progress(
         &self,
         local_path: &Path,
@@ -231,33 +242,38 @@ impl SftpBackend {
         progress: Option<&AtomicU64>,
         cancel: Option<&AtomicBool>,
     ) -> Result<()> {
-        let mut local_file = tokio::fs::File::open(local_path)
+        let handle = self
+            .ssh_handle
+            .as_ref()
+            .context("No SSH handle available for transfer")?;
+
+        let local_meta = std::fs::metadata(local_path)
+            .with_context(|| format!("Failed to stat: {}", local_path.display()))?;
+        let total = local_meta.len();
+
+        // Open a dedicated channel for the pipelined transfer.
+        let channel = handle
+            .channel_open_session()
             .await
+            .context("Failed to open transfer channel")?;
+        let raw = pipeline::create_raw_session(channel).await?;
+
+        let mut local_file = std::fs::File::open(local_path)
             .with_context(|| format!("Failed to open: {}", local_path.display()))?;
 
-        let mut remote_file = self
-            .sftp
-            .create(remote_path)
-            .await
-            .with_context(|| format!("Failed to create remote file: {remote_path}"))?;
-
-        let mut buf = vec![0u8; SFTP_CHUNK_SIZE];
-        loop {
-            if cancel.is_some_and(|c| c.load(Ordering::Relaxed)) {
-                anyhow::bail!("Transfer cancelled");
-            }
-            let n = local_file.read(&mut buf).await?;
-            if n == 0 {
-                break;
-            }
-            remote_file.write_all(&buf[..n]).await?;
-            if let Some(p) = progress {
-                p.fetch_add(n as u64, Ordering::Relaxed);
-            }
-        }
-
-        remote_file.shutdown().await?;
-        Ok(())
+        pipeline::upload(
+            &raw,
+            remote_path,
+            &mut local_file,
+            total,
+            |bytes| {
+                if let Some(p) = progress {
+                    p.fetch_add(bytes, Ordering::Relaxed);
+                }
+            },
+            cancel,
+        )
+        .await
     }
 
     pub async fn delete(&self, path: &str) -> Result<()> {

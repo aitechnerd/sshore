@@ -1,13 +1,14 @@
+pub mod pipeline;
 pub mod shortcuts;
 
-use std::io::{self, BufRead, Write};
+use std::io::{self, BufRead, BufWriter, Write};
 
 use anyhow::{Context, Result, bail};
 use russh_sftp::client::SftpSession;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use crate::config::model::AppConfig;
 use crate::ssh;
+use crate::ssh::client::SshoreHandler;
 use crate::ssh::terminal_theme;
 
 use self::shortcuts::ProgressBar;
@@ -51,8 +52,8 @@ pub async fn open_session(config: &AppConfig, bookmark_index: usize) -> Result<(
     eprintln!("SFTP session opened. Remote directory: {cwd}");
     eprintln!("Type 'help' for available commands.");
 
-    // Run the interactive command loop
-    let result = run_command_loop(&sftp, cwd, is_production).await;
+    // Run the interactive command loop (pass SSH handle for pipelined transfers)
+    let result = run_command_loop(&sftp, &session, cwd, is_production).await;
 
     // Always reset theme, even on error
     terminal_theme::reset_theme();
@@ -63,6 +64,7 @@ pub async fn open_session(config: &AppConfig, bookmark_index: usize) -> Result<(
 /// Run the interactive SFTP command loop.
 async fn run_command_loop(
     sftp: &SftpSession,
+    session: &russh::client::Handle<SshoreHandler>,
     initial_cwd: String,
     is_production: bool,
 ) -> Result<()> {
@@ -124,7 +126,7 @@ async fn run_command_loop(
                             .map(|n| n.to_string_lossy().to_string())
                             .unwrap_or_else(|| "download".to_string())
                     });
-                    if let Err(e) = cmd_get(sftp, &remote, &local).await {
+                    if let Err(e) = cmd_get(sftp, session, &remote, &local).await {
                         eprintln!("get: {e}");
                     }
                 }
@@ -141,7 +143,7 @@ async fn run_command_loop(
                             .unwrap_or_else(|| "upload".to_string());
                         resolve_path(&cwd, &name)
                     });
-                    if let Err(e) = cmd_put(sftp, local, &remote).await {
+                    if let Err(e) = cmd_put(session, local, &remote).await {
                         eprintln!("put: {e}");
                     }
                 }
@@ -279,51 +281,56 @@ async fn cmd_ls(sftp: &SftpSession, path: &str) -> Result<()> {
     Ok(())
 }
 
-/// Download a remote file to a local path.
-async fn cmd_get(sftp: &SftpSession, remote: &str, local: &str) -> Result<()> {
+/// Download a remote file via pipelined SFTP on a dedicated channel.
+async fn cmd_get(
+    sftp: &SftpSession,
+    session: &russh::client::Handle<SshoreHandler>,
+    remote: &str,
+    local: &str,
+) -> Result<()> {
+    // Use the existing SftpSession for metadata.
     let meta = sftp
         .metadata(remote)
         .await
         .with_context(|| format!("Failed to stat {remote}"))?;
-
     let total = meta.size.unwrap_or(0);
 
-    let mut remote_file = sftp
-        .open(remote)
+    // Open a dedicated channel for the pipelined transfer.
+    let channel = session
+        .channel_open_session()
         .await
-        .with_context(|| format!("Failed to open {remote}"))?;
+        .context("Failed to open transfer channel")?;
+    let raw = pipeline::create_raw_session(channel).await?;
 
-    let mut local_file = tokio::fs::File::create(local)
-        .await
-        .with_context(|| format!("Failed to create local file {local}"))?;
+    let mut local_file = BufWriter::new(
+        std::fs::File::create(local)
+            .with_context(|| format!("Failed to create local file {local}"))?,
+    );
 
     let mut progress = ProgressBar::new(total);
-    let mut buf = vec![0u8; TRANSFER_CHUNK_SIZE];
-
-    loop {
-        let n = remote_file
-            .read(&mut buf)
-            .await
-            .context("Failed to read from remote file")?;
-        if n == 0 {
-            break;
-        }
-        local_file
-            .write_all(&buf[..n])
-            .await
-            .context("Failed to write to local file")?;
-        progress.update(n as u64);
-    }
+    pipeline::download(
+        &raw,
+        remote,
+        &mut local_file,
+        total,
+        0,
+        |b| progress.update(b),
+        None,
+    )
+    .await?;
 
     progress.finish();
     Ok(())
 }
 
-/// Upload a local file to a remote path.
-async fn cmd_put(sftp: &SftpSession, local: &str, remote: &str) -> Result<()> {
-    let local_meta = tokio::fs::metadata(local)
-        .await
-        .with_context(|| format!("Failed to stat local file {local}"))?;
+/// Upload a local file via pipelined SFTP on a dedicated channel.
+async fn cmd_put(
+    session: &russh::client::Handle<SshoreHandler>,
+    local: &str,
+    remote: &str,
+) -> Result<()> {
+    let local_meta =
+        std::fs::metadata(local).with_context(|| format!("Failed to stat local file {local}"))?;
 
     if !local_meta.is_file() {
         bail!("{local} is not a regular file");
@@ -331,37 +338,26 @@ async fn cmd_put(sftp: &SftpSession, local: &str, remote: &str) -> Result<()> {
 
     let total = local_meta.len();
 
-    let mut local_file = tokio::fs::File::open(local)
+    // Open a dedicated channel for the pipelined transfer.
+    let channel = session
+        .channel_open_session()
         .await
-        .with_context(|| format!("Failed to open local file {local}"))?;
+        .context("Failed to open transfer channel")?;
+    let raw = pipeline::create_raw_session(channel).await?;
 
-    let mut remote_file = sftp
-        .create(remote)
-        .await
-        .with_context(|| format!("Failed to create {remote}"))?;
+    let mut local_file =
+        std::fs::File::open(local).with_context(|| format!("Failed to open local file {local}"))?;
 
     let mut progress = ProgressBar::new(total);
-    let mut buf = vec![0u8; TRANSFER_CHUNK_SIZE];
-
-    loop {
-        let n = local_file
-            .read(&mut buf)
-            .await
-            .context("Failed to read local file")?;
-        if n == 0 {
-            break;
-        }
-        remote_file
-            .write_all(&buf[..n])
-            .await
-            .context("Failed to write to remote file")?;
-        progress.update(n as u64);
-    }
-
-    remote_file
-        .shutdown()
-        .await
-        .context("Failed to close remote file")?;
+    pipeline::upload(
+        &raw,
+        remote,
+        &mut local_file,
+        total,
+        |b| progress.update(b),
+        None,
+    )
+    .await?;
 
     progress.finish();
     Ok(())
@@ -454,9 +450,6 @@ Commands:
   exit / quit          Close SFTP session"
     );
 }
-
-/// Buffer size for file transfer chunks.
-const TRANSFER_CHUNK_SIZE: usize = 32 * 1024;
 
 #[cfg(test)]
 mod tests {

@@ -535,8 +535,15 @@ pub async fn exec_command(
             Some(ChannelMsg::ExitStatus { exit_status }) => {
                 exit_code = Some(exit_status);
             }
+            Some(ChannelMsg::ExitSignal { .. }) => {
+                if exit_code.is_none() {
+                    exit_code = Some(128);
+                }
+            }
             Some(ChannelMsg::Eof | ChannelMsg::Close) => break,
-            Some(_) => {}
+            Some(other) => {
+                tracing::trace!(?other, "exec: ignoring channel message");
+            }
             None => break,
         }
     }
@@ -644,8 +651,15 @@ async fn exec_command_quiet(
             Some(ChannelMsg::ExitStatus { exit_status }) => {
                 exit_code = Some(exit_status);
             }
+            Some(ChannelMsg::ExitSignal { .. }) => {
+                if exit_code.is_none() {
+                    exit_code = Some(128);
+                }
+            }
             Some(ChannelMsg::Eof | ChannelMsg::Close) => break,
-            Some(_) => {}
+            Some(other) => {
+                tracing::trace!(?other, "exec_quiet: ignoring channel message");
+            }
             None => break,
         }
     }
@@ -1191,6 +1205,10 @@ async fn run_proxy_loop(
                             tracing::debug!(exit_status, "remote exited");
                             break 'proxy ProxyAction::Exit;
                         }
+                        Some(ChannelMsg::ExitSignal { signal_name, .. }) => {
+                            tracing::debug!(?signal_name, "remote killed by signal");
+                            break 'proxy ProxyAction::Exit;
+                        }
                         Some(ChannelMsg::Eof) => {
                             tracing::debug!("channel EOF");
                             break 'proxy ProxyAction::Exit;
@@ -1199,7 +1217,9 @@ async fn run_proxy_loop(
                             tracing::debug!("channel closed by server");
                             break 'proxy ProxyAction::Exit;
                         }
-                        Some(_) => {}
+                        Some(other) => {
+                            tracing::trace!(?other, "ignoring channel message");
+                        }
                         None => {
                             tracing::debug!("channel stream ended (connection lost)");
                             break 'proxy ProxyAction::Exit;
@@ -1484,7 +1504,12 @@ async fn detect_remote_cwd(session: &russh::client::Handle<SshoreHandler>) -> Op
     loop {
         match rx.wait().await {
             Some(ChannelMsg::Data { ref data }) => output.extend_from_slice(data),
-            Some(ChannelMsg::Eof | ChannelMsg::Close | ChannelMsg::ExitStatus { .. }) => break,
+            Some(
+                ChannelMsg::Eof
+                | ChannelMsg::Close
+                | ChannelMsg::ExitStatus { .. }
+                | ChannelMsg::ExitSignal { .. },
+            ) => break,
             Some(_) => {}
             None => break,
         }

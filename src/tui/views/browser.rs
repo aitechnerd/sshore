@@ -568,7 +568,9 @@ pub async fn run(
                 Event::Resize(_, _) => {
                     needs_redraw = true;
                 }
-                _ => {}
+                other => {
+                    tracing::trace!(?other, "browser: ignoring event");
+                }
             }
         }
     }

@@ -361,7 +361,9 @@ fn event_loop(
                 Event::Resize(_, _) => {
                     needs_redraw = true;
                 }
-                _ => {}
+                other => {
+                    tracing::trace!(?other, "TUI: ignoring event");
+                }
             }
         }
 

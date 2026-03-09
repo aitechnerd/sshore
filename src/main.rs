@@ -943,6 +943,19 @@ fn cmd_tunnel_stop(bookmark_name: &str) -> Result<()> {
 
     let pid = entry.pid;
 
+    if !ssh::tunnel::pid_matches_tunnel_entry(pid, entry.started_at) {
+        eprintln!(
+            "Warning: PID {pid} no longer matches the original tunnel process start time. \
+             Refusing to kill to avoid terminating an unrelated process."
+        );
+        eprintln!("Removing stale tunnel entry for '{bookmark_name}'.");
+        state
+            .tunnels
+            .retain(|t| !t.bookmark.eq_ignore_ascii_case(bookmark_name));
+        save_tunnel_state(&state).context("Failed to update tunnel state")?;
+        return Ok(());
+    }
+
     // Terminate the tunnel process
     if terminate_process(pid) {
         println!("Stopped tunnel for '{bookmark_name}' (PID {pid}).");

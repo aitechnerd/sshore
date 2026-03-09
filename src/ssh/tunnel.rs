@@ -301,6 +301,61 @@ pub fn cleanup_stale_tunnels(state: &mut TunnelState) {
     state.tunnels.retain(|t| is_process_alive(t.pid));
 }
 
+/// Verify that a PID still belongs to the same tunnel process by comparing
+/// process start time to the tunnel entry's recorded start time.
+///
+/// This prevents killing an unrelated process when a stale PID has been reused.
+#[cfg(unix)]
+pub fn pid_matches_tunnel_entry(pid: u32, expected_started_at: DateTime<Utc>) -> bool {
+    use chrono::{Local, NaiveDateTime, TimeZone};
+
+    let output = match Command::new("ps")
+        .args(["-p", &pid.to_string(), "-o", "lstart="])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .output()
+    {
+        Ok(output) => output,
+        Err(_) => return false,
+    };
+
+    if !output.status.success() {
+        return false;
+    }
+
+    let raw = String::from_utf8_lossy(&output.stdout);
+    let line = raw.trim();
+    if line.is_empty() {
+        return false;
+    }
+
+    let naive = match NaiveDateTime::parse_from_str(line, "%a %b %e %H:%M:%S %Y") {
+        Ok(dt) => dt,
+        Err(_) => return false,
+    };
+
+    let started_local = match Local.from_local_datetime(&naive).single() {
+        Some(dt) => dt,
+        None => return false,
+    };
+
+    let started_utc = started_local.with_timezone(&Utc);
+    let drift_secs = started_utc
+        .signed_duration_since(expected_started_at)
+        .num_seconds()
+        .abs();
+
+    // Allow small clock/reporting drift between process creation and state write.
+    drift_secs <= 120
+}
+
+/// Non-Unix fallback: no robust start-time check available with current
+/// implementation, so keep previous behavior.
+#[cfg(not(unix))]
+pub fn pid_matches_tunnel_entry(_pid: u32, _expected_started_at: DateTime<Utc>) -> bool {
+    true
+}
+
 /// Get the set of bookmark names that have active tunnels.
 pub fn active_tunnel_bookmarks() -> HashSet<String> {
     let mut state = load_tunnel_state().unwrap_or_default();
@@ -581,9 +636,16 @@ async fn wait_for_channel_close(channel: russh::Channel<russh::client::Msg>) {
     let (mut rx, _tx) = channel.split();
     loop {
         match rx.wait().await {
-            Some(russh::ChannelMsg::Eof | russh::ChannelMsg::Close) => break,
+            Some(
+                russh::ChannelMsg::Eof
+                | russh::ChannelMsg::Close
+                | russh::ChannelMsg::ExitStatus { .. }
+                | russh::ChannelMsg::ExitSignal { .. },
+            ) => break,
             None => break,
-            _ => {}
+            Some(other) => {
+                tracing::trace!(?other, "tunnel: ignoring channel message");
+            }
         }
     }
 }

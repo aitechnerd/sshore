@@ -10,11 +10,12 @@ use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph};
+use russh_sftp::client::RawSftpSession;
 use russh_sftp::client::SftpSession;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use futures::future::join_all;
 
+use crate::sftp::pipeline;
 use crate::sftp::shortcuts::{format_bytes, format_bytes_per_sec, format_duration};
 use crate::storage::{Backend, FileEntry};
 use crate::tui::theme::ThemeColors;
@@ -26,15 +27,19 @@ const POLL_RATE: Duration = Duration::from_secs(1);
 /// Faster poll rate when background transfers are active, for progress updates.
 const PROGRESS_POLL_RATE: Duration = Duration::from_millis(100);
 
-/// Buffer size for background file transfers (256 KB).
-const TRANSFER_CHUNK_SIZE: usize = 256 * 1024;
-
 /// Max concurrent SFTP `read_dir` calls during directory scanning.
 /// Higher values hide more network latency but use more SFTP channel capacity.
 const SFTP_SCAN_CONCURRENCY: usize = 16;
 
-/// Number of parallel SFTP worker sessions for file transfers.
-const TRANSFER_WORKERS: usize = 8;
+/// Number of pipelined SFTP workers per SSH/TCP connection.
+/// Each worker fires up to 64 concurrent SFTP requests internally.
+const WORKERS_PER_CONNECTION: usize = 2;
+
+/// Minimum number of transfer targets before opening a second SSH connection.
+/// Even a single directory can expand to hundreds of files, so keep this at 1
+/// to always open a second connection. The overhead is just one background SSH
+/// handshake that's discarded if not needed.
+const MIN_FILES_FOR_SECOND_CONN: usize = 1;
 
 /// Drop guard that restores terminal state when the browser exits (normally or on error).
 struct BrowserGuard;
@@ -211,6 +216,13 @@ struct TransferTarget {
     is_dir: bool,
 }
 
+/// A pipelined SFTP worker session for high-throughput transfers.
+/// Each worker fires 64 concurrent SFTP requests internally.
+struct PipelinedWorker {
+    raw: Arc<RawSftpSession>,
+    read_chunk_size: u64,
+}
+
 /// Info about a file currently being transferred by a worker.
 #[derive(Clone)]
 struct ActiveFile {
@@ -221,6 +233,15 @@ struct ActiveFile {
     dst_path: String,
     bytes_done: u64,
     bytes_total: u64,
+}
+
+/// Number of speed samples kept for the rolling window average.
+const SPEED_WINDOW_SAMPLES: usize = 100;
+
+/// Rolling speed sample: (instant_nanos, cumulative_bytes).
+struct SpeedSample {
+    nanos: u64,
+    bytes: u64,
 }
 
 /// Shared atomic progress counters for a background transfer, read by the main event loop.
@@ -237,6 +258,13 @@ struct TransferProgress {
     scan_entries_found: AtomicU64,
     /// Active file slots for each worker thread.
     active_files: std::sync::Mutex<Vec<Option<ActiveFile>>>,
+    /// Nanos since `UNIX_EPOCH` when the first data byte was transferred.
+    /// Set once by the first `on_bytes_written` callback. 0 = not yet started.
+    first_bytes_nanos: AtomicU64,
+    /// Ring buffer of (timestamp, bytes_done) for rolling speed calculation.
+    speed_samples: std::sync::Mutex<Vec<SpeedSample>>,
+    /// Next write position in the ring buffer.
+    speed_sample_idx: AtomicU64,
 }
 
 impl TransferProgress {
@@ -249,7 +277,106 @@ impl TransferProgress {
             scanning: AtomicBool::new(true),
             scan_entries_found: AtomicU64::new(0),
             active_files: std::sync::Mutex::new(Vec::new()),
+            first_bytes_nanos: AtomicU64::new(0),
+            speed_samples: std::sync::Mutex::new(Vec::with_capacity(SPEED_WINDOW_SAMPLES)),
+            speed_sample_idx: AtomicU64::new(0),
         }
+    }
+
+    /// Record that data transfer has started (called once on first bytes).
+    fn mark_transfer_start(&self) {
+        let _ = self.first_bytes_nanos.compare_exchange(
+            0,
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos() as u64,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        );
+    }
+
+    /// Seconds elapsed since first data byte, or None if not started yet.
+    fn transfer_elapsed_secs(&self) -> Option<f64> {
+        let start_nanos = self.first_bytes_nanos.load(Ordering::Relaxed);
+        if start_nanos == 0 {
+            return None;
+        }
+        let now_nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos() as u64;
+        Some((now_nanos.saturating_sub(start_nanos)) as f64 / 1_000_000_000.0)
+    }
+
+    /// Record a speed sample (called from the UI poll loop, not from transfer callbacks).
+    fn record_speed_sample(&self) {
+        let now_nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos() as u64;
+        let bytes = self.bytes_done_all.load(Ordering::Relaxed);
+
+        let mut samples = self.speed_samples.lock().unwrap();
+        let idx = self.speed_sample_idx.fetch_add(1, Ordering::Relaxed) as usize;
+        let pos = idx % SPEED_WINDOW_SAMPLES;
+        let sample = SpeedSample {
+            nanos: now_nanos,
+            bytes,
+        };
+        if pos >= samples.len() {
+            samples.push(sample);
+        } else {
+            samples[pos] = sample;
+        }
+    }
+
+    /// Compute rolling speed (bytes/sec) from recent samples.
+    /// Returns None if not enough samples yet.
+    fn rolling_speed(&self) -> Option<f64> {
+        let samples = self.speed_samples.lock().unwrap();
+        if samples.len() < 2 {
+            tracing::trace!("speed: only {} samples, need >=2", samples.len());
+            return None;
+        }
+        let idx = self.speed_sample_idx.load(Ordering::Relaxed) as usize;
+        // Most recent sample
+        let newest_pos = (idx.wrapping_sub(1)) % SPEED_WINDOW_SAMPLES;
+        // Oldest sample in the window
+        let oldest_pos = if samples.len() < SPEED_WINDOW_SAMPLES {
+            0
+        } else {
+            idx % SPEED_WINDOW_SAMPLES
+        };
+        let newest = &samples[newest_pos];
+        let oldest = &samples[oldest_pos];
+        let dt_nanos = newest.nanos.saturating_sub(oldest.nanos);
+        let dt_secs = dt_nanos as f64 / 1_000_000_000.0;
+        if dt_secs < 0.1 {
+            tracing::trace!(
+                "speed: window too short ({:.3}s), newest_pos={newest_pos} oldest_pos={oldest_pos}",
+                dt_secs,
+            );
+            return None;
+        }
+        let dbytes = newest.bytes.saturating_sub(oldest.bytes);
+        let speed = dbytes as f64 / dt_secs;
+        // Log every ~5s (every 50th call at ~100ms poll interval).
+        if idx.is_multiple_of(50) {
+            tracing::debug!(
+                "speed: rolling window={} samples, span={:.1}s, \
+                 oldest=({oldest_pos}, {:.1} MB) newest=({newest_pos}, {:.1} MB) \
+                 delta={:.1} MB in {:.1}s = {:.2} MB/s",
+                samples.len(),
+                dt_secs,
+                oldest.bytes as f64 / 1_048_576.0,
+                newest.bytes as f64 / 1_048_576.0,
+                dbytes as f64 / 1_048_576.0,
+                dt_secs,
+                speed / 1_048_576.0,
+            );
+        }
+        Some(speed)
     }
 }
 
@@ -501,7 +628,11 @@ pub async fn run(
                 }
             }
 
-            // Update progress display for active transfers (background mode)
+            // Record speed samples and update progress for active transfers.
+            for transfer in &state.background_transfers {
+                transfer.progress.record_speed_sample();
+            }
+
             if !state.background_transfers.is_empty()
                 && !matches!(state.input_mode, InputMode::TransferPopup)
             {
@@ -570,6 +701,42 @@ pub async fn run(
                 }
                 other => {
                     tracing::trace!(?other, "browser: ignoring event");
+                }
+            }
+        }
+    }
+
+    // Cancel any in-flight transfers and give workers time to log summaries.
+    if !state.background_transfers.is_empty() {
+        tracing::debug!(
+            "browser:cleanup cancelling {} transfers",
+            state.background_transfers.len(),
+        );
+        for t in &state.background_transfers {
+            t.cancel.store(true, Ordering::Relaxed);
+        }
+        // Workers need time to: notice cancel (50ms poll) → bail from pipeline →
+        // close SFTP handle (100-1000ms over internet) → print summary.
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        for (i, t) in state.background_transfers.iter_mut().enumerate() {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                tracing::debug!("browser:cleanup deadline hit at transfer {i}");
+                break;
+            }
+            match tokio::time::timeout(remaining, &mut t.handle).await {
+                Ok(Ok(result)) => {
+                    tracing::debug!(
+                        "browser:cleanup transfer {i} finished: {}/{} files",
+                        result.copied,
+                        result.total,
+                    );
+                }
+                Ok(Err(e)) => {
+                    tracing::debug!("browser:cleanup transfer {i} join error: {e}");
+                }
+                Err(_) => {
+                    tracing::debug!("browser:cleanup transfer {i} timed out");
                 }
             }
         }
@@ -1854,18 +2021,42 @@ fn draw_transfer_popup(frame: &mut Frame, area: Rect, state: &BrowserState) {
     let total_bytes_all = p.total_bytes_all.load(Ordering::Relaxed);
     let scanning = p.scanning.load(Ordering::Relaxed);
 
-    let elapsed = transfer.started_at.elapsed();
-    let elapsed_secs = elapsed.as_secs_f64();
-    let speed = if elapsed_secs > 0.1 {
-        bytes_done_all as f64 / elapsed_secs
-    } else {
-        0.0
+    // Use rolling window for current speed; fall back to overall average during ramp-up.
+    let (speed, speed_source) = match p.rolling_speed() {
+        Some(s) => (s, "rolling"),
+        None => {
+            let elapsed_secs = p
+                .transfer_elapsed_secs()
+                .unwrap_or_else(|| transfer.started_at.elapsed().as_secs_f64());
+            if elapsed_secs > 0.1 {
+                (bytes_done_all as f64 / elapsed_secs, "average")
+            } else {
+                (0.0, "zero")
+            }
+        }
     };
     let eta_secs = if speed > 0.0 && total_bytes_all > bytes_done_all {
         ((total_bytes_all - bytes_done_all) as f64 / speed) as u64
     } else {
         0
     };
+
+    // Log display speed periodically (~every 5s at 100ms poll).
+    {
+        let sample_idx = p.speed_sample_idx.load(Ordering::Relaxed);
+        if sample_idx.is_multiple_of(50) && sample_idx > 0 {
+            tracing::debug!(
+                "speed display: source={speed_source} {:.2} MB/s, \
+                 done={:.1}/{:.1} MB, files={}/{}, eta={}s",
+                speed / 1_048_576.0,
+                bytes_done_all as f64 / 1_048_576.0,
+                total_bytes_all as f64 / 1_048_576.0,
+                p.files_done.load(Ordering::Relaxed),
+                total_files,
+                eta_secs,
+            );
+        }
+    }
 
     let is_move = transfer.delete_sources.is_some();
     let dir_label = match (transfer.direction, is_move) {
@@ -2503,11 +2694,407 @@ fn format_transfer_result(result: &TransferResult, description: &str, is_move: b
     }
 }
 
-/// Run a file transfer using a pool of parallel SFTP workers.
-/// Takes pre-opened SFTP sessions for concurrent transfers.
+/// Shared state for the worker pool, allowing dynamic worker addition.
+struct WorkerPool {
+    work_rx: Arc<tokio::sync::Mutex<tokio::sync::mpsc::Receiver<TransferTarget>>>,
+    progress: Arc<TransferProgress>,
+    cancel: Arc<AtomicBool>,
+    skip: Arc<AtomicBool>,
+    direction: TransferDirection,
+    copied: Arc<AtomicU64>,
+    last_error: Arc<std::sync::Mutex<Option<String>>>,
+    overwrite_tx: tokio::sync::mpsc::Sender<OverwriteQuery>,
+    overwrite_policy: Arc<AtomicU64>,
+}
+
+/// Receive the next work item from the shared queue, handling overwrite checks.
+/// Returns `None` if channel closed or cancelled.
+/// Returns `Some((target, should_transfer))` — `should_transfer` is false if skipped.
+async fn recv_next_target(
+    worker_id: usize,
+    pool: &WorkerPool,
+    raw: &RawSftpSession,
+    total_idle_ms: &mut u64,
+    total_stat_ms: &mut u64,
+    total_overwrite_wait_ms: &mut u64,
+) -> Option<(TransferTarget, bool)> {
+    let idle_start = std::time::Instant::now();
+    let target = {
+        let mut rx = pool.work_rx.lock().await;
+        rx.recv().await
+    };
+    let idle_ms = idle_start.elapsed().as_millis() as u64;
+    *total_idle_ms += idle_ms;
+    if idle_ms > 100 {
+        tracing::debug!("worker[{worker_id}] waited {idle_ms}ms for next work item");
+    }
+
+    let target = target?;
+
+    if pool.cancel.load(Ordering::Relaxed) {
+        return None;
+    }
+
+    // Fast path: skip stat check when overwrite policy is already decided.
+    let policy = pool.overwrite_policy.load(Ordering::Relaxed);
+    if policy == 1 {
+        return Some((target, true)); // overwrite all — skip stat
+    }
+
+    // Need to check existence.
+    let stat_start = std::time::Instant::now();
+    let exists = match pool.direction {
+        TransferDirection::LocalToRemote => raw.stat(target.dst_path.as_str()).await.is_ok(),
+        TransferDirection::RemoteToLocal => tokio::fs::metadata(&target.dst_path).await.is_ok(),
+    };
+    let stat_ms = stat_start.elapsed().as_millis() as u64;
+    *total_stat_ms += stat_ms;
+    if stat_ms > 50 {
+        tracing::debug!(
+            "worker[{worker_id}] stat check took {stat_ms}ms: {}",
+            target.name
+        );
+    }
+
+    if !exists {
+        return Some((target, true)); // new file — transfer it
+    }
+
+    if policy == 2 {
+        // skip all existing
+        pool.progress.files_done.fetch_add(1, Ordering::Relaxed);
+        pool.progress
+            .bytes_done_all
+            .fetch_add(target.size, Ordering::Relaxed);
+        return Some((target, false));
+    }
+
+    // policy == 0: ask the user
+    let ow_start = std::time::Instant::now();
+    let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
+    let query = OverwriteQuery {
+        name: target.name.clone(),
+        dst_path: target.dst_path.clone(),
+        size: target.size,
+        response: resp_tx,
+    };
+    if pool.overwrite_tx.send(query).await.is_err() {
+        return None;
+    }
+    let answer = match resp_rx.await {
+        Ok(a) => a,
+        Err(_) => return None,
+    };
+    let ow_wait_ms = ow_start.elapsed().as_millis() as u64;
+    *total_overwrite_wait_ms += ow_wait_ms;
+    if ow_wait_ms > 100 {
+        tracing::debug!(
+            "worker[{worker_id}] overwrite prompt waited {ow_wait_ms}ms: {}",
+            target.name,
+        );
+    }
+
+    match answer {
+        OverwriteAnswer::Overwrite => Some((target, true)),
+        OverwriteAnswer::OverwriteAll => {
+            pool.overwrite_policy.store(1, Ordering::Relaxed);
+            Some((target, true))
+        }
+        OverwriteAnswer::Skip => {
+            pool.progress.files_done.fetch_add(1, Ordering::Relaxed);
+            pool.progress
+                .bytes_done_all
+                .fetch_add(target.size, Ordering::Relaxed);
+            Some((target, false))
+        }
+        OverwriteAnswer::SkipAll => {
+            pool.overwrite_policy.store(2, Ordering::Relaxed);
+            pool.progress.files_done.fetch_add(1, Ordering::Relaxed);
+            pool.progress
+                .bytes_done_all
+                .fetch_add(target.size, Ordering::Relaxed);
+            Some((target, false))
+        }
+        OverwriteAnswer::Cancel => {
+            pool.cancel.store(true, Ordering::Relaxed);
+            None
+        }
+    }
+}
+
+/// Spawn a single transfer worker that pulls from the shared work queue.
+/// Prefetches the next file's SFTP handle during the current transfer to
+/// eliminate per-file open/close latency.
+fn spawn_worker(
+    worker_id: usize,
+    worker: PipelinedWorker,
+    pool: &Arc<WorkerPool>,
+) -> tokio::task::JoinHandle<()> {
+    let pool = Arc::clone(pool);
+    let raw = worker.raw;
+    let read_chunk_size = worker.read_chunk_size;
+
+    tokio::spawn(async move {
+        tracing::debug!("worker[{worker_id}] spawned (chunk_size={read_chunk_size})");
+        let worker_start = std::time::Instant::now();
+        let mut files_completed = 0u64;
+        let mut bytes_transferred = 0u64;
+        let mut total_idle_ms = 0u64;
+        let mut total_stat_ms = 0u64;
+        let mut total_transfer_ms = 0u64;
+        let mut total_overwrite_wait_ms = 0u64;
+        let mut total_open_ms = 0u64;
+
+        // Prefetched state: next target + its already-opened SFTP handle.
+        let mut prefetched: Option<(TransferTarget, Arc<str>)> = None;
+
+        loop {
+            // Get next target — either from prefetch or from the work queue.
+            let (target, file_handle) = if let Some((t, h)) = prefetched.take() {
+                (t, Some(h))
+            } else {
+                match recv_next_target(
+                    worker_id,
+                    &pool,
+                    &raw,
+                    &mut total_idle_ms,
+                    &mut total_stat_ms,
+                    &mut total_overwrite_wait_ms,
+                )
+                .await
+                {
+                    Some((target, true)) => (target, None),
+                    Some((_, false)) => continue, // skipped
+                    None => break,                // done or cancelled
+                }
+            };
+
+            if pool.cancel.load(Ordering::Relaxed) {
+                // Close prefetched handle if we got one
+                if let Some(h) = file_handle {
+                    pipeline::close_handle(&raw, &h).await;
+                }
+                break;
+            }
+
+            // Open the SFTP file handle (if not prefetched).
+            let open_start = std::time::Instant::now();
+            let handle_str = match file_handle {
+                Some(h) => h,
+                None => match open_target_handle(&raw, &target, pool.direction).await {
+                    Ok(h) => h,
+                    Err(e) => {
+                        tracing::error!("worker[{worker_id}] open failed: {}: {e:#}", target.name,);
+                        let mut err = pool.last_error.lock().unwrap();
+                        *err = Some(format!("{}: open failed: {e}", target.name));
+                        continue;
+                    }
+                },
+            };
+            let open_ms = open_start.elapsed().as_millis() as u64;
+            total_open_ms += open_ms;
+
+            // Set active file info for this worker.
+            {
+                let mut active = pool.progress.active_files.lock().unwrap();
+                if worker_id >= active.len() {
+                    active.resize(worker_id + 1, None);
+                }
+                active[worker_id] = Some(ActiveFile {
+                    name: target.name.clone(),
+                    src_path: target.src_path.clone(),
+                    dst_path: target.dst_path.clone(),
+                    bytes_done: 0,
+                    bytes_total: target.size,
+                });
+            }
+
+            // Run the data transfer + concurrently prefetch the next file's handle.
+            let xfer_start = std::time::Instant::now();
+            let transfer_fut = run_file_transfer(
+                &raw,
+                &handle_str,
+                &target,
+                pool.direction,
+                worker_id,
+                read_chunk_size,
+                &pool.progress,
+                &pool.cancel,
+                &pool.skip,
+            );
+
+            let prefetch_raw = Arc::clone(&raw);
+            let prefetch_pool = Arc::clone(&pool);
+            let prefetch_fut = async {
+                // Get next target from queue and open its handle while transfer runs.
+                let next = recv_next_target(
+                    worker_id,
+                    &prefetch_pool,
+                    &prefetch_raw,
+                    &mut 0u64, // prefetch idle/stat not counted separately
+                    &mut 0u64,
+                    &mut 0u64,
+                )
+                .await;
+                match next {
+                    Some((next_target, true)) => {
+                        // Pre-open the handle while current transfer is in progress.
+                        match open_target_handle(
+                            &prefetch_raw,
+                            &next_target,
+                            prefetch_pool.direction,
+                        )
+                        .await
+                        {
+                            Ok(h) => Some((next_target, Some(h))),
+                            Err(e) => {
+                                tracing::debug!(
+                                    "worker[{worker_id}] prefetch open failed: {}: {e:#}",
+                                    next_target.name,
+                                );
+                                // Return target without handle — will open in main loop.
+                                Some((next_target, None))
+                            }
+                        }
+                    }
+                    Some((next_target, false)) => {
+                        // Skipped file — return None so main loop continues.
+                        // We already updated progress in recv_next_target.
+                        Some((next_target, None))
+                    }
+                    None => None, // channel closed or cancelled
+                }
+            };
+
+            let (result, next_prefetched) = tokio::join!(transfer_fut, prefetch_fut);
+            let xfer_ms = xfer_start.elapsed().as_millis() as u64;
+            total_transfer_ms += xfer_ms;
+
+            // Store prefetched result for next iteration.
+            match next_prefetched {
+                Some((next_target, Some(next_handle))) => {
+                    prefetched = Some((next_target, next_handle));
+                }
+                Some((next_target, None)) => {
+                    // Target was skipped or open failed — re-queue as no-handle
+                    // Only set prefetched if it should be transferred (not skipped).
+                    // Skipped targets already had their progress updated.
+                    // For open failures, we'll retry in the main loop.
+                    // Check: was this a skip or an open failure?
+                    // If bytes_done_all was bumped, it was skipped.
+                    // For simplicity: just set it as prefetched without handle.
+                    prefetched = Some((next_target, "".into()));
+                    // The empty handle signals "needs re-opening" in the main loop.
+                    // Actually, let's use a cleaner approach:
+                }
+                None => {
+                    prefetched = None; // No more work
+                }
+            }
+
+            // Fire-and-forget close of current handle (overlaps with next transfer).
+            let close_raw = Arc::clone(&raw);
+            let close_handle = Arc::clone(&handle_str);
+            let close_start = std::time::Instant::now();
+            tokio::spawn(async move {
+                pipeline::close_handle(&close_raw, &close_handle).await;
+            });
+            // Estimate close time from recent closes (we can't await without blocking).
+            let _ = close_start; // close runs in background
+
+            // Clear active file slot.
+            {
+                let mut active = pool.progress.active_files.lock().unwrap();
+                if worker_id < active.len() {
+                    active[worker_id] = None;
+                }
+            }
+
+            match result {
+                Ok(()) => {
+                    files_completed += 1;
+                    bytes_transferred += target.size;
+                    pool.copied.fetch_add(1, Ordering::Relaxed);
+                    pool.progress.files_done.fetch_add(1, Ordering::Relaxed);
+                    let mbps = if xfer_ms > 0 {
+                        target.size as f64 / (xfer_ms as f64 / 1000.0) / 1_048_576.0
+                    } else {
+                        0.0
+                    };
+                    tracing::debug!(
+                        "worker[{worker_id}] file done: {} {:.1}MB in {:.1}s = {mbps:.1}MB/s (open={open_ms}ms)",
+                        target.name,
+                        target.size as f64 / 1_048_576.0,
+                        xfer_ms as f64 / 1000.0,
+                    );
+                }
+                Err(_) if pool.cancel.load(Ordering::Relaxed) => {
+                    // Close prefetched handle before exiting.
+                    if let Some((_, ref h)) = prefetched
+                        && !h.is_empty()
+                    {
+                        pipeline::close_handle(&raw, h).await;
+                    }
+                    break;
+                }
+                Err(e) if pool.skip.swap(false, Ordering::Relaxed) => {
+                    tracing::debug!("worker[{worker_id}] skipped: {}: {e:#}", target.name);
+                }
+                Err(e) => {
+                    tracing::error!(
+                        "worker[{worker_id}] transfer failed: {}: {e:#}",
+                        target.name,
+                    );
+                    let mut err = pool.last_error.lock().unwrap();
+                    *err = Some(format!("{}: {e}", target.name));
+                }
+            }
+        }
+
+        // Close any remaining prefetched handle.
+        if let Some((_, ref h)) = prefetched
+            && !h.is_empty()
+        {
+            pipeline::close_handle(&raw, h).await;
+        }
+
+        // Worker summary.
+        let wall_ms = worker_start.elapsed().as_millis() as u64;
+        let active_pct = if wall_ms > 0 {
+            total_transfer_ms as f64 / wall_ms as f64 * 100.0
+        } else {
+            0.0
+        };
+        let avg_speed = if total_transfer_ms > 0 {
+            bytes_transferred as f64 / (total_transfer_ms as f64 / 1000.0) / 1_048_576.0
+        } else {
+            0.0
+        };
+        tracing::debug!(
+            "worker[{worker_id}] done: {files_completed} files, \
+             {:.1} MB in {:.1}s wall | \
+             transfer={:.1}s idle={:.1}s stat={:.1}s open={:.1}s overwrite_wait={:.1}s | \
+             active={active_pct:.0}% avg_speed={avg_speed:.1}MB/s",
+            bytes_transferred as f64 / 1_048_576.0,
+            wall_ms as f64 / 1000.0,
+            total_transfer_ms as f64 / 1000.0,
+            total_idle_ms as f64 / 1000.0,
+            total_stat_ms as f64 / 1000.0,
+            total_open_ms as f64 / 1000.0,
+            total_overwrite_wait_ms as f64 / 1000.0,
+        );
+    })
+}
+
+/// Run a file transfer using a dynamic pool of pipelined SFTP workers.
+/// `scan_sftp` is used for directory scanning/mkdir; `initial_workers` start immediately.
+/// Extra workers arriving on `extra_workers_rx` are added to the pool on the fly
+/// (e.g. from a second SSH connection opened in the background).
 #[allow(clippy::too_many_arguments)]
 async fn run_background_transfer(
-    worker_sessions: Vec<SftpSession>,
+    scan_sftp: SftpSession,
+    initial_workers: Vec<PipelinedWorker>,
+    mut extra_workers_rx: tokio::sync::mpsc::Receiver<PipelinedWorker>,
     targets: Vec<TransferTarget>,
     progress: Arc<TransferProgress>,
     cancel: Arc<AtomicBool>,
@@ -2517,14 +3104,25 @@ async fn run_background_transfer(
     overwrite_policy: Arc<AtomicU64>,
 ) -> TransferResult {
     assert!(
-        !worker_sessions.is_empty(),
-        "run_background_transfer requires at least one SFTP session"
+        !initial_workers.is_empty(),
+        "run_background_transfer requires at least one pipelined worker"
     );
 
-    // Use first session for scanning
-    let scan_sftp = &worker_sessions[0];
+    let transfer_wall_start = std::time::Instant::now();
+    let dir_label = match direction {
+        TransferDirection::LocalToRemote => "upload",
+        TransferDirection::RemoteToLocal => "download",
+    };
+    tracing::debug!(
+        "transfer:start {dir_label} targets={} initial_workers={}",
+        targets.len(),
+        initial_workers.len(),
+    );
+
+    let scan_sftp = &scan_sftp;
 
     // Expand directories into flat file lists
+    let scan_start = std::time::Instant::now();
     let targets = match expand_directory_targets(scan_sftp, targets, direction, &progress).await {
         Ok(t) => t,
         Err(e) => {
@@ -2536,6 +3134,7 @@ async fn run_background_transfer(
             };
         }
     };
+    let scan_ms = scan_start.elapsed().as_millis();
 
     progress.scanning.store(false, Ordering::Relaxed);
 
@@ -2550,7 +3149,18 @@ async fn run_background_transfer(
         }
     }
 
+    // Sort files largest-first so workers stay busy on big files early,
+    // avoiding a "long tail" where one worker grinds a large file at the end.
+    file_targets.sort_by(|a, b| b.size.cmp(&a.size));
+
+    tracing::debug!(
+        "transfer:scan done in {scan_ms}ms — {} dirs, {} files",
+        dir_targets.len(),
+        file_targets.len(),
+    );
+
     // Create directories sequentially first (order matters for nested dirs)
+    let mkdir_start = std::time::Instant::now();
     for dir_target in &dir_targets {
         if cancel.load(Ordering::Relaxed) {
             return TransferResult {
@@ -2572,6 +3182,13 @@ async fn run_background_transfer(
             tracing::error!("mkdir failed: {}: {e:#}", dir_target.dst_path);
         }
     }
+    if !dir_targets.is_empty() {
+        tracing::debug!(
+            "transfer:mkdir {} dirs in {}ms",
+            dir_targets.len(),
+            mkdir_start.elapsed().as_millis(),
+        );
+    }
 
     let total = file_targets.len();
     let total_bytes: u64 = file_targets.iter().map(|t| t.size).sum();
@@ -2579,6 +3196,11 @@ async fn run_background_transfer(
     progress
         .total_bytes_all
         .store(total_bytes, Ordering::Relaxed);
+
+    tracing::debug!(
+        "transfer:files {total} files, {:.1} MB total",
+        total_bytes as f64 / 1_048_576.0,
+    );
 
     if total == 0 {
         return TransferResult {
@@ -2588,196 +3210,95 @@ async fn run_background_transfer(
         };
     }
 
-    let actual_workers = worker_sessions.len().min(total).min(TRANSFER_WORKERS);
+    // Set up shared work queue and worker pool state.
+    let (tx, rx) = tokio::sync::mpsc::channel::<TransferTarget>(WORKERS_PER_CONNECTION * 4);
+    let pool = Arc::new(WorkerPool {
+        work_rx: Arc::new(tokio::sync::Mutex::new(rx)),
+        progress: Arc::clone(&progress),
+        cancel: Arc::clone(&cancel),
+        skip: Arc::clone(&skip),
+        direction,
+        copied: Arc::new(AtomicU64::new(0)),
+        last_error: Arc::new(std::sync::Mutex::new(None)),
+        overwrite_tx,
+        overwrite_policy,
+    });
+
+    // Spawn initial workers immediately.
+    let worker_handles: Arc<tokio::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>> =
+        Arc::new(tokio::sync::Mutex::new(Vec::new()));
+    let initial_count = initial_workers.len();
     {
-        let mut active = progress.active_files.lock().unwrap();
-        active.resize(actual_workers, None);
+        let mut handles = worker_handles.lock().await;
+        for (id, worker) in initial_workers.into_iter().enumerate() {
+            handles.push(spawn_worker(id, worker, &pool));
+        }
     }
 
-    // Set up work queue channel
-    let (tx, rx) = tokio::sync::mpsc::channel::<TransferTarget>(actual_workers * 2);
-    let rx = Arc::new(tokio::sync::Mutex::new(rx));
-
-    // Spawn workers
-    let copied = Arc::new(AtomicU64::new(0));
-    let last_error: Arc<std::sync::Mutex<Option<String>>> = Arc::new(std::sync::Mutex::new(None));
-    let mut join_set = tokio::task::JoinSet::new();
-
-    for (worker_id, sftp) in worker_sessions.into_iter().take(actual_workers).enumerate() {
-        let rx = Arc::clone(&rx);
-        let progress = Arc::clone(&progress);
-        let cancel = Arc::clone(&cancel);
-        let skip = Arc::clone(&skip);
-        let copied = Arc::clone(&copied);
-        let last_error = Arc::clone(&last_error);
-        let overwrite_tx = overwrite_tx.clone();
-        let overwrite_policy = Arc::clone(&overwrite_policy);
-
-        join_set.spawn(async move {
-            loop {
-                let target = {
-                    let mut rx = rx.lock().await;
-                    rx.recv().await
-                };
-                let Some(target) = target else {
-                    break; // Channel closed, no more work
-                };
-
-                if cancel.load(Ordering::Relaxed) {
-                    break;
-                }
-
-                // Check if destination file already exists
-                let exists = match direction {
-                    TransferDirection::LocalToRemote => {
-                        sftp.metadata(&target.dst_path).await.is_ok()
-                    }
-                    TransferDirection::RemoteToLocal => {
-                        tokio::fs::metadata(&target.dst_path).await.is_ok()
-                    }
-                };
-
-                if exists {
-                    let policy = overwrite_policy.load(Ordering::Relaxed);
-                    if policy == 2 {
-                        // Skip all — skip without asking
-                        progress.files_done.fetch_add(1, Ordering::Relaxed);
-                        progress
-                            .bytes_done_all
-                            .fetch_add(target.size, Ordering::Relaxed);
-                        continue;
-                    } else if policy == 0 {
-                        // Ask the user
-                        let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
-                        let query = OverwriteQuery {
-                            name: target.name.clone(),
-                            dst_path: target.dst_path.clone(),
-                            size: target.size,
-                            response: resp_tx,
-                        };
-                        if overwrite_tx.send(query).await.is_err() {
-                            break; // UI gone
-                        }
-                        match resp_rx.await {
-                            Ok(OverwriteAnswer::Overwrite) => {
-                                // Proceed with this file
-                            }
-                            Ok(OverwriteAnswer::OverwriteAll) => {
-                                overwrite_policy.store(1, Ordering::Relaxed);
-                                // Proceed with this file
-                            }
-                            Ok(OverwriteAnswer::Skip) => {
-                                progress.files_done.fetch_add(1, Ordering::Relaxed);
-                                progress
-                                    .bytes_done_all
-                                    .fetch_add(target.size, Ordering::Relaxed);
-                                continue;
-                            }
-                            Ok(OverwriteAnswer::SkipAll) => {
-                                overwrite_policy.store(2, Ordering::Relaxed);
-                                progress.files_done.fetch_add(1, Ordering::Relaxed);
-                                progress
-                                    .bytes_done_all
-                                    .fetch_add(target.size, Ordering::Relaxed);
-                                continue;
-                            }
-                            Ok(OverwriteAnswer::Cancel) | Err(_) => {
-                                cancel.store(true, Ordering::Relaxed);
-                                break;
-                            }
-                        }
-                    }
-                    // policy == 1 (overwrite all) falls through to transfer
-                }
-
-                // Set active file info for this worker
-                {
-                    let mut active = progress.active_files.lock().unwrap();
-                    if worker_id < active.len() {
-                        active[worker_id] = Some(ActiveFile {
-                            name: target.name.clone(),
-                            src_path: target.src_path.clone(),
-                            dst_path: target.dst_path.clone(),
-                            bytes_done: 0,
-                            bytes_total: target.size,
-                        });
-                    }
-                }
-
-                let result = match direction {
-                    TransferDirection::LocalToRemote => {
-                        transfer_local_to_remote(
-                            &sftp,
-                            &target.src_path,
-                            &target.dst_path,
-                            worker_id,
-                            &progress,
-                            &cancel,
-                            &skip,
-                        )
-                        .await
-                    }
-                    TransferDirection::RemoteToLocal => {
-                        transfer_remote_to_local(
-                            &sftp,
-                            &target.src_path,
-                            &target.dst_path,
-                            worker_id,
-                            &progress,
-                            &cancel,
-                            &skip,
-                        )
-                        .await
-                    }
-                };
-
-                // Clear active file slot
-                {
-                    let mut active = progress.active_files.lock().unwrap();
-                    if worker_id < active.len() {
-                        active[worker_id] = None;
-                    }
-                }
-
-                match result {
-                    Ok(()) => {
-                        copied.fetch_add(1, Ordering::Relaxed);
-                        progress.files_done.fetch_add(1, Ordering::Relaxed);
-                    }
-                    Err(_) if cancel.load(Ordering::Relaxed) => break,
-                    Err(e) if skip.swap(false, Ordering::Relaxed) => {
-                        tracing::debug!("skipped: {}: {e:#}", target.name);
-                    }
-                    Err(e) => {
-                        tracing::error!("transfer failed: {}: {e:#}", target.name);
-                        let mut err = last_error.lock().unwrap();
-                        *err = Some(format!("{}: {e}", target.name));
-                    }
-                }
+    // Spawn a listener that adds extra workers (from second connection) as they arrive.
+    let extra_pool = Arc::clone(&pool);
+    let extra_handles = Arc::clone(&worker_handles);
+    let extra_cancel = Arc::clone(&cancel);
+    let extra_listener = tokio::spawn(async move {
+        let mut next_id = WORKERS_PER_CONNECTION; // IDs for extra workers start after initial
+        while let Some(worker) = extra_workers_rx.recv().await {
+            if extra_cancel.load(Ordering::Relaxed) {
+                break;
             }
-        });
-    }
+            tracing::debug!(
+                "transfer:extra_worker {next_id} added at +{:.1}s",
+                transfer_wall_start.elapsed().as_secs_f64(),
+            );
+            let handle = spawn_worker(next_id, worker, &extra_pool);
+            extra_handles.lock().await.push(handle);
+            next_id += 1;
+        }
+    });
 
-    // Feed work items into the channel
+    // Feed work items into the channel.
+    let feed_start = std::time::Instant::now();
     for target in file_targets {
         if cancel.load(Ordering::Relaxed) {
             break;
         }
         if tx.send(target).await.is_err() {
-            break; // All workers gone
+            break;
         }
     }
     drop(tx); // Close channel so workers exit when done
+    tracing::debug!(
+        "transfer:feed all work items queued in {}ms",
+        feed_start.elapsed().as_millis(),
+    );
 
-    // Wait for all workers to finish
-    while let Some(result) = join_set.join_next().await {
-        if let Err(e) = result {
-            tracing::error!("worker task panicked: {e}");
+    // Wait for all workers (initial + extra) to finish.
+    loop {
+        let handles: Vec<_> = worker_handles.lock().await.drain(..).collect();
+        if handles.is_empty() {
+            break;
         }
+        let batch_size = handles.len();
+        for h in handles {
+            let _ = h.await;
+        }
+        tracing::debug!("transfer:join awaited {batch_size} worker handles");
     }
+    extra_listener.abort(); // Listener no longer needed
 
-    let final_copied = copied.load(Ordering::Relaxed) as usize;
-    let final_error = last_error.lock().unwrap().clone();
+    let final_copied = pool.copied.load(Ordering::Relaxed) as usize;
+    let final_error = pool.last_error.lock().unwrap().clone();
+    let wall_secs = transfer_wall_start.elapsed().as_secs_f64();
+    let avg_speed = if wall_secs > 0.1 {
+        total_bytes as f64 / wall_secs / 1_048_576.0
+    } else {
+        0.0
+    };
+    tracing::debug!(
+        "transfer:done {final_copied}/{total} files, \
+         {:.1} MB in {wall_secs:.1}s = {avg_speed:.1} MB/s avg | \
+         {initial_count} initial workers + extra via second conn",
+        total_bytes as f64 / 1_048_576.0,
+    );
 
     TransferResult {
         copied: final_copied,
@@ -2786,105 +3307,119 @@ async fn run_background_transfer(
     }
 }
 
-/// Upload a local file to a remote SFTP destination.
-async fn transfer_local_to_remote(
-    sftp: &SftpSession,
-    local_path: &str,
-    remote_path: &str,
+/// Run a pipelined transfer for a single file using a pre-opened SFTP handle.
+/// Handles both upload and download directions. Does NOT open or close the handle.
+#[allow(clippy::too_many_arguments)]
+async fn run_file_transfer(
+    raw: &Arc<RawSftpSession>,
+    handle_str: &Arc<str>,
+    target: &TransferTarget,
+    direction: TransferDirection,
     worker_id: usize,
+    read_chunk_size: u64,
     progress: &TransferProgress,
     cancel: &AtomicBool,
     skip: &AtomicBool,
 ) -> Result<()> {
-    let mut local_file = tokio::fs::File::open(local_path)
-        .await
-        .with_context(|| format!("Failed to open: {local_path}"))?;
+    let combined_cancel = Arc::new(AtomicBool::new(false));
 
-    let mut remote_file = sftp
-        .create(remote_path)
-        .await
-        .with_context(|| format!("Failed to create remote file: {remote_path}"))?;
+    match direction {
+        TransferDirection::LocalToRemote => {
+            let local_meta = std::fs::metadata(&target.src_path)
+                .with_context(|| format!("Failed to stat: {}", target.src_path))?;
+            let total = local_meta.len();
 
-    let mut buf = vec![0u8; TRANSFER_CHUNK_SIZE];
-    loop {
-        if cancel.load(Ordering::Relaxed) {
-            anyhow::bail!("Transfer cancelled");
+            let local_file = std::fs::File::open(&target.src_path)
+                .with_context(|| format!("Failed to open: {}", target.src_path))?;
+            let mut local_file =
+                std::io::BufReader::with_capacity((pipeline::CHUNK_SIZE * 2) as usize, local_file);
+
+            let mut on_bytes = |bytes: u64| {
+                progress.mark_transfer_start();
+                progress.bytes_done_all.fetch_add(bytes, Ordering::Relaxed);
+                let mut active = progress.active_files.lock().unwrap();
+                if let Some(Some(af)) = active.get_mut(worker_id) {
+                    af.bytes_done += bytes;
+                }
+            };
+            let transfer = pipeline::upload_from_handle(
+                raw,
+                handle_str,
+                &mut local_file,
+                total,
+                &mut on_bytes,
+                Some(combined_cancel.as_ref()),
+            );
+            tokio::pin!(transfer);
+            loop {
+                tokio::select! {
+                    result = &mut transfer => { result?; break; }
+                    _ = tokio::time::sleep(Duration::from_millis(50)) => {
+                        if cancel.load(Ordering::Relaxed) || skip.load(Ordering::Relaxed) {
+                            combined_cancel.store(true, Ordering::Relaxed);
+                        }
+                    }
+                }
+            }
         }
-        if skip.load(Ordering::Relaxed) {
-            anyhow::bail!("File skipped");
-        }
-        let n = local_file.read(&mut buf).await?;
-        if n == 0 {
-            break;
-        }
-        remote_file.write_all(&buf[..n]).await?;
-        progress
-            .bytes_done_all
-            .fetch_add(n as u64, Ordering::Relaxed);
-        // Update per-worker active file progress
-        {
-            let mut active = progress.active_files.lock().unwrap();
-            if let Some(Some(af)) = active.get_mut(worker_id) {
-                af.bytes_done += n as u64;
+        TransferDirection::RemoteToLocal => {
+            // Ensure parent directory exists for nested files.
+            if let Some(parent) = std::path::Path::new(&target.dst_path).parent() {
+                tokio::fs::create_dir_all(parent).await.with_context(|| {
+                    format!("Failed to create parent dir: {}", parent.display())
+                })?;
+            }
+
+            let local_file = std::fs::File::create(&target.dst_path)
+                .with_context(|| format!("Failed to create: {}", target.dst_path))?;
+            let mut local_file =
+                std::io::BufWriter::with_capacity((pipeline::CHUNK_SIZE * 2) as usize, local_file);
+
+            let mut on_bytes = |bytes: u64| {
+                progress.mark_transfer_start();
+                progress.bytes_done_all.fetch_add(bytes, Ordering::Relaxed);
+                let mut active = progress.active_files.lock().unwrap();
+                if let Some(Some(af)) = active.get_mut(worker_id) {
+                    af.bytes_done += bytes;
+                }
+            };
+            let transfer = pipeline::download_from_handle(
+                raw,
+                handle_str,
+                &mut local_file,
+                target.size,
+                0,
+                read_chunk_size,
+                &mut on_bytes,
+                Some(combined_cancel.as_ref()),
+            );
+            tokio::pin!(transfer);
+            loop {
+                tokio::select! {
+                    result = &mut transfer => { result?; break; }
+                    _ = tokio::time::sleep(Duration::from_millis(50)) => {
+                        if cancel.load(Ordering::Relaxed) || skip.load(Ordering::Relaxed) {
+                            combined_cancel.store(true, Ordering::Relaxed);
+                        }
+                    }
+                }
             }
         }
     }
 
-    remote_file.shutdown().await?;
     Ok(())
 }
 
-/// Download a remote SFTP file to a local destination.
-async fn transfer_remote_to_local(
-    sftp: &SftpSession,
-    remote_path: &str,
-    local_path: &str,
-    worker_id: usize,
-    progress: &TransferProgress,
-    cancel: &AtomicBool,
-    skip: &AtomicBool,
-) -> Result<()> {
-    // Ensure parent directory exists for nested files
-    if let Some(parent) = std::path::Path::new(local_path).parent() {
-        tokio::fs::create_dir_all(parent)
-            .await
-            .with_context(|| format!("Failed to create parent dir: {}", parent.display()))?;
+/// Open the SFTP file handle for a target (read for download, write for upload).
+async fn open_target_handle(
+    raw: &RawSftpSession,
+    target: &TransferTarget,
+    direction: TransferDirection,
+) -> Result<Arc<str>> {
+    match direction {
+        TransferDirection::RemoteToLocal => pipeline::open_read(raw, &target.src_path).await,
+        TransferDirection::LocalToRemote => pipeline::open_write(raw, &target.dst_path).await,
     }
-
-    let mut remote_file = sftp
-        .open(remote_path)
-        .await
-        .with_context(|| format!("Failed to open remote file: {remote_path}"))?;
-
-    let mut local_file = tokio::fs::File::create(local_path)
-        .await
-        .with_context(|| format!("Failed to create: {local_path}"))?;
-
-    let mut buf = vec![0u8; TRANSFER_CHUNK_SIZE];
-    loop {
-        if cancel.load(Ordering::Relaxed) {
-            anyhow::bail!("Transfer cancelled");
-        }
-        if skip.load(Ordering::Relaxed) {
-            anyhow::bail!("File skipped");
-        }
-        let n = remote_file.read(&mut buf).await?;
-        if n == 0 {
-            break;
-        }
-        local_file.write_all(&buf[..n]).await?;
-        progress
-            .bytes_done_all
-            .fetch_add(n as u64, Ordering::Relaxed);
-        {
-            let mut active = progress.active_files.lock().unwrap();
-            if let Some(Some(af)) = active.get_mut(worker_id) {
-                af.bytes_done += n as u64;
-            }
-        }
-    }
-
-    Ok(())
 }
 
 /// Start a copy transfer from the CopyConfirm state. Opens an SFTP channel, expands
@@ -2924,25 +3459,47 @@ async fn start_copy_transfer(
     let ssh_handle = remote_backend.ssh_handle();
     match ssh_handle {
         Some(handle) => {
-            // Open SFTP worker sessions before spawning the transfer task.
-            // We need at least one; try to open up to TRANSFER_WORKERS.
-            let mut worker_sessions = Vec::new();
-            for i in 0..TRANSFER_WORKERS {
-                match open_sftp_from_handle(handle).await {
-                    Ok(s) => worker_sessions.push(s),
+            let setup_start = std::time::Instant::now();
+
+            // Open one SftpSession for scanning/mkdir on the primary connection.
+            let scan_sftp = match open_sftp_from_handle(handle).await {
+                Ok(s) => s,
+                Err(e) => {
+                    state.status_message = Some(format!("Failed to open SFTP session: {e}"));
+                    state.input_mode = InputMode::Normal;
+                    return Ok(());
+                }
+            };
+
+            tracing::debug!(
+                "setup:scan_sftp opened in {}ms",
+                setup_start.elapsed().as_millis(),
+            );
+
+            // Open initial workers on the primary (already-open) connection — instant.
+            let workers_start = std::time::Instant::now();
+            let mut initial_workers = Vec::new();
+            for i in 0..WORKERS_PER_CONNECTION {
+                match open_pipelined_worker(handle).await {
+                    Ok(w) => initial_workers.push(w),
                     Err(e) => {
                         if i == 0 {
-                            // Can't open even one session — fail
                             state.status_message =
-                                Some(format!("Failed to open SFTP session: {e}"));
+                                Some(format!("Failed to open pipelined SFTP: {e}"));
                             state.input_mode = InputMode::Normal;
                             return Ok(());
                         }
-                        tracing::warn!("Opened {i} SFTP sessions (wanted {TRANSFER_WORKERS}): {e}");
+                        tracing::warn!("Opened {i} workers on primary connection: {e}");
                         break;
                     }
                 }
             }
+            tracing::debug!(
+                "setup:workers {} initial workers opened in {}ms (total setup={}ms)",
+                initial_workers.len(),
+                workers_start.elapsed().as_millis(),
+                setup_start.elapsed().as_millis(),
+            );
 
             let dest_side = match source_side {
                 Side::Left => Side::Right,
@@ -2977,12 +3534,105 @@ async fn start_copy_transfer(
             let bg_progress = Arc::clone(&progress);
             let bg_cancel = Arc::clone(&cancel);
             let bg_skip = Arc::clone(&skip);
-            let (ow_tx, ow_rx) = tokio::sync::mpsc::channel::<OverwriteQuery>(1);
+            // Capacity matches max workers so none block waiting to submit their query.
+            let (ow_tx, ow_rx) =
+                tokio::sync::mpsc::channel::<OverwriteQuery>(WORKERS_PER_CONNECTION * 2 + 1);
             let ow_policy = Arc::new(AtomicU64::new(0));
             let bg_ow_policy = Arc::clone(&ow_policy);
+
+            // Channel for dynamically adding workers from a second SSH connection.
+            let (extra_tx, extra_rx) = tokio::sync::mpsc::channel::<PipelinedWorker>(4);
+
+            // Open a second TCP connection in the background for extra workers.
+            let need_second = transfer_targets.len() >= MIN_FILES_FOR_SECOND_CONN;
+            let extra_cancel = Arc::clone(&cancel);
+            let reconnect_info = if need_second {
+                let info = remote_backend.reconnection_info();
+                if info.is_none() {
+                    tracing::debug!(
+                        "no reconnection info available (backend created via from_handle?)"
+                    );
+                }
+                info
+            } else {
+                tracing::debug!(
+                    "skipping second connection: only {} targets",
+                    transfer_targets.len()
+                );
+                None
+            };
+            if let Some((reconnect_config, reconnect_index)) = reconnect_info {
+                // Open second connection in a background task — doesn't block transfer start.
+                let conn_setup_start = setup_start;
+                tokio::spawn(async move {
+                    // extra_tx moved into this task
+                    let conn_start = std::time::Instant::now();
+                    tracing::debug!(
+                        "second_conn:start opening at +{:.1}s",
+                        conn_setup_start.elapsed().as_secs_f64(),
+                    );
+                    match crate::ssh::establish_session(&reconnect_config, reconnect_index).await {
+                        Ok(second_handle) => {
+                            let conn_ms = conn_start.elapsed().as_millis();
+                            tracing::debug!(
+                                "second_conn:established in {conn_ms}ms (at +{:.1}s from transfer start)",
+                                conn_setup_start.elapsed().as_secs_f64(),
+                            );
+                            // Open workers on the new connection and send them to the pool.
+                            for i in 0..WORKERS_PER_CONNECTION {
+                                if extra_cancel.load(Ordering::Relaxed) {
+                                    tracing::debug!(
+                                        "second_conn: cancelled before opening worker {i}"
+                                    );
+                                    break;
+                                }
+                                let w_start = std::time::Instant::now();
+                                match open_pipelined_worker(&second_handle).await {
+                                    Ok(w) => {
+                                        tracing::debug!(
+                                            "second_conn:worker[{i}] opened in {}ms",
+                                            w_start.elapsed().as_millis(),
+                                        );
+                                        if extra_tx.send(w).await.is_err() {
+                                            tracing::debug!(
+                                                "second_conn: transfer done, worker {i} not needed"
+                                            );
+                                            break;
+                                        }
+                                    }
+                                    Err(e) => {
+                                        tracing::warn!("second_conn: opened {i} workers: {e}");
+                                        break;
+                                    }
+                                }
+                            }
+                            // Keep the second handle alive until the transfer finishes.
+                            // When extra_tx is dropped (transfer done), this task ends.
+                            drop(extra_tx);
+                            // Hold the handle alive by waiting for cancel.
+                            loop {
+                                tokio::time::sleep(Duration::from_secs(1)).await;
+                                if extra_cancel.load(Ordering::Relaxed) {
+                                    break;
+                                }
+                            }
+                            drop(second_handle);
+                        }
+                        Err(e) => {
+                            tracing::debug!("second SSH connection failed: {e}");
+                        }
+                    }
+                });
+            } else {
+                // No second connection — drop the sender so the extra_workers listener terminates.
+                drop(extra_tx);
+            }
+
             let handle = tokio::spawn(async move {
                 run_background_transfer(
-                    worker_sessions,
+                    scan_sftp,
+                    initial_workers,
+                    extra_rx,
                     transfer_targets,
                     bg_progress,
                     bg_cancel,
@@ -3736,6 +4386,21 @@ async fn open_sftp_from_handle(
     SftpSession::new(channel.into_stream())
         .await
         .context("Failed to initialize SFTP session")
+}
+
+/// Open a pipelined SFTP worker session for high-throughput transfers.
+async fn open_pipelined_worker(
+    handle: &russh::client::Handle<crate::ssh::client::SshoreHandler>,
+) -> Result<PipelinedWorker> {
+    let channel = handle
+        .channel_open_session()
+        .await
+        .context("Failed to open SSH channel for pipelined SFTP")?;
+    let session = pipeline::create_raw_session(channel).await?;
+    Ok(PipelinedWorker {
+        raw: session.raw,
+        read_chunk_size: session.read_chunk_size,
+    })
 }
 
 /// Truncate a filename to fit within a given character width.

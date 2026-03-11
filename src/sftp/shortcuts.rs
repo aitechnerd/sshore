@@ -193,18 +193,19 @@ async fn download(
         .channel_open_session()
         .await
         .context("Failed to open transfer channel")?;
-    let raw = pipeline::create_raw_session(channel).await?;
+    let session = pipeline::create_raw_session(channel).await?;
 
     let mut local_file = BufWriter::new(local_file);
     let mut progress = ProgressBar::new(total);
     progress.transferred = offset;
 
     pipeline::download(
-        &raw,
+        &session.raw,
         remote_path,
         &mut local_file,
         total,
         offset,
+        session.read_chunk_size,
         |bytes| progress.update(bytes),
         None,
     )
@@ -246,7 +247,7 @@ async fn upload(
         .channel_open_session()
         .await
         .context("Failed to open transfer channel")?;
-    let raw = pipeline::create_raw_session(channel).await?;
+    let session = pipeline::create_raw_session(channel).await?;
 
     let mut local_file = std::fs::File::open(local_path)
         .with_context(|| format!("Failed to open local file {local_path}"))?;
@@ -254,7 +255,7 @@ async fn upload(
     let mut progress = ProgressBar::new(total);
 
     pipeline::upload(
-        &raw,
+        &session.raw,
         remote_path,
         &mut local_file,
         total,

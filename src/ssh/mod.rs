@@ -45,6 +45,21 @@ const KEEPALIVE_INTERVAL_SECS: u64 = 60;
 /// Maximum consecutive keepalive failures before dropping the connection.
 const KEEPALIVE_MAX: usize = 3;
 
+/// SSH channel window size for all sessions (16 MB).
+///
+/// The default russh window is only 2 MB, which throttles pipelined SFTP transfers.
+/// With 64 in-flight SFTP read requests at 261 KB each (~16 MB), we need a window
+/// large enough to keep the pipe full. 16 MB matches the pipeline capacity and
+/// is harmless for interactive sessions (window is a flow-control limit, not a
+/// pre-allocated buffer).
+const SSH_WINDOW_SIZE: u32 = 16 * 1024 * 1024;
+
+/// Maximum SSH packet size (64 KB, the SSH spec maximum).
+///
+/// The default russh packet size is 32 KB. Larger packets reduce per-packet
+/// overhead for bulk SFTP transfers.
+const SSH_MAX_PACKET_SIZE: u32 = 65535;
+
 /// Print a one-time high-visibility production banner for interactive operations.
 pub fn print_production_banner(
     bookmark: &Bookmark,
@@ -272,6 +287,9 @@ pub async fn establish_session(
         inactivity_timeout: None,
         keepalive_interval: Some(std::time::Duration::from_secs(KEEPALIVE_INTERVAL_SECS)),
         keepalive_max: KEEPALIVE_MAX,
+        window_size: SSH_WINDOW_SIZE,
+        maximum_packet_size: SSH_MAX_PACKET_SIZE,
+        nodelay: true,
         ..<_>::default()
     };
 
@@ -279,6 +297,7 @@ pub async fn establish_session(
         timeout_secs,
         keepalive_interval = KEEPALIVE_INTERVAL_SECS,
         keepalive_max = KEEPALIVE_MAX,
+        window_size = SSH_WINDOW_SIZE,
         "connecting with timeout"
     );
 
@@ -348,6 +367,9 @@ pub async fn establish_tunnel_session(
             tunnel::TUNNEL_KEEPALIVE_INTERVAL_SECS,
         )),
         keepalive_max: tunnel::TUNNEL_KEEPALIVE_MAX,
+        window_size: SSH_WINDOW_SIZE,
+        maximum_packet_size: SSH_MAX_PACKET_SIZE,
+        nodelay: true,
         ..<_>::default()
     };
 

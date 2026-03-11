@@ -20,6 +20,10 @@ pub struct SftpBackend {
     display_name: String,
     /// SSH connection handle for spawning additional SFTP channels (background transfers).
     ssh_handle: Option<Arc<russh::client::Handle<crate::ssh::client::SshoreHandler>>>,
+    /// Stored config for establishing additional SSH connections (e.g. parallel transfers).
+    config: Option<Arc<AppConfig>>,
+    /// Bookmark index within `config.bookmarks` for reconnection.
+    bookmark_index: Option<usize>,
 }
 
 impl SftpBackend {
@@ -54,6 +58,8 @@ impl SftpBackend {
             cwd,
             display_name,
             ssh_handle: Some(Arc::new(session)),
+            config: Some(Arc::new(config.clone())),
+            bookmark_index: Some(bookmark_index),
         })
     }
 
@@ -89,6 +95,8 @@ impl SftpBackend {
             cwd,
             display_name,
             ssh_handle: None,
+            config: None,
+            bookmark_index: None,
         })
     }
 
@@ -206,7 +214,7 @@ impl SftpBackend {
             .channel_open_session()
             .await
             .context("Failed to open transfer channel")?;
-        let raw = pipeline::create_raw_session(channel).await?;
+        let session = pipeline::create_raw_session(channel).await?;
 
         let local_file = std::fs::File::create(local_path)
             .with_context(|| format!("Failed to create: {}", local_path.display()))?;
@@ -214,11 +222,12 @@ impl SftpBackend {
             BufWriter::with_capacity((pipeline::CHUNK_SIZE * 2) as usize, local_file);
 
         pipeline::download(
-            &raw,
+            &session.raw,
             remote_path,
             &mut local_file,
             total,
             0,
+            session.read_chunk_size,
             |bytes| {
                 if let Some(p) = progress {
                     p.fetch_add(bytes, Ordering::Relaxed);
@@ -257,7 +266,7 @@ impl SftpBackend {
             .channel_open_session()
             .await
             .context("Failed to open transfer channel")?;
-        let raw = pipeline::create_raw_session(channel).await?;
+        let session = pipeline::create_raw_session(channel).await?;
 
         let local_file = std::fs::File::open(local_path)
             .with_context(|| format!("Failed to open: {}", local_path.display()))?;
@@ -265,7 +274,7 @@ impl SftpBackend {
             BufReader::with_capacity((pipeline::CHUNK_SIZE * 2) as usize, local_file);
 
         pipeline::upload(
-            &raw,
+            &session.raw,
             remote_path,
             &mut local_file,
             total,
@@ -331,6 +340,30 @@ impl SftpBackend {
     /// Get a reference to the SSH handle for spawning additional SFTP sessions.
     pub fn ssh_handle(&self) -> Option<&russh::client::Handle<crate::ssh::client::SshoreHandler>> {
         self.ssh_handle.as_deref()
+    }
+
+    /// Establish a new, independent SSH connection to the same host.
+    /// Returns a fresh handle on a separate TCP socket — useful for parallel
+    /// transfers that need independent flow control.
+    pub async fn establish_new_connection(
+        &self,
+    ) -> Result<russh::client::Handle<crate::ssh::client::SshoreHandler>> {
+        let config = self
+            .config
+            .as_ref()
+            .context("No config stored for reconnection")?;
+        let index = self
+            .bookmark_index
+            .context("No bookmark index stored for reconnection")?;
+        ssh::establish_session(config, index).await
+    }
+
+    /// Get the reconnection info (config + bookmark index) for spawning
+    /// independent SSH connections in background tasks.
+    pub fn reconnection_info(&self) -> Option<(Arc<AppConfig>, usize)> {
+        let config = self.config.as_ref()?.clone();
+        let index = self.bookmark_index?;
+        Some((config, index))
     }
 }
 

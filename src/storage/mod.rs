@@ -2,6 +2,7 @@ pub mod local_backend;
 pub mod sftp_backend;
 
 use std::path::Path;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64};
 
 use anyhow::Result;
@@ -168,6 +169,25 @@ impl Backend {
         match self {
             Backend::Local(_) => None,
             Backend::Sftp(b) => b.ssh_handle(),
+        }
+    }
+
+    /// Establish a new, independent SSH connection to the same host.
+    /// Returns a fresh handle on a separate TCP socket.
+    pub async fn establish_new_connection(
+        &self,
+    ) -> Result<russh::client::Handle<crate::ssh::client::SshoreHandler>> {
+        match self {
+            Backend::Local(_) => anyhow::bail!("Local backend has no SSH connection"),
+            Backend::Sftp(b) => b.establish_new_connection().await,
+        }
+    }
+
+    /// Get reconnection info for spawning independent SSH connections in background tasks.
+    pub fn reconnection_info(&self) -> Option<(Arc<crate::config::model::AppConfig>, usize)> {
+        match self {
+            Backend::Local(_) => None,
+            Backend::Sftp(b) => b.reconnection_info(),
         }
     }
 }

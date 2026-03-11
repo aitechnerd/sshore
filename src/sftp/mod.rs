@@ -300,7 +300,7 @@ async fn cmd_get(
         .channel_open_session()
         .await
         .context("Failed to open transfer channel")?;
-    let raw = pipeline::create_raw_session(channel).await?;
+    let session = pipeline::create_raw_session(channel).await?;
 
     let local_file = std::fs::File::create(local)
         .with_context(|| format!("Failed to create local file {local}"))?;
@@ -308,11 +308,12 @@ async fn cmd_get(
 
     let mut progress = ProgressBar::new(total);
     pipeline::download(
-        &raw,
+        &session.raw,
         remote,
         &mut local_file,
         total,
         0,
+        session.read_chunk_size,
         |b| progress.update(b),
         None,
     )
@@ -342,7 +343,7 @@ async fn cmd_put(
         .channel_open_session()
         .await
         .context("Failed to open transfer channel")?;
-    let raw = pipeline::create_raw_session(channel).await?;
+    let session = pipeline::create_raw_session(channel).await?;
 
     let local_file =
         std::fs::File::open(local).with_context(|| format!("Failed to open local file {local}"))?;
@@ -350,7 +351,7 @@ async fn cmd_put(
 
     let mut progress = ProgressBar::new(total);
     pipeline::upload(
-        &raw,
+        &session.raw,
         remote,
         &mut local_file,
         total,

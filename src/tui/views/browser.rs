@@ -875,8 +875,15 @@ async fn handle_key(
             if let Some(entry) = pane.selected_entry().cloned()
                 && entry.is_dir
             {
+                let going_up = entry.name == "..";
+                // Remember current dir name so we can select it after going up
+                let prev_dir_name = if going_up {
+                    dir_basename(&pane.cwd)
+                } else {
+                    None
+                };
                 let backend = active_backend_mut(left, right, state);
-                if entry.name == ".." {
+                if going_up {
                     backend.cd("..").await?;
                 } else {
                     backend.cd(&entry.name).await?;
@@ -892,6 +899,9 @@ async fn handle_key(
                 let pane = active_pane_mut(left_pane, right_pane, state);
                 let backend = active_backend_mut(left, right, state);
                 refresh_pane(pane, backend, state).await?;
+                if let Some(name) = prev_dir_name {
+                    select_entry_by_name(pane, &name);
+                }
             }
         }
 
@@ -945,8 +955,14 @@ async fn handle_key(
             if let Some(entry) = pane.selected_entry().cloned() {
                 if entry.is_dir {
                     // Same as Enter — navigate into directory
+                    let going_up = entry.name == "..";
+                    let prev_dir_name = if going_up {
+                        dir_basename(&pane.cwd)
+                    } else {
+                        None
+                    };
                     let backend = active_backend_mut(left, right, state);
-                    if entry.name == ".." {
+                    if going_up {
                         backend.cd("..").await?;
                     } else {
                         backend.cd(&entry.name).await?;
@@ -962,6 +978,9 @@ async fn handle_key(
                     let pane = active_pane_mut(left_pane, right_pane, state);
                     let backend = active_backend_mut(left, right, state);
                     refresh_pane(pane, backend, state).await?;
+                    if let Some(name) = prev_dir_name {
+                        select_entry_by_name(pane, &name);
+                    }
                 } else {
                     // Download to temp file, open in pager
                     state.status_message = Some(format!("Downloading {}...", entry.name));
@@ -1133,6 +1152,8 @@ async fn handle_key(
 
         KeyCode::Backspace => {
             // Navigate up (parent directory)
+            let pane = active_pane_mut(left_pane, right_pane, state);
+            let prev_dir_name = dir_basename(&pane.cwd);
             let backend = active_backend_mut(left, right, state);
             backend.cd("..").await?;
             let new_cwd = backend.cwd().unwrap_or_default();
@@ -1146,12 +1167,30 @@ async fn handle_key(
             let pane = active_pane_mut(left_pane, right_pane, state);
             let backend = active_backend_mut(left, right, state);
             refresh_pane(pane, backend, state).await?;
+            if let Some(name) = prev_dir_name {
+                select_entry_by_name(pane, &name);
+            }
         }
 
         _ => {}
     }
 
     Ok(BrowserAction::Continue)
+}
+
+/// Extract the last component (directory name) from a path.
+fn dir_basename(path: &str) -> Option<String> {
+    std::path::Path::new(path)
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+}
+
+/// Select the entry matching `name` in the pane, updating both `selected` and `list_state`.
+fn select_entry_by_name(pane: &mut PaneState, name: &str) {
+    if let Some(idx) = pane.entries.iter().position(|e| e.name == name) {
+        pane.selected = idx;
+        pane.list_state.select(Some(idx));
+    }
 }
 
 /// Refresh a pane's file listing from its backend.

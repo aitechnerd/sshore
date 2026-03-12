@@ -45,14 +45,14 @@ const KEEPALIVE_INTERVAL_SECS: u64 = 60;
 /// Maximum consecutive keepalive failures before dropping the connection.
 const KEEPALIVE_MAX: usize = 3;
 
-/// SSH channel window size for all sessions (16 MB).
+/// SSH channel window size for all sessions (32 MB).
 ///
 /// The default russh window is only 2 MB, which throttles pipelined SFTP transfers.
-/// With 64 in-flight SFTP read requests at 261 KB each (~16 MB), we need a window
-/// large enough to keep the pipe full. 16 MB matches the pipeline capacity and
+/// With 128 in-flight SFTP read requests at 261 KB each (~32 MB), we need a window
+/// large enough to keep the pipe full. 32 MB matches the pipeline capacity and
 /// is harmless for interactive sessions (window is a flow-control limit, not a
 /// pre-allocated buffer).
-const SSH_WINDOW_SIZE: u32 = 16 * 1024 * 1024;
+const SSH_WINDOW_SIZE: u32 = 32 * 1024 * 1024;
 
 /// Maximum SSH packet size (64 KB, the SSH spec maximum).
 ///
@@ -283,6 +283,24 @@ pub async fn establish_session(
     // No inactivity_timeout — interactive sessions must never be killed due to
     // idle time (e.g. waiting at a `su -` password prompt). Keepalives detect
     // dead connections without cutting live ones.
+    // Prefer AES-256-GCM over ChaCha20-Poly1305. On Apple Silicon (and
+    // x86 with AES-NI), AES-GCM is hardware-accelerated and 2-4× faster
+    // than ChaCha20 for bulk data. This significantly reduces CPU during
+    // SFTP transfers. ChaCha20 is kept as fallback for servers that only
+    // support it.
+    let preferred = {
+        use russh::cipher;
+        let mut p = russh::Preferred::DEFAULT;
+        p.cipher = std::borrow::Cow::Borrowed(&[
+            cipher::AES_256_GCM,
+            cipher::AES_128_GCM,
+            cipher::CHACHA20_POLY1305,
+            cipher::AES_256_CTR,
+            cipher::AES_192_CTR,
+            cipher::AES_128_CTR,
+        ]);
+        p
+    };
     let ssh_config = russh::client::Config {
         inactivity_timeout: None,
         keepalive_interval: Some(std::time::Duration::from_secs(KEEPALIVE_INTERVAL_SECS)),
@@ -290,6 +308,7 @@ pub async fn establish_session(
         window_size: SSH_WINDOW_SIZE,
         maximum_packet_size: SSH_MAX_PACKET_SIZE,
         nodelay: true,
+        preferred,
         ..<_>::default()
     };
 
@@ -1077,7 +1096,8 @@ async fn run_proxy_loop(
     // Create a writer for stdin forwarding (clones the internal sender)
     let mut writer = channel_tx.make_writer();
 
-    let mut stdout = std::io::stdout();
+    let stdout_raw = std::io::stdout();
+    let mut stdout = std::io::BufWriter::with_capacity(65536, stdout_raw);
     let mut osc_stripper = terminal_theme::OscTitleStripper::new();
     let mut awaiting_confirm = false;
     let mut capturing_pw: Option<Zeroizing<String>> = None;
@@ -1180,7 +1200,7 @@ async fn run_proxy_loop(
                             // Strip remote shell title sequences to preserve sshore's tab title
                             let filtered = osc_stripper.strip(data);
                             match stdout.write_all(&filtered) {
-                                Ok(()) => { let _ = stdout.flush(); }
+                                Ok(()) => {}
                                 Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => {
                                     tracing::debug!("stdout broken pipe");
                                     break 'proxy ProxyAction::Exit;
@@ -1284,6 +1304,11 @@ async fn run_proxy_loop(
                             break 'proxy ProxyAction::Exit;
                         }
                     }
+                    // Flush stdout once after processing a channel message.
+                    // The 64KB BufWriter coalesces rapid successive writes (e.g.
+                    // cat of a large file) into fewer syscalls, while this flush
+                    // ensures output reaches the screen before we wait again.
+                    let _ = stdout.flush();
                 }
 
                 Some(bytes) = stdin_rx.recv() => {
@@ -1374,8 +1399,9 @@ async fn run_proxy_loop(
                                         let _ = tokio::io::AsyncWriteExt::write_all(&mut writer, &forward_batch).await;
                                         forward_batch.clear();
                                     }
+                                    let _ = stdout.flush();
                                     if let Ok(Some(command)) = snippet::show_snippet_picker(
-                                        &mut stdout,
+                                        stdout.get_mut(),
                                         &bookmark_snippets,
                                         &global_snippets,
                                     ) {
@@ -1391,8 +1417,9 @@ async fn run_proxy_loop(
                                         let _ = tokio::io::AsyncWriteExt::write_all(&mut writer, &forward_batch).await;
                                         forward_batch.clear();
                                     }
+                                    let _ = stdout.flush();
                                     if let Ok(Some(new_bookmark)) = snippet::show_save_bookmark_form(
-                                        &mut stdout,
+                                        stdout.get_mut(),
                                         &session_info,
                                     ) {
                                         match config::locked_modify(cfg_override, |app_config| {

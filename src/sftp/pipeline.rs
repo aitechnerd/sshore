@@ -23,19 +23,29 @@ use russh_sftp::protocol::{FileAttributes, OpenFlags};
 
 /// Default max bytes per SFTP read/write request.
 /// Matches russh-sftp's internal `MAX_READ_LENGTH` (261,120 bytes ≈ 255 KB).
-/// Actual chunk size may be smaller if the server negotiates a lower limit.
+/// Actual chunk size may be smaller if the server negotiates a lower limit,
+/// or larger if the server advertises higher limits via `limits@openssh.com`.
 pub(crate) const CHUNK_SIZE: u64 = 261_120;
 
+/// Upper bound on chunk size even when the server allows more.
+/// 1 MB balances fewer requests (less overhead) vs memory per in-flight chunk.
+const MAX_CHUNK_SIZE: u64 = 1024 * 1024;
+
 /// Maximum concurrent in-flight SFTP requests.
-/// OpenSSH uses 64. Actual depth is adaptive: min(MAX_MAX_PIPELINE_DEPTH, chunks_in_file)
-/// so small files don't waste time seeding requests they'll never need.
-const MAX_MAX_PIPELINE_DEPTH: usize = 64;
+/// OpenSSH uses 64; we use 128 to better saturate high-bandwidth, high-latency
+/// links. At 261 KB per request, 128 in-flight covers ~32 MB of data in the pipe,
+/// which at 1 Gbps and 100ms RTT keeps the link full (~12 MB in-flight needed).
+/// Actual depth is adaptive: min(MAX_PIPELINE_DEPTH, chunks_in_file) so small
+/// files don't waste time seeding requests they'll never need.
+const MAX_PIPELINE_DEPTH: usize = 128;
 
 /// Result of creating a raw SFTP session, including negotiated limits.
 pub struct PipelinedSession {
     pub raw: Arc<RawSftpSession>,
     /// Effective max bytes per read request (from server limits or default).
     pub read_chunk_size: u64,
+    /// Effective max bytes per write request (from server limits or default).
+    pub write_chunk_size: u64,
 }
 
 /// Create an initialized `RawSftpSession` from an SSH channel.
@@ -59,13 +69,20 @@ pub async fn create_raw_session(
         .map_err(|e| anyhow::anyhow!("SFTP init failed: {e}"))?;
 
     let mut read_chunk_size = CHUNK_SIZE;
+    let mut write_chunk_size = CHUNK_SIZE;
 
     // Negotiate server limits (max read/write length) if supported.
+    // Use the server's advertised limits — both smaller AND larger than our
+    // default. Larger chunks reduce per-request overhead (fewer futures,
+    // fewer HashMap entries, fewer SSH packets).
     if version.extensions.contains_key("limits@openssh.com")
         && let Ok(limits) = raw.limits().await
     {
-        if limits.max_read_len > 0 && limits.max_read_len < CHUNK_SIZE {
-            read_chunk_size = limits.max_read_len;
+        if limits.max_read_len > 0 {
+            read_chunk_size = limits.max_read_len.clamp(1, MAX_CHUNK_SIZE);
+        }
+        if limits.max_write_len > 0 {
+            write_chunk_size = limits.max_write_len.clamp(1, MAX_CHUNK_SIZE);
         }
         raw.set_limits(Arc::new(limits.into()));
     }
@@ -73,6 +90,7 @@ pub async fn create_raw_session(
     Ok(PipelinedSession {
         raw: Arc::new(raw),
         read_chunk_size,
+        write_chunk_size,
     })
 }
 
@@ -165,12 +183,14 @@ async fn download_inner<F: FnMut(u64)>(
     let mut next_request_offset = start_offset;
     let mut next_write_offset = start_offset;
     let mut inflight = FuturesUnordered::new();
-    let mut buffer: HashMap<u64, Vec<u8>> = HashMap::new();
 
     // Adaptive pipeline depth: no point having more in-flight requests than chunks in the file.
     let remaining = total_size - start_offset;
     let total_chunks = remaining.div_ceil(chunk_size) as usize;
-    let depth = total_chunks.min(MAX_MAX_PIPELINE_DEPTH);
+    let depth = total_chunks.min(MAX_PIPELINE_DEPTH);
+
+    // Pre-allocate with expected capacity to avoid rehashing.
+    let mut buffer: HashMap<u64, Vec<u8>> = HashMap::with_capacity(depth);
 
     // Seed the pipeline with concurrent read requests.
     while inflight.len() < depth && next_request_offset < total_size {
@@ -198,9 +218,6 @@ async fn download_inner<F: FnMut(u64)>(
         // so the UI speed display reflects actual network throughput.
         on_bytes_written(received_len);
 
-        // Buffer the response (may arrive out of order).
-        buffer.insert(offset, data.data);
-
         // If the server returned less data than requested (short read),
         // re-request the remaining range to fill the gap.
         if received_len < expected_len && offset + received_len < total_size {
@@ -215,13 +232,26 @@ async fn download_inner<F: FnMut(u64)>(
             );
         }
 
-        // Flush contiguous chunks to disk in order.
-        while let Some(chunk) = buffer.remove(&next_write_offset) {
-            let chunk_len = chunk.len() as u64;
+        // Fast path: if this chunk is the next expected offset, write directly
+        // to disk without touching the HashMap. This is the common case when
+        // responses arrive roughly in order.
+        if offset == next_write_offset {
             local_file
-                .write_all(&chunk)
+                .write_all(&data.data)
                 .context("Failed to write to local file")?;
-            next_write_offset += chunk_len;
+            next_write_offset += received_len;
+
+            // Drain any buffered chunks that are now contiguous.
+            while let Some(chunk) = buffer.remove(&next_write_offset) {
+                let chunk_len = chunk.len() as u64;
+                local_file
+                    .write_all(&chunk)
+                    .context("Failed to write to local file")?;
+                next_write_offset += chunk_len;
+            }
+        } else {
+            // Out-of-order response: buffer it.
+            buffer.insert(offset, data.data);
         }
 
         // Refill pipeline with new chunks beyond what's already requested.
@@ -259,6 +289,7 @@ pub async fn upload<F: FnMut(u64)>(
     remote_path: &str,
     local_file: &mut (impl Read + Send),
     total_size: u64,
+    chunk_size: u64,
     mut on_bytes_written: F,
     cancel: Option<&AtomicBool>,
 ) -> Result<()> {
@@ -277,6 +308,7 @@ pub async fn upload<F: FnMut(u64)>(
         Arc::clone(&handle_str),
         local_file,
         total_size,
+        chunk_size,
         &mut on_bytes_written,
         cancel,
     )
@@ -303,6 +335,7 @@ async fn upload_inner<F: FnMut(u64)>(
     handle_str: Arc<str>,
     local_file: &mut (impl Read + Send),
     total_size: u64,
+    chunk_size: u64,
     on_bytes_written: &mut F,
     cancel: Option<&AtomicBool>,
 ) -> Result<()> {
@@ -310,19 +343,22 @@ async fn upload_inner<F: FnMut(u64)>(
     let mut inflight = FuturesUnordered::new();
 
     // Adaptive pipeline depth for small files.
-    let total_chunks = total_size.div_ceil(CHUNK_SIZE) as usize;
-    let depth = total_chunks.min(MAX_MAX_PIPELINE_DEPTH);
+    let total_chunks = total_size.div_ceil(chunk_size) as usize;
+    let depth = total_chunks.min(MAX_PIPELINE_DEPTH);
+
+    // Pre-allocate a reusable read buffer to avoid per-chunk allocation.
+    let mut read_buf = vec![0u8; chunk_size as usize];
 
     // Seed the pipeline.
     while inflight.len() < depth && offset < total_size {
-        let len = chunk_len(offset, total_size) as usize;
-        let n = read_chunk(local_file, len)?;
-        if n.is_empty() {
+        let len = std::cmp::min(chunk_size, total_size - offset) as usize;
+        let n = read_chunk_into(local_file, &mut read_buf, len)?;
+        if n == 0 {
             break;
         }
-        let written = n.len() as u64;
-        queue_write(&mut inflight, raw, Arc::clone(&handle_str), offset, n);
-        offset += written;
+        let data = read_buf[..n].to_vec();
+        queue_write(&mut inflight, raw, Arc::clone(&handle_str), offset, data);
+        offset += n as u64;
     }
 
     // Process ACKs and refill.
@@ -336,12 +372,12 @@ async fn upload_inner<F: FnMut(u64)>(
 
         // Refill.
         if offset < total_size {
-            let len = chunk_len(offset, total_size) as usize;
-            let n = read_chunk(local_file, len)?;
-            if !n.is_empty() {
-                let written = n.len() as u64;
-                queue_write(&mut inflight, raw, Arc::clone(&handle_str), offset, n);
-                offset += written;
+            let len = std::cmp::min(chunk_size, total_size - offset) as usize;
+            let n = read_chunk_into(local_file, &mut read_buf, len)?;
+            if n > 0 {
+                let data = read_buf[..n].to_vec();
+                queue_write(&mut inflight, raw, Arc::clone(&handle_str), offset, data);
+                offset += n as u64;
             }
         }
     }
@@ -349,21 +385,21 @@ async fn upload_inner<F: FnMut(u64)>(
     Ok(())
 }
 
-/// Read a chunk from a local file. Returns the data (may be shorter than `len` at EOF).
-fn read_chunk(file: &mut impl Read, len: usize) -> Result<Vec<u8>> {
-    let mut buf = vec![0u8; len];
+/// Read up to `len` bytes from a file into `buf`. Returns bytes read.
+/// Reuses the caller's buffer to avoid per-chunk allocation overhead.
+fn read_chunk_into(file: &mut impl Read, buf: &mut [u8], len: usize) -> Result<usize> {
+    let target = len.min(buf.len());
     let mut filled = 0;
-    while filled < len {
+    while filled < target {
         let n = file
-            .read(&mut buf[filled..])
+            .read(&mut buf[filled..target])
             .context("Failed to read local file")?;
         if n == 0 {
             break;
         }
         filled += n;
     }
-    buf.truncate(filled);
-    Ok(buf)
+    Ok(filled)
 }
 
 /// (offset, expected_len, result) — expected_len lets us detect short reads.
@@ -404,11 +440,6 @@ fn queue_write(
         r.write(handle_str.as_ref(), offset, data).await?;
         Ok(len)
     }));
-}
-
-/// Calculate chunk length for uploads, clamping to file boundary.
-fn chunk_len(offset: u64, total_size: u64) -> u64 {
-    std::cmp::min(CHUNK_SIZE, total_size - offset)
 }
 
 // === Handle-based API for prefetching open/close across files ===
@@ -471,6 +502,7 @@ pub async fn upload_from_handle<F: FnMut(u64)>(
     handle_str: &Arc<str>,
     local_file: &mut (impl Read + Send),
     total_size: u64,
+    chunk_size: u64,
     on_bytes_written: &mut F,
     cancel: Option<&AtomicBool>,
 ) -> Result<()> {
@@ -479,6 +511,7 @@ pub async fn upload_from_handle<F: FnMut(u64)>(
         Arc::clone(handle_str),
         local_file,
         total_size,
+        chunk_size,
         on_bytes_written,
         cancel,
     )

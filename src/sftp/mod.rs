@@ -355,6 +355,7 @@ async fn cmd_put(
         remote,
         &mut local_file,
         total,
+        session.write_chunk_size,
         |b| progress.update(b),
         None,
     )

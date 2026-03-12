@@ -278,6 +278,7 @@ impl SftpBackend {
             remote_path,
             &mut local_file,
             total,
+            session.write_chunk_size,
             |bytes| {
                 if let Some(p) = progress {
                     p.fetch_add(bytes, Ordering::Relaxed);

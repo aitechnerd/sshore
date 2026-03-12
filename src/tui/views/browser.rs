@@ -221,6 +221,7 @@ struct TransferTarget {
 struct PipelinedWorker {
     raw: Arc<RawSftpSession>,
     read_chunk_size: u64,
+    write_chunk_size: u64,
 }
 
 /// Info about a file currently being transferred by a worker.
@@ -2872,6 +2873,7 @@ fn spawn_worker(
     let pool = Arc::clone(pool);
     let raw = worker.raw;
     let read_chunk_size = worker.read_chunk_size;
+    let write_chunk_size = worker.write_chunk_size;
 
     tokio::spawn(async move {
         tracing::debug!("worker[{worker_id}] spawned (chunk_size={read_chunk_size})");
@@ -2957,6 +2959,7 @@ fn spawn_worker(
                 pool.direction,
                 worker_id,
                 read_chunk_size,
+                write_chunk_size,
                 &pool.progress,
                 &pool.cancel,
                 &pool.skip,
@@ -3356,6 +3359,7 @@ async fn run_file_transfer(
     direction: TransferDirection,
     worker_id: usize,
     read_chunk_size: u64,
+    write_chunk_size: u64,
     progress: &TransferProgress,
     cancel: &AtomicBool,
     skip: &AtomicBool,
@@ -3386,6 +3390,7 @@ async fn run_file_transfer(
                 handle_str,
                 &mut local_file,
                 total,
+                write_chunk_size,
                 &mut on_bytes,
                 Some(combined_cancel.as_ref()),
             );
@@ -4439,6 +4444,7 @@ async fn open_pipelined_worker(
     Ok(PipelinedWorker {
         raw: session.raw,
         read_chunk_size: session.read_chunk_size,
+        write_chunk_size: session.write_chunk_size,
     })
 }
 

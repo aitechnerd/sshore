@@ -195,7 +195,7 @@ async fn download(
         .context("Failed to open transfer channel")?;
     let session = pipeline::create_raw_session(channel).await?;
 
-    let mut local_file = BufWriter::new(local_file);
+    let mut local_file = BufWriter::with_capacity((pipeline::CHUNK_SIZE * 2) as usize, local_file);
     let mut progress = ProgressBar::new(total);
     progress.transferred = offset;
 
@@ -259,6 +259,7 @@ async fn upload(
         remote_path,
         &mut local_file,
         total,
+        session.write_chunk_size,
         |bytes| progress.update(bytes),
         None,
     )

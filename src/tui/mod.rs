@@ -22,6 +22,7 @@ use crate::config::ssh_import::merge_imports;
 use crate::keychain;
 use crate::ssh;
 use crate::tui::theme::{ThemeColors, resolve_theme};
+use crate::tui::views::browser::truncate_name;
 use crate::tui::views::confirm::ConfirmState;
 use crate::tui::views::form::FormState;
 use crate::tui::views::{confirm, form, help, import_wizard, list};
@@ -455,8 +456,10 @@ fn draw(frame: &mut ratatui::Frame, app: &App) {
     if let Some((ref msg, _)) = app.status_message
         && !msg.is_empty()
     {
+        let available = chunks[chunk_idx].width.saturating_sub(1) as usize;
+        let display_msg = truncate_name(msg, available);
         let status_line = ratatui::text::Line::from(ratatui::text::Span::styled(
-            format!(" {msg}"),
+            format!(" {display_msg}"),
             Style::default().fg(theme.warning),
         ));
         frame.render_widget(

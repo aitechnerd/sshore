@@ -436,6 +436,9 @@ pub struct BrowserState {
     overwrite_response_tx: Option<tokio::sync::oneshot::Sender<OverwriteAnswer>>,
     /// Force a full terminal repaint (e.g. after returning from an external pager).
     pub needs_full_redraw: bool,
+    /// Persistent overwrite policy across transfers in this browser session.
+    /// 0=ask, 1=overwrite all, 2=skip all.
+    overwrite_policy: Arc<AtomicU64>,
 }
 
 /// Whether a pane shows a local or remote filesystem.
@@ -504,6 +507,7 @@ pub async fn run(
         popup_transfer_index: 0,
         overwrite_response_tx: None,
         needs_full_redraw: false,
+        overwrite_policy: Arc::new(AtomicU64::new(0)),
     };
 
     // Initial load
@@ -1409,11 +1413,16 @@ fn draw(
         );
     }
 
-    // Status message
+    // Status message (truncated to available width so long messages get "..."
+    // instead of being silently clipped by ratatui).
     if has_status {
         let msg = state.status_message.as_deref().unwrap_or("");
+        let available = main_chunks[3].width as usize;
+        // Account for the leading space in the format.
+        let max_msg = available.saturating_sub(1);
+        let display_msg = truncate_name(msg, max_msg);
         frame.render_widget(
-            Paragraph::new(msg).style(Style::default().fg(Color::DarkGray)),
+            Paragraph::new(format!(" {display_msg}")).style(Style::default().fg(Color::DarkGray)),
             main_chunks[3],
         );
     }
@@ -2398,9 +2407,13 @@ fn draw_transfer_complete_popup(frame: &mut Frame, area: Rect, msg: &str) {
         return;
     }
 
+    // Truncate message to fit within popup borders (2 chars for borders).
+    let max_msg_width = popup_area.width.saturating_sub(2) as usize;
+    let display_msg = truncate_name(msg, max_msg_width);
+
     let lines = vec![
         Line::from(Span::styled(
-            format!(" {msg}"),
+            format!(" {display_msg}"),
             Style::default().add_modifier(Modifier::BOLD),
         )),
         Line::from(""),
@@ -3634,7 +3647,7 @@ async fn start_copy_transfer(
             // Capacity matches max workers so none block waiting to submit their query.
             let (ow_tx, ow_rx) =
                 tokio::sync::mpsc::channel::<OverwriteQuery>(WORKERS_PER_CONNECTION * 2 + 1);
-            let ow_policy = Arc::new(AtomicU64::new(0));
+            let ow_policy = Arc::clone(&state.overwrite_policy);
             let bg_ow_policy = Arc::clone(&ow_policy);
 
             // Channel for dynamically adding workers (primary extra + second connection).
@@ -4532,9 +4545,12 @@ async fn open_pipelined_worker(
 
 /// Truncate a filename to fit within a given character width.
 /// Uses `char` boundaries so multi-byte UTF-8 filenames don't panic.
-fn truncate_name(name: &str, max_len: usize) -> String {
+pub(crate) fn truncate_name(name: &str, max_len: usize) -> String {
     if name.chars().count() <= max_len {
         name.to_string()
+    } else if max_len < 3 {
+        // Not enough room for even "...", just take what fits.
+        name.chars().take(max_len).collect()
     } else {
         let truncated: String = name.chars().take(max_len.saturating_sub(3)).collect();
         format!("{truncated}...")
@@ -4859,6 +4875,37 @@ mod tests {
     fn test_truncate_name_minimum() {
         // With max_len=3, we get "..."
         assert_eq!(truncate_name("abcd", 3), "...");
+    }
+
+    #[test]
+    fn test_truncate_name_zero_width() {
+        // Zero width should return empty string, never panic.
+        assert_eq!(truncate_name("hello", 0), "");
+        assert_eq!(truncate_name("", 0), "");
+        // Width 1 and 2: too small for "...", just take what fits.
+        assert_eq!(truncate_name("hello", 1), "h");
+        assert_eq!(truncate_name("hello", 2), "he");
+    }
+
+    #[test]
+    fn test_overwrite_policy_persists_across_transfers() {
+        // The overwrite policy is shared via Arc<AtomicU64> across all transfers
+        // in a browser session. When a user picks "Overwrite All" (1) or
+        // "Skip All" (2), subsequent transfers read the same value.
+        let policy = Arc::new(AtomicU64::new(0));
+        assert_eq!(policy.load(Ordering::Relaxed), 0); // default: ask
+
+        // Simulate first transfer setting "overwrite all"
+        let transfer1_policy = Arc::clone(&policy);
+        transfer1_policy.store(1, Ordering::Relaxed);
+
+        // Simulate second transfer reading the persisted policy
+        let transfer2_policy = Arc::clone(&policy);
+        assert_eq!(transfer2_policy.load(Ordering::Relaxed), 1);
+
+        // Simulate user changing to "skip all"
+        transfer2_policy.store(2, Ordering::Relaxed);
+        assert_eq!(policy.load(Ordering::Relaxed), 2);
     }
 
     #[test]

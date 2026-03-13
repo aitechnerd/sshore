@@ -3377,8 +3377,10 @@ async fn run_background_transfer(
         }
         tracing::debug!("transfer:join awaited {batch_size} worker handles");
     }
-    extra_listener.abort(); // Listener no longer needed
-    mem_reporter.abort(); // Stop periodic memory logging
+    // Signal helper tasks to stop, then wait for them to exit gracefully.
+    cancel.store(true, Ordering::Relaxed);
+    let _ = extra_listener.await;
+    let _ = mem_reporter.await;
 
     let final_copied = pool.copied.load(Ordering::Relaxed) as usize;
     let final_error = pool.last_error.lock().unwrap().clone();

@@ -13,6 +13,8 @@ mod wasm;
 #[cfg(not(target_arch = "wasm32"))]
 pub use unix::{mlock, mmap_alloc, mmap_dealloc};
 // munlock is used internally by mmap_dealloc; re-export for other crates.
+#[cfg(not(windows))]
+#[cfg(not(target_arch = "wasm32"))]
 #[allow(unused_imports)]
 pub use unix::munlock;
 #[cfg(target_arch = "wasm32")]

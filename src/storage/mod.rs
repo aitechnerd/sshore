@@ -172,6 +172,16 @@ impl Backend {
         }
     }
 
+    /// Get a cloneable Arc to the SSH handle (for passing into spawned tasks).
+    pub fn ssh_handle_arc(
+        &self,
+    ) -> Option<std::sync::Arc<russh::client::Handle<crate::ssh::client::SshoreHandler>>> {
+        match self {
+            Backend::Local(_) => None,
+            Backend::Sftp(b) => b.ssh_handle_arc(),
+        }
+    }
+
     /// Establish a new, independent SSH connection to the same host.
     /// Returns a fresh handle on a separate TCP socket.
     pub async fn establish_new_connection(

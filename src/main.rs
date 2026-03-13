@@ -1,3 +1,22 @@
+/// Use jemalloc with aggressive page return so freed memory (especially
+/// mlocked CryptoVec pages from russh) is returned to the OS promptly.
+/// Without this, macOS's system allocator holds freed pages indefinitely,
+/// inflating RSS to ~500 MB during SFTP transfers despite low actual usage.
+#[global_allocator]
+static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
+/// Jemalloc tuning:
+/// - `dirty_decay_ms:0,muzzy_decay_ms:0` — purge freed pages immediately.
+/// - `retain:false` — use `munmap()` instead of `madvise()` to return pages.
+///   On macOS, `madvise(MADV_FREE)` only marks pages as reusable without
+///   reducing RSS. `munmap()` forces the kernel to reclaim them immediately,
+///   preventing phantom RSS inflation from short-lived CryptoVec allocations.
+/// - `background_thread:true` — enables async purging for any residual pages.
+#[allow(non_upper_case_globals)]
+#[unsafe(export_name = "malloc_conf")]
+pub static malloc_conf: &[u8] =
+    b"background_thread:true,dirty_decay_ms:0,muzzy_decay_ms:0,retain:false\0";
+
 mod cli;
 mod config;
 mod keychain;

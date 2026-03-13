@@ -1,17 +1,16 @@
 /// Pipelined SFTP transfers.
 ///
 /// SFTP protocol allows multiple in-flight requests on a single channel.
-/// OpenSSH's sftp client uses 64 concurrent requests to keep the network pipe
-/// full regardless of RTT. This module keeps a bounded set of in-flight
+/// Like OpenSSH's sftp client, this module keeps a bounded set of in-flight
 /// requests without spawning a Tokio task per chunk.
 ///
 /// **Architecture**: Fire N concurrent `SSH_FXP_READ` requests via a bounded
-/// future queue,
-/// buffer out-of-order responses, and write to the local file in sequential
-/// order (preserving resume compatibility with `.part` files).
-use std::collections::HashMap;
+/// future queue, write each response directly at its file offset (via seek)
+/// as it arrives — no reorder buffer needed. This matches OpenSSH's approach
+/// of lseek + write per response, keeping peak memory proportional to the
+/// pipeline depth rather than total file size.
 use std::future::Future;
-use std::io::{Read, Write};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -31,13 +30,16 @@ pub(crate) const CHUNK_SIZE: u64 = 261_120;
 /// 1 MB balances fewer requests (less overhead) vs memory per in-flight chunk.
 const MAX_CHUNK_SIZE: u64 = 1024 * 1024;
 
-/// Maximum concurrent in-flight SFTP requests.
-/// OpenSSH uses 64; we use 128 to better saturate high-bandwidth, high-latency
-/// links. At 261 KB per request, 128 in-flight covers ~32 MB of data in the pipe,
-/// which at 1 Gbps and 100ms RTT keeps the link full (~12 MB in-flight needed).
-/// Actual depth is adaptive: min(MAX_PIPELINE_DEPTH, chunks_in_file) so small
-/// files don't waste time seeding requests they'll never need.
-const MAX_PIPELINE_DEPTH: usize = 128;
+/// Maximum concurrent in-flight SFTP requests (hard cap).
+const MAX_PIPELINE_DEPTH: usize = 64;
+
+/// Target upper bound on in-flight bytes across all concurrent requests.
+/// Matches SSH_WINDOW_SIZE (2 MB) — the SSH channel backpressure limit.
+/// With no reorder buffer (direct offset writes like OpenSSH), each chunk
+/// exists only briefly between SFTP response and disk write. 2 MB in-flight
+/// saturates most links (at 100 ms RTT, covers ~160 Mbps — typical SSH
+/// single-connection throughput).
+const MAX_INFLIGHT_BYTES: u64 = 2 * 1024 * 1024;
 
 /// Result of creating a raw SFTP session, including negotiated limits.
 pub struct PipelinedSession {
@@ -96,20 +98,21 @@ pub async fn create_raw_session(
 
 /// Pipelined SFTP download.
 ///
-/// Fires `MAX_PIPELINE_DEPTH` concurrent `SSH_FXP_READ` requests and writes
-/// responses to the local file in sequential order. Out-of-order responses
-/// are buffered in memory (bounded by `MAX_PIPELINE_DEPTH` × chunk_size).
+/// Fires up to `MAX_PIPELINE_DEPTH` concurrent `SSH_FXP_READ` requests and
+/// writes each response directly at its file offset as it arrives (like
+/// OpenSSH's lseek + write). No reorder buffer — peak memory is bounded
+/// by pipeline depth × chunk_size.
 ///
 /// `chunk_size` should come from `PipelinedSession::read_chunk_size` to
 /// match the server's negotiated limits and avoid short reads.
 ///
-/// `on_bytes_written` is called after each contiguous chunk is flushed to disk,
+/// `on_bytes_written` is called after each chunk is written to disk,
 /// with the number of bytes just written. This enables progress reporting.
 #[allow(clippy::too_many_arguments)]
 pub async fn download<F: FnMut(u64)>(
     raw: &Arc<RawSftpSession>,
     remote_path: &str,
-    local_file: &mut (impl Write + Send),
+    local_file: &mut (impl Write + Seek + Send),
     total_size: u64,
     start_offset: u64,
     chunk_size: u64,
@@ -169,11 +172,15 @@ pub async fn download<F: FnMut(u64)>(
 }
 
 /// Inner download loop. Separated so the handle is always closed in `download()`.
+///
+/// Like OpenSSH's sftp client, writes each response directly at its file
+/// offset as it arrives. No reorder buffer — out-of-order responses are
+/// handled via seek. Peak memory is bounded by pipeline depth × chunk_size.
 #[allow(clippy::too_many_arguments)]
 async fn download_inner<F: FnMut(u64)>(
     raw: &Arc<RawSftpSession>,
     handle_str: Arc<str>,
-    local_file: &mut (impl Write + Send),
+    local_file: &mut (impl Write + Seek + Send),
     total_size: u64,
     start_offset: u64,
     chunk_size: u64,
@@ -181,16 +188,14 @@ async fn download_inner<F: FnMut(u64)>(
     cancel: Option<&AtomicBool>,
 ) -> Result<()> {
     let mut next_request_offset = start_offset;
-    let mut next_write_offset = start_offset;
     let mut inflight = FuturesUnordered::new();
 
-    // Adaptive pipeline depth: no point having more in-flight requests than chunks in the file.
+    // Adaptive pipeline depth: cap by in-flight bytes so larger chunks use fewer
+    // concurrent requests, keeping memory bounded regardless of server limits.
     let remaining = total_size - start_offset;
     let total_chunks = remaining.div_ceil(chunk_size) as usize;
-    let depth = total_chunks.min(MAX_PIPELINE_DEPTH);
-
-    // Pre-allocate with expected capacity to avoid rehashing.
-    let mut buffer: HashMap<u64, Vec<u8>> = HashMap::with_capacity(depth);
+    let by_bytes = (MAX_INFLIGHT_BYTES / chunk_size).max(8) as usize;
+    let depth = total_chunks.min(MAX_PIPELINE_DEPTH).min(by_bytes);
 
     // Seed the pipeline with concurrent read requests.
     while inflight.len() < depth && next_request_offset < total_size {
@@ -206,6 +211,7 @@ async fn download_inner<F: FnMut(u64)>(
     }
 
     // Process responses and refill pipeline.
+    // Like OpenSSH: seek to offset, write, free. No reorder buffer.
     while let Some((offset, expected_len, sftp_result)) = inflight.next().await {
         if cancel.is_some_and(|c| c.load(Ordering::Relaxed)) {
             anyhow::bail!("Transfer cancelled");
@@ -214,8 +220,8 @@ async fn download_inner<F: FnMut(u64)>(
         let data = sftp_result.map_err(|e| anyhow::anyhow!("SFTP read failed: {e}"))?;
         let received_len = data.data.len() as u64;
 
-        // Report progress as soon as data arrives (not after in-order write),
-        // so the UI speed display reflects actual network throughput.
+        // Report progress as soon as data arrives, so the UI speed display
+        // reflects actual network throughput.
         on_bytes_written(received_len);
 
         // If the server returned less data than requested (short read),
@@ -232,27 +238,17 @@ async fn download_inner<F: FnMut(u64)>(
             );
         }
 
-        // Fast path: if this chunk is the next expected offset, write directly
-        // to disk without touching the HashMap. This is the common case when
-        // responses arrive roughly in order.
-        if offset == next_write_offset {
-            local_file
-                .write_all(&data.data)
-                .context("Failed to write to local file")?;
-            next_write_offset += received_len;
-
-            // Drain any buffered chunks that are now contiguous.
-            while let Some(chunk) = buffer.remove(&next_write_offset) {
-                let chunk_len = chunk.len() as u64;
-                local_file
-                    .write_all(&chunk)
-                    .context("Failed to write to local file")?;
-                next_write_offset += chunk_len;
-            }
-        } else {
-            // Out-of-order response: buffer it.
-            buffer.insert(offset, data.data);
-        }
+        // Write directly at the correct file offset (like OpenSSH's lseek + write).
+        // No reorder buffer needed — out-of-order responses just seek to their
+        // position. The chunk data is freed immediately after write.
+        let local_offset = offset - start_offset;
+        local_file
+            .seek(SeekFrom::Start(local_offset))
+            .context("Failed to seek in local file")?;
+        local_file
+            .write_all(&data.data)
+            .context("Failed to write to local file")?;
+        // `data` (mmap-backed Bytes) is dropped here → munmap → RSS freed.
 
         // Refill pipeline with new chunks beyond what's already requested.
         if next_request_offset < total_size {
@@ -266,14 +262,6 @@ async fn download_inner<F: FnMut(u64)>(
             );
             next_request_offset += len;
         }
-    }
-
-    // Flush any remaining buffered chunks (shouldn't happen if pipeline drains cleanly).
-    while let Some(chunk) = buffer.remove(&next_write_offset) {
-        local_file
-            .write_all(&chunk)
-            .context("Failed to write to local file")?;
-        next_write_offset += chunk.len() as u64;
     }
 
     local_file.flush().context("Failed to flush local file")?;
@@ -342,9 +330,10 @@ async fn upload_inner<F: FnMut(u64)>(
     let mut offset = 0u64;
     let mut inflight = FuturesUnordered::new();
 
-    // Adaptive pipeline depth for small files.
+    // Adaptive pipeline depth: cap by in-flight bytes (same as download).
     let total_chunks = total_size.div_ceil(chunk_size) as usize;
-    let depth = total_chunks.min(MAX_PIPELINE_DEPTH);
+    let by_bytes = (MAX_INFLIGHT_BYTES / chunk_size).max(8) as usize;
+    let depth = total_chunks.min(MAX_PIPELINE_DEPTH).min(by_bytes);
 
     // Pre-allocate a reusable read buffer to avoid per-chunk allocation.
     let mut read_buf = vec![0u8; chunk_size as usize];
@@ -473,7 +462,7 @@ pub async fn close_handle(raw: &RawSftpSession, handle: &str) {
 pub async fn download_from_handle<F: FnMut(u64)>(
     raw: &Arc<RawSftpSession>,
     handle_str: &Arc<str>,
-    local_file: &mut (impl Write + Send),
+    local_file: &mut (impl Write + Seek + Send),
     total_size: u64,
     start_offset: u64,
     chunk_size: u64,

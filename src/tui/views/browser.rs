@@ -32,14 +32,16 @@ const PROGRESS_POLL_RATE: Duration = Duration::from_millis(100);
 const SFTP_SCAN_CONCURRENCY: usize = 16;
 
 /// Number of pipelined SFTP workers per SSH/TCP connection.
-/// Each worker fires up to 64 concurrent SFTP requests internally.
+/// Each worker fires concurrent SFTP requests internally.
+/// 2 allows overlapping file transfers on the same connection,
+/// which helps for multi-file batches without much extra memory
+/// (~30 MB per extra worker with 8 MB in-flight cap).
 const WORKERS_PER_CONNECTION: usize = 2;
 
 /// Minimum number of transfer targets before opening a second SSH connection.
-/// Even a single directory can expand to hundreds of files, so keep this at 1
-/// to always open a second connection. The overhead is just one background SSH
-/// handshake that's discarded if not needed.
-const MIN_FILES_FOR_SECOND_CONN: usize = 1;
+/// A second connection doubles memory, so only open it for batches large enough
+/// to benefit from the parallelism.
+const MIN_FILES_FOR_SECOND_CONN: usize = 10;
 
 /// Drop guard that restores terminal state when the browser exits (normally or on error).
 struct BrowserGuard;
@@ -452,7 +454,10 @@ pub async fn run(
     show_hidden: bool,
     theme: &ThemeColors,
 ) -> Result<()> {
-    tracing::debug!("browser starting for bookmark={bookmark_name} env={env}");
+    tracing::debug!(
+        "MEM[browser:start]: {:.1} MB RSS — bookmark={bookmark_name} env={env}",
+        rss_mb()
+    );
 
     // Enter TUI mode — BrowserGuard ensures cleanup on any exit path
     crossterm::terminal::enable_raw_mode()?;
@@ -523,6 +528,13 @@ pub async fn run(
                             last_error: Some("Transfer task panicked".into()),
                         },
                     };
+
+                    tracing::debug!(
+                        "MEM[browser:transfer_finished]: {:.1} MB RSS — {}/{} files",
+                        rss_mb(),
+                        result.copied,
+                        result.total
+                    );
 
                     let is_move = transfer.delete_sources.is_some();
                     let summary = format_transfer_result(&result, &transfer.description, is_move);
@@ -744,7 +756,7 @@ pub async fn run(
     }
 
     // BrowserGuard handles terminal cleanup on drop
-    tracing::debug!("browser exiting normally");
+    tracing::debug!("MEM[browser:exit]: {:.1} MB RSS", rss_mb());
     Ok(())
 }
 
@@ -2876,7 +2888,10 @@ fn spawn_worker(
     let write_chunk_size = worker.write_chunk_size;
 
     tokio::spawn(async move {
-        tracing::debug!("worker[{worker_id}] spawned (chunk_size={read_chunk_size})");
+        tracing::debug!(
+            "MEM[worker:spawn]: {:.1} MB RSS — worker[{worker_id}] chunk_size={read_chunk_size}",
+            rss_mb()
+        );
         let worker_start = std::time::Instant::now();
         let mut files_completed = 0u64;
         let mut bytes_transferred = 0u64;
@@ -3063,12 +3078,22 @@ fn spawn_worker(
                     } else {
                         0.0
                     };
-                    tracing::debug!(
-                        "worker[{worker_id}] file done: {} {:.1}MB in {:.1}s = {mbps:.1}MB/s (open={open_ms}ms)",
-                        target.name,
-                        target.size as f64 / 1_048_576.0,
-                        xfer_ms as f64 / 1000.0,
-                    );
+                    // Log memory every 5 files or on first file to track RSS over time.
+                    if files_completed == 1 || files_completed % 5 == 0 {
+                        tracing::debug!(
+                            "MEM[worker:file_done]: {:.1} MB RSS — worker[{worker_id}] #{files_completed} {} {:.1}MB {mbps:.1}MB/s",
+                            rss_mb(),
+                            target.name,
+                            target.size as f64 / 1_048_576.0
+                        );
+                    } else {
+                        tracing::debug!(
+                            "worker[{worker_id}] file done: {} {:.1}MB in {:.1}s = {mbps:.1}MB/s (open={open_ms}ms)",
+                            target.name,
+                            target.size as f64 / 1_048_576.0,
+                            xfer_ms as f64 / 1000.0,
+                        );
+                    }
                 }
                 Err(_) if pool.cancel.load(Ordering::Relaxed) => {
                     // Close prefetched handle before exiting.
@@ -3101,6 +3126,11 @@ fn spawn_worker(
         }
 
         // Worker summary.
+        tracing::debug!(
+            "MEM[worker:done]: {:.1} MB RSS — worker[{worker_id}] {files_completed} files, {:.1} MB",
+            rss_mb(),
+            bytes_transferred as f64 / 1_048_576.0
+        );
         let wall_ms = worker_start.elapsed().as_millis() as u64;
         let active_pct = if wall_ms > 0 {
             total_transfer_ms as f64 / wall_ms as f64 * 100.0
@@ -3156,16 +3186,15 @@ async fn run_background_transfer(
         TransferDirection::RemoteToLocal => "download",
     };
     tracing::debug!(
-        "transfer:start {dir_label} targets={} initial_workers={}",
+        "MEM[bg:start]: {:.1} MB RSS — {dir_label} targets={} initial_workers={}",
+        rss_mb(),
         targets.len(),
-        initial_workers.len(),
+        initial_workers.len()
     );
-
-    let scan_sftp = &scan_sftp;
 
     // Expand directories into flat file lists
     let scan_start = std::time::Instant::now();
-    let targets = match expand_directory_targets(scan_sftp, targets, direction, &progress).await {
+    let targets = match expand_directory_targets(&scan_sftp, targets, direction, &progress).await {
         Ok(t) => t,
         Err(e) => {
             progress.scanning.store(false, Ordering::Relaxed);
@@ -3196,9 +3225,10 @@ async fn run_background_transfer(
     file_targets.sort_by(|a, b| b.size.cmp(&a.size));
 
     tracing::debug!(
-        "transfer:scan done in {scan_ms}ms — {} dirs, {} files",
+        "MEM[bg:scan_done]: {:.1} MB RSS — in {scan_ms}ms — {} dirs, {} files",
+        rss_mb(),
         dir_targets.len(),
-        file_targets.len(),
+        file_targets.len()
     );
 
     // Create directories sequentially first (order matters for nested dirs)
@@ -3232,6 +3262,12 @@ async fn run_background_transfer(
         );
     }
 
+    // Drop scan session — frees its SSH channel and mlocked buffers before
+    // workers start filling their own channels with transfer data.
+    tracing::debug!("MEM[bg:pre_drop_scan_sftp]: {:.1} MB RSS", rss_mb());
+    drop(scan_sftp);
+    tracing::debug!("MEM[bg:post_drop_scan_sftp]: {:.1} MB RSS", rss_mb());
+
     let total = file_targets.len();
     let total_bytes: u64 = file_targets.iter().map(|t| t.size).sum();
     progress.total_files.store(total as u64, Ordering::Relaxed);
@@ -3240,8 +3276,9 @@ async fn run_background_transfer(
         .store(total_bytes, Ordering::Relaxed);
 
     tracing::debug!(
-        "transfer:files {total} files, {:.1} MB total",
-        total_bytes as f64 / 1_048_576.0,
+        "MEM[bg:files_queued]: {:.1} MB RSS — {total} files, {:.1} MB total",
+        rss_mb(),
+        total_bytes as f64 / 1_048_576.0
     );
 
     if total == 0 {
@@ -3266,6 +3303,20 @@ async fn run_background_transfer(
         overwrite_policy,
     });
 
+    // Periodic memory reporter — logs RSS every 2 seconds during transfer.
+    let mem_cancel = Arc::clone(&cancel);
+    let mem_reporter = tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(2));
+        interval.tick().await; // skip immediate first tick
+        loop {
+            interval.tick().await;
+            if mem_cancel.load(Ordering::Relaxed) {
+                break;
+            }
+            tracing::debug!("MEM[bg:periodic]: {:.1} MB RSS", rss_mb());
+        }
+    });
+
     // Spawn initial workers immediately.
     let worker_handles: Arc<tokio::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>> =
         Arc::new(tokio::sync::Mutex::new(Vec::new()));
@@ -3288,8 +3339,9 @@ async fn run_background_transfer(
                 break;
             }
             tracing::debug!(
-                "transfer:extra_worker {next_id} added at +{:.1}s",
-                transfer_wall_start.elapsed().as_secs_f64(),
+                "MEM[bg:extra_worker]: {:.1} MB RSS — {next_id} added at +{:.1}s",
+                rss_mb(),
+                transfer_wall_start.elapsed().as_secs_f64()
             );
             let handle = spawn_worker(next_id, worker, &extra_pool);
             extra_handles.lock().await.push(handle);
@@ -3326,6 +3378,7 @@ async fn run_background_transfer(
         tracing::debug!("transfer:join awaited {batch_size} worker handles");
     }
     extra_listener.abort(); // Listener no longer needed
+    mem_reporter.abort(); // Stop periodic memory logging
 
     let final_copied = pool.copied.load(Ordering::Relaxed) as usize;
     let final_error = pool.last_error.lock().unwrap().clone();
@@ -3336,10 +3389,11 @@ async fn run_background_transfer(
         0.0
     };
     tracing::debug!(
-        "transfer:done {final_copied}/{total} files, \
+        "MEM[bg:transfer_done]: {:.1} MB RSS — {final_copied}/{total} files, \
          {:.1} MB in {wall_secs:.1}s = {avg_speed:.1} MB/s avg | \
          {initial_count} initial workers + extra via second conn",
-        total_bytes as f64 / 1_048_576.0,
+        rss_mb(),
+        total_bytes as f64 / 1_048_576.0
     );
 
     TransferResult {
@@ -3504,6 +3558,7 @@ async fn start_copy_transfer(
     match ssh_handle {
         Some(handle) => {
             let setup_start = std::time::Instant::now();
+            tracing::debug!("MEM[transfer:begin]: {:.1} MB RSS", rss_mb());
 
             // Open one SftpSession for scanning/mkdir on the primary connection.
             let scan_sftp = match open_sftp_from_handle(handle).await {
@@ -3516,33 +3571,29 @@ async fn start_copy_transfer(
             };
 
             tracing::debug!(
-                "setup:scan_sftp opened in {}ms",
-                setup_start.elapsed().as_millis(),
+                "MEM[transfer:scan_sftp_opened]: {:.1} MB RSS — in {}ms",
+                rss_mb(),
+                setup_start.elapsed().as_millis()
             );
 
-            // Open initial workers on the primary (already-open) connection — instant.
+            // Open one worker now so the transfer can start immediately after scanning.
+            // Additional workers are opened lazily via the extra_workers channel to
+            // avoid allocating channel buffers during the scan phase.
             let workers_start = std::time::Instant::now();
-            let mut initial_workers = Vec::new();
-            for i in 0..WORKERS_PER_CONNECTION {
-                match open_pipelined_worker(handle).await {
-                    Ok(w) => initial_workers.push(w),
-                    Err(e) => {
-                        if i == 0 {
-                            state.status_message =
-                                Some(format!("Failed to open pipelined SFTP: {e}"));
-                            state.input_mode = InputMode::Normal;
-                            return Ok(());
-                        }
-                        tracing::warn!("Opened {i} workers on primary connection: {e}");
-                        break;
-                    }
+            let first_worker = match open_pipelined_worker(handle).await {
+                Ok(w) => w,
+                Err(e) => {
+                    state.status_message = Some(format!("Failed to open pipelined SFTP: {e}"));
+                    state.input_mode = InputMode::Normal;
+                    return Ok(());
                 }
-            }
+            };
+            let initial_workers = vec![first_worker];
             tracing::debug!(
-                "setup:workers {} initial workers opened in {}ms (total setup={}ms)",
-                initial_workers.len(),
+                "MEM[transfer:first_worker_opened]: {:.1} MB RSS — in {}ms (total setup={}ms)",
+                rss_mb(),
                 workers_start.elapsed().as_millis(),
-                setup_start.elapsed().as_millis(),
+                setup_start.elapsed().as_millis()
             );
 
             let dest_side = match source_side {
@@ -3584,8 +3635,35 @@ async fn start_copy_transfer(
             let ow_policy = Arc::new(AtomicU64::new(0));
             let bg_ow_policy = Arc::clone(&ow_policy);
 
-            // Channel for dynamically adding workers from a second SSH connection.
+            // Channel for dynamically adding workers (primary extra + second connection).
             let (extra_tx, extra_rx) = tokio::sync::mpsc::channel::<PipelinedWorker>(4);
+
+            // Open remaining primary-connection workers in the background so they
+            // don't allocate channel buffers during the scan phase.
+            if WORKERS_PER_CONNECTION > 1 {
+                if let Some(primary_arc) = remote_backend.ssh_handle_arc() {
+                    let primary_tx = extra_tx.clone();
+                    let primary_cancel = Arc::clone(&cancel);
+                    tokio::spawn(async move {
+                        for i in 1..WORKERS_PER_CONNECTION {
+                            if primary_cancel.load(Ordering::Relaxed) {
+                                break;
+                            }
+                            match open_pipelined_worker(&primary_arc).await {
+                                Ok(w) => {
+                                    if primary_tx.send(w).await.is_err() {
+                                        break;
+                                    }
+                                }
+                                Err(e) => {
+                                    tracing::warn!("primary extra worker {i}: {e}");
+                                    break;
+                                }
+                            }
+                        }
+                    });
+                }
+            }
 
             // Open a second TCP connection in the background for extra workers.
             let need_second = transfer_targets.len() >= MIN_FILES_FOR_SECOND_CONN;
@@ -3619,8 +3697,9 @@ async fn start_copy_transfer(
                         Ok(second_handle) => {
                             let conn_ms = conn_start.elapsed().as_millis();
                             tracing::debug!(
-                                "second_conn:established in {conn_ms}ms (at +{:.1}s from transfer start)",
-                                conn_setup_start.elapsed().as_secs_f64(),
+                                "MEM[second_conn:established]: {:.1} MB RSS — in {conn_ms}ms (at +{:.1}s)",
+                                rss_mb(),
+                                conn_setup_start.elapsed().as_secs_f64()
                             );
                             // Open workers on the new connection and send them to the pool.
                             for i in 0..WORKERS_PER_CONNECTION {
@@ -3634,8 +3713,9 @@ async fn start_copy_transfer(
                                 match open_pipelined_worker(&second_handle).await {
                                     Ok(w) => {
                                         tracing::debug!(
-                                            "second_conn:worker[{i}] opened in {}ms",
-                                            w_start.elapsed().as_millis(),
+                                            "MEM[second_conn:worker]: {:.1} MB RSS — [{i}] opened in {}ms",
+                                            rss_mb(),
+                                            w_start.elapsed().as_millis()
                                         );
                                         if extra_tx.send(w).await.is_err() {
                                             tracing::debug!(
@@ -4457,6 +4537,38 @@ fn truncate_name(name: &str, max_len: usize) -> String {
         let truncated: String = name.chars().take(max_len.saturating_sub(3)).collect();
         format!("{truncated}...")
     }
+}
+
+/// Get process RSS in megabytes (macOS only, 0.0 elsewhere).
+fn rss_mb() -> f64 {
+    #[cfg(target_os = "macos")]
+    {
+        use std::mem;
+        #[repr(C)]
+        struct TaskBasicInfo {
+            virtual_size: u64,
+            resident_size: u64,
+            resident_size_max: u64,
+            user_time: [u32; 2],
+            system_time: [u32; 2],
+            policy: i32,
+            suspend_count: i32,
+        }
+        const FLAVOR: u32 = 20;
+        const COUNT: u32 = (mem::size_of::<TaskBasicInfo>() / mem::size_of::<u32>()) as u32;
+        unsafe {
+            unsafe extern "C" {
+                fn mach_task_self() -> u32;
+                fn task_info(t: u32, f: u32, out: *mut TaskBasicInfo, cnt: *mut u32) -> i32;
+            }
+            let mut info: TaskBasicInfo = mem::zeroed();
+            let mut count = COUNT;
+            if task_info(mach_task_self(), FLAVOR, &mut info, &mut count) == 0 {
+                return info.resident_size as f64 / 1_048_576.0;
+            }
+        }
+    }
+    0.0
 }
 
 #[cfg(test)]

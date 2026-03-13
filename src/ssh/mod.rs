@@ -45,20 +45,24 @@ const KEEPALIVE_INTERVAL_SECS: u64 = 60;
 /// Maximum consecutive keepalive failures before dropping the connection.
 const KEEPALIVE_MAX: usize = 3;
 
-/// SSH channel window size for all sessions (32 MB).
+/// SSH channel window size (2 MB, matching OpenSSH).
 ///
-/// The default russh window is only 2 MB, which throttles pipelined SFTP transfers.
-/// With 128 in-flight SFTP read requests at 261 KB each (~32 MB), we need a window
-/// large enough to keep the pipe full. 32 MB matches the pipeline capacity and
-/// is harmless for interactive sessions (window is a flow-control limit, not a
-/// pre-allocated buffer).
-const SSH_WINDOW_SIZE: u32 = 32 * 1024 * 1024;
+/// Controls how much data the remote can push before TCP backpressure.
+/// Must be ≥ pipeline's MAX_INFLIGHT_BYTES or the pipeline stalls.
+/// Larger windows waste memory via mlocked CryptoVec buffers in russh.
+const SSH_WINDOW_SIZE: u32 = 2 * 1024 * 1024;
 
 /// Maximum SSH packet size (64 KB, the SSH spec maximum).
 ///
 /// The default russh packet size is 32 KB. Larger packets reduce per-packet
 /// overhead for bulk SFTP transfers.
 const SSH_MAX_PACKET_SIZE: u32 = 65535;
+
+/// Tokio mpsc channel capacity for each SSH channel.
+/// Each buffered message holds a CryptoVec (mlocked) up to SSH_MAX_PACKET_SIZE.
+/// Default russh value is 100 (~6 MB of mlocked data per channel).
+/// 16 keeps memory bounded while avoiding micro-stalls in the SFTP reader.
+const SSH_CHANNEL_BUFFER_SIZE: usize = 16;
 
 /// Print a one-time high-visibility production banner for interactive operations.
 pub fn print_production_banner(
@@ -307,6 +311,7 @@ pub async fn establish_session(
         keepalive_max: KEEPALIVE_MAX,
         window_size: SSH_WINDOW_SIZE,
         maximum_packet_size: SSH_MAX_PACKET_SIZE,
+        channel_buffer_size: SSH_CHANNEL_BUFFER_SIZE,
         nodelay: true,
         preferred,
         ..<_>::default()
@@ -388,6 +393,7 @@ pub async fn establish_tunnel_session(
         keepalive_max: tunnel::TUNNEL_KEEPALIVE_MAX,
         window_size: SSH_WINDOW_SIZE,
         maximum_packet_size: SSH_MAX_PACKET_SIZE,
+        channel_buffer_size: SSH_CHANNEL_BUFFER_SIZE,
         nodelay: true,
         ..<_>::default()
     };

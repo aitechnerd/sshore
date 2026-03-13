@@ -2789,8 +2789,6 @@ dependencies = [
 [[package]]
 name = "russh-cryptovec"
 version = "0.52.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4fb0ed583ff0f6b4aa44c7867dd7108df01b30571ee9423e250b4cc939f8c6cf"
 dependencies = [
  "libc",
  "log",
@@ -2802,13 +2800,12 @@ dependencies = [
 [[package]]
 name = "russh-sftp"
 version = "2.1.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3bb94393cafad0530145b8f626d8687f1ee1dedb93d7ba7740d6ae81868b13b5"
 dependencies = [
  "bitflags 2.11.0",
  "bytes",
  "chrono",
  "flurry",
+ "libc",
  "log",
  "serde",
  "thiserror 2.0.18",
@@ -3281,6 +3278,7 @@ dependencies = [
  "anyhow",
  "assert_cmd",
  "base64",
+ "bytes",
  "chrono",
  "clap",
  "clap_complete",
@@ -3309,6 +3307,7 @@ dependencies = [
  "sha2 0.10.9",
  "shellexpand",
  "tempfile",
+ "tikv-jemallocator",
  "tokio",
  "toml",
  "tracing",
@@ -3507,6 +3506,26 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f60246a4944f24f6e018aa17cdeffb7818b76356965d03b07d6a9886e8962185"
 dependencies = [
  "cfg-if",
+]
+
+[[package]]
+name = "tikv-jemalloc-sys"
+version = "0.6.1+5.3.0-1-ge13ca993e8ccb9ba9847cc330696e02839f328f7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cd8aa5b2ab86a2cefa406d889139c162cbb230092f7d1d7cbc1716405d852a3b"
+dependencies = [
+ "cc",
+ "libc",
+]
+
+[[package]]
+name = "tikv-jemallocator"
+version = "0.6.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0359b4327f954e0567e69fb191cf1436617748813819c94b8cd4a431422d053a"
+dependencies = [
+ "libc",
+ "tikv-jemalloc-sys",
 ]
 
 [[package]]

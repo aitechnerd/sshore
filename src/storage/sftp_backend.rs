@@ -343,6 +343,13 @@ impl SftpBackend {
         self.ssh_handle.as_deref()
     }
 
+    /// Get a cloneable Arc to the SSH handle (for passing into spawned tasks).
+    pub fn ssh_handle_arc(
+        &self,
+    ) -> Option<Arc<russh::client::Handle<crate::ssh::client::SshoreHandler>>> {
+        self.ssh_handle.clone()
+    }
+
     /// Establish a new, independent SSH connection to the same host.
     /// Returns a fresh handle on a separate TCP socket — useful for parallel
     /// transfers that need independent flow control.

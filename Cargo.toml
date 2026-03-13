@@ -58,15 +58,6 @@ percent-encoding = "2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
-# Memory allocator — returns freed pages to OS aggressively,
-# preventing RSS bloat from russh's mlocked CryptoVec allocations.
-# Not supported on Windows (jemalloc requires a C compiler configure step).
-[target.'cfg(unix)'.dependencies]
-tikv-jemallocator = { version = "0.6", features = ["background_threads"] }
-
-# Unix stdin poll
-libc = "0.2"
-
 # Byte buffers (zero-copy SFTP data path)
 bytes = "1"
 
@@ -80,6 +71,15 @@ hmac = "0.12"
 sha1 = "0.10"
 zeroize = "1.8.2"
 fs2 = "0.4"
+
+# Memory allocator — returns freed pages to OS aggressively,
+# preventing RSS bloat from russh's mlocked CryptoVec allocations.
+# Not supported on Windows (jemalloc requires a C compiler configure step).
+[target.'cfg(unix)'.dependencies]
+tikv-jemallocator = { version = "0.6", features = ["background_threads"] }
+
+# Unix stdin poll
+libc = "0.2"
 
 [dev-dependencies]
 assert_cmd = "2"

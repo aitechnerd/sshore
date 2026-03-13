@@ -6,3 +6,4 @@ docs/features/
 .claude/
 crates/*/target/
 crates/*/Cargo.lock
+.ai-team/

@@ -695,8 +695,8 @@ fn try_save_form(app: &mut App) {
             app.refilter();
         }
         Err(e) => {
-            // Show validation error in the form
-            form.error = Some(e.to_string());
+            // Route validation errors to the main status bar for consistency
+            app.status_message = Some((e.to_string(), Instant::now()));
         }
     }
 }
@@ -983,6 +983,33 @@ mod tests {
 
         let empty_app = App::new(AppConfig::default());
         assert!(empty_app.selected_bookmark_index().is_none());
+    }
+
+    #[test]
+    fn test_try_save_form_validation_error_goes_to_status() {
+        let mut app = sample_app();
+        // Set up a form with invalid data: empty name triggers validation error
+        app.form_state = Some(FormState::new_add(&app.config.settings));
+        app.screen = Screen::AddForm;
+
+        try_save_form(&mut app);
+
+        // Validation error should go to the status bar, not form.error
+        assert!(
+            app.status_message.is_some(),
+            "expected validation error in status_message"
+        );
+        let (msg, _) = app.status_message.as_ref().unwrap();
+        assert!(
+            msg.contains("name") || msg.contains("Name"),
+            "status message should mention name validation: {msg}"
+        );
+        // form.error should remain None (not used for validation errors anymore)
+        let form = app.form_state.as_ref().unwrap();
+        assert!(
+            form.error.is_none(),
+            "form.error should be None; validation errors go to status bar"
+        );
     }
 
     #[test]

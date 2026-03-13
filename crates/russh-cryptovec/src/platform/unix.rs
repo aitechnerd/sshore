@@ -3,7 +3,9 @@ use std::num::NonZeroUsize;
 use std::ptr::NonNull;
 
 use nix::errno::Errno;
-use nix::sys::mman::{MapFlags, MmapAdvise, ProtFlags};
+use nix::sys::mman::{MapFlags, ProtFlags};
+#[cfg(target_os = "macos")]
+use nix::sys::mman::MmapAdvise;
 
 use super::MemoryLockError;
 

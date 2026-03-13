@@ -507,4 +507,53 @@ mod tests {
         // Empty base64 decodes to empty vec, which shouldn't match non-empty data
         assert!(!entry.key_matches(&[1, 2, 3]));
     }
+
+    // --- Error-path tests (H7) ---
+
+    #[test]
+    fn test_check_hashed_host_truncated_base64() {
+        // Base64 that decodes but produces a short salt (< HMAC key size is fine,
+        // but the computed hash won't match) — should return Some(false), not panic.
+        assert_eq!(
+            check_hashed_host("|1|YQ==|YQ==", "example.com"),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn test_check_hashed_host_empty_salt_and_hash() {
+        // Empty base64 fields decode to empty bytes — should not panic.
+        // Empty salt is a valid HMAC key, but computed hash won't match empty stored hash.
+        let result = check_hashed_host("|1||", "example.com");
+        assert_eq!(result, Some(false));
+    }
+
+    #[test]
+    fn test_check_hashed_host_extra_pipes() {
+        // More pipe segments than expected — parts.len() != 4
+        assert!(check_hashed_host("|1|a|b|c", "host").is_none());
+    }
+
+    #[test]
+    fn test_parse_known_hosts_line_whitespace_only() {
+        assert!(parse_known_hosts_line("   \t  ").is_none());
+    }
+
+    #[test]
+    fn test_parse_known_hosts_line_revoked_but_too_few_fields() {
+        // @revoked marker but only 2 fields total — no key data
+        assert!(parse_known_hosts_line("@revoked host").is_none());
+    }
+
+    #[test]
+    fn test_key_matches_corrupted_base64_graceful() {
+        // Base64 with padding errors should return false, not panic.
+        let entry = KnownHostEntry {
+            host_patterns: vec!["test".into()],
+            _key_type: "ssh-rsa".into(),
+            key_base64: "AAAA====invalid".into(),
+            is_revoked: false,
+        };
+        assert!(!entry.key_matches(&[0, 0, 0]));
+    }
 }

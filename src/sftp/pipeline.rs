@@ -506,3 +506,136 @@ pub async fn upload_from_handle<F: FnMut(u64)>(
     )
     .await
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // --- read_chunk_into tests ---
+
+    #[test]
+    fn test_read_chunk_into_full_read() {
+        let data = b"hello world";
+        let mut cursor = std::io::Cursor::new(data.as_slice());
+        let mut buf = [0u8; 64];
+        let n = read_chunk_into(&mut cursor, &mut buf, 11).unwrap();
+        assert_eq!(n, 11);
+        assert_eq!(&buf[..n], b"hello world");
+    }
+
+    #[test]
+    fn test_read_chunk_into_eof_before_len() {
+        // File has 5 bytes but we ask for 100 — should return 5, not error.
+        let data = b"short";
+        let mut cursor = std::io::Cursor::new(data.as_slice());
+        let mut buf = [0u8; 128];
+        let n = read_chunk_into(&mut cursor, &mut buf, 100).unwrap();
+        assert_eq!(n, 5);
+        assert_eq!(&buf[..n], b"short");
+    }
+
+    #[test]
+    fn test_read_chunk_into_zero_len() {
+        let data = b"data";
+        let mut cursor = std::io::Cursor::new(data.as_slice());
+        let mut buf = [0u8; 64];
+        let n = read_chunk_into(&mut cursor, &mut buf, 0).unwrap();
+        assert_eq!(n, 0);
+    }
+
+    #[test]
+    fn test_read_chunk_into_len_exceeds_buf() {
+        // len > buf.len() — should cap at buf size.
+        let data = vec![0xABu8; 200];
+        let mut cursor = std::io::Cursor::new(data.as_slice());
+        let mut buf = [0u8; 64];
+        let n = read_chunk_into(&mut cursor, &mut buf, 200).unwrap();
+        assert_eq!(n, 64);
+    }
+
+    /// A reader that returns an I/O error on the first read.
+    struct FailingReader;
+
+    impl Read for FailingReader {
+        fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "simulated read failure",
+            ))
+        }
+    }
+
+    #[test]
+    fn test_read_chunk_into_io_error() {
+        let mut reader = FailingReader;
+        let mut buf = [0u8; 64];
+        let result = read_chunk_into(&mut reader, &mut buf, 64);
+        assert!(result.is_err());
+        let msg = format!("{:#}", result.unwrap_err());
+        assert!(msg.contains("Failed to read local file"));
+    }
+
+    /// A reader that succeeds for N bytes then errors.
+    struct PartialThenFailReader {
+        good_bytes: usize,
+        delivered: usize,
+    }
+
+    impl Read for PartialThenFailReader {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            if self.delivered >= self.good_bytes {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::ConnectionReset,
+                    "connection lost mid-read",
+                ));
+            }
+            let n = buf.len().min(self.good_bytes - self.delivered);
+            buf[..n].fill(0x42);
+            self.delivered += n;
+            Ok(n)
+        }
+    }
+
+    #[test]
+    fn test_read_chunk_into_error_after_partial() {
+        // Delivers 10 bytes successfully, then errors.
+        let mut reader = PartialThenFailReader {
+            good_bytes: 10,
+            delivered: 0,
+        };
+        let mut buf = [0u8; 64];
+        let result = read_chunk_into(&mut reader, &mut buf, 64);
+        assert!(result.is_err());
+        let msg = format!("{:#}", result.unwrap_err());
+        assert!(msg.contains("Failed to read local file"));
+    }
+
+    /// A reader that returns 1 byte at a time (simulates slow/fragmented reads).
+    struct SlowReader {
+        data: Vec<u8>,
+        pos: usize,
+    }
+
+    impl Read for SlowReader {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            if self.pos >= self.data.len() {
+                return Ok(0);
+            }
+            buf[0] = self.data[self.pos];
+            self.pos += 1;
+            Ok(1)
+        }
+    }
+
+    #[test]
+    fn test_read_chunk_into_byte_at_a_time() {
+        let mut reader = SlowReader {
+            data: b"abcdef".to_vec(),
+            pos: 0,
+        };
+        let mut buf = [0u8; 64];
+        let n = read_chunk_into(&mut reader, &mut buf, 6).unwrap();
+        assert_eq!(n, 6);
+        assert_eq!(&buf[..6], b"abcdef");
+    }
+}

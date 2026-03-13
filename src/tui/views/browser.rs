@@ -180,8 +180,23 @@ pub enum InputMode {
         dst_path: String,
         size: u64,
     },
-    /// Transfer complete popup with summary message (any key to close).
-    TransferComplete(String),
+    /// Transfer complete popup with summary message.
+    /// When `retry` is `Some`, a Retry button is shown (transfer had errors).
+    /// When `retry` is `None`, any key dismisses (success).
+    TransferComplete {
+        msg: String,
+        retry: Option<RetryInfo>,
+    },
+}
+
+/// Info needed to retry a failed transfer from the completion popup.
+#[derive(Debug, Clone)]
+pub struct RetryInfo {
+    targets: Vec<(String, String, bool, u64)>,
+    direction: TransferDirection,
+    source_side: Side,
+    dst_cwd: String,
+    is_move: bool,
 }
 
 /// Transfer direction for background file copies.
@@ -410,6 +425,10 @@ struct BackgroundTransfer {
     delete_sources: Option<Vec<(String, bool)>>,
     /// Side where the sources live (needed to pick the right backend for deletion).
     source_side: Side,
+    /// Original transfer parameters for retry on failure.
+    retry_targets: Vec<(String, String, bool, u64)>,
+    retry_dst_cwd: String,
+    retry_is_move: bool,
 }
 
 /// Overall browser state.
@@ -550,7 +569,22 @@ pub async fn run(
                         let total_bytes = transfer.progress.bytes_done_all.load(Ordering::Relaxed);
                         let completion_msg =
                             format_transfer_complete(&result, total_bytes, elapsed, is_move);
-                        state.input_mode = InputMode::TransferComplete(completion_msg);
+                        let retry = if result.last_error.is_some() {
+                            Some(RetryInfo {
+                                targets: transfer.retry_targets,
+                                direction: transfer.direction,
+                                source_side: transfer.source_side,
+                                dst_cwd: transfer.retry_dst_cwd,
+                                is_move: transfer.retry_is_move,
+                            })
+                        } else {
+                            None
+                        };
+                        state.popup_focus = 0;
+                        state.input_mode = InputMode::TransferComplete {
+                            msg: completion_msg,
+                            retry,
+                        };
                     }
 
                     // Clamp popup index after removal
@@ -1473,8 +1507,8 @@ fn draw(
                 state.popup_focus,
             );
         }
-        InputMode::TransferComplete(msg) => {
-            draw_transfer_complete_popup(frame, size, msg);
+        InputMode::TransferComplete { msg, retry } => {
+            draw_transfer_complete_popup(frame, size, msg, retry.is_some(), state.popup_focus);
         }
         InputMode::ConfirmDelete { entries } => {
             let is_production = is_production_remote(state);
@@ -2401,9 +2435,18 @@ fn draw_overwrite_confirm_popup(
 }
 
 /// Draw the transfer complete popup overlay.
-fn draw_transfer_complete_popup(frame: &mut Frame, area: Rect, msg: &str) {
-    let popup_area = centered_fixed_rect(POPUP_WIDTH, 5, area);
-    if popup_area.width < 20 || popup_area.height < 5 {
+/// When `has_retry` is true, shows [Retry] [OK] buttons with yellow border (error).
+/// When false, shows "Press any key to close" with green border (success).
+fn draw_transfer_complete_popup(
+    frame: &mut Frame,
+    area: Rect,
+    msg: &str,
+    has_retry: bool,
+    popup_focus: usize,
+) {
+    let popup_height = if has_retry { 6 } else { 5 };
+    let popup_area = centered_fixed_rect(POPUP_WIDTH, popup_height, area);
+    if popup_area.width < 20 || popup_area.height < popup_height {
         return;
     }
 
@@ -2417,16 +2460,36 @@ fn draw_transfer_complete_popup(frame: &mut Frame, area: Rect, msg: &str) {
             Style::default().add_modifier(Modifier::BOLD),
         )),
         Line::from(""),
-        Line::from(" Press any key to close"),
     ];
 
+    let border_color = if has_retry {
+        Color::Yellow
+    } else {
+        Color::Green
+    };
     let block = Block::default()
         .title(" Copy Complete ")
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Green));
+        .border_style(Style::default().fg(border_color));
+
+    let inner = Rect::new(
+        popup_area.x + 1,
+        popup_area.y + 1,
+        popup_area.width.saturating_sub(2),
+        popup_area.height.saturating_sub(2),
+    );
 
     frame.render_widget(Clear, popup_area);
     frame.render_widget(Paragraph::new(lines).block(block), popup_area);
+
+    if has_retry {
+        render_button_row(&["Retry", "OK"], popup_focus, inner, inner.y + 3, frame);
+    } else {
+        frame.render_widget(
+            Paragraph::new(Line::from(" Press any key to close")),
+            Rect::new(inner.x, inner.y + 2, inner.width, 1),
+        );
+    }
 }
 
 /// Format a completion message for the transfer complete popup.
@@ -3808,6 +3871,9 @@ async fn start_copy_transfer(
                 overwrite_policy: ow_policy,
                 delete_sources,
                 source_side,
+                retry_targets: targets.clone(),
+                retry_dst_cwd: dst_cwd.to_string(),
+                retry_is_move: is_move,
             });
             state.popup_transfer_index = state.background_transfers.len() - 1;
 
@@ -3995,9 +4061,53 @@ async fn handle_input_mode(
     left: &mut Backend,
     right: &mut Backend,
 ) -> Result<()> {
-    // Transfer complete popup: any key dismisses
-    if matches!(state.input_mode, InputMode::TransferComplete(_)) {
-        state.input_mode = InputMode::Normal;
+    // Transfer complete popup
+    if let InputMode::TransferComplete { retry, .. } = &state.input_mode {
+        if retry.is_none() {
+            // Success: any key dismisses
+            state.input_mode = InputMode::Normal;
+            return Ok(());
+        }
+        // Error with retry: Tab/arrows switch focus, Enter acts, Esc dismisses
+        match key.code {
+            KeyCode::Tab | KeyCode::Left | KeyCode::Right | KeyCode::BackTab => {
+                state.popup_focus = if state.popup_focus == 0 { 1 } else { 0 };
+            }
+            KeyCode::Esc => {
+                state.input_mode = InputMode::Normal;
+            }
+            KeyCode::Enter => {
+                if state.popup_focus == 0 {
+                    // Retry: extract retry info and re-queue the transfer
+                    let info = if let InputMode::TransferComplete {
+                        retry: Some(info), ..
+                    } = std::mem::replace(&mut state.input_mode, InputMode::Normal)
+                    {
+                        info
+                    } else {
+                        unreachable!()
+                    };
+                    start_copy_transfer(
+                        info.targets,
+                        info.direction,
+                        info.source_side,
+                        &info.dst_cwd,
+                        left_pane,
+                        right_pane,
+                        state,
+                        left,
+                        right,
+                        false,
+                        info.is_move,
+                    )
+                    .await?;
+                } else {
+                    // OK: dismiss
+                    state.input_mode = InputMode::Normal;
+                }
+            }
+            _ => {}
+        }
         return Ok(());
     }
 
@@ -4471,7 +4581,7 @@ async fn handle_input_mode(
             | InputMode::CopyConfirm { .. }
             | InputMode::TransferPopup
             | InputMode::OverwriteConfirm { .. }
-            | InputMode::TransferComplete(_) => {}
+            | InputMode::TransferComplete { .. } => {}
         }
         return Ok(());
     }
@@ -4918,5 +5028,55 @@ mod tests {
         let emoji = "📁documents_folder";
         let result = truncate_name(emoji, 8);
         assert_eq!(result, "📁docu...");
+    }
+
+    // --- RetryInfo / TransferComplete ---
+
+    #[test]
+    fn test_retry_info_present_on_error() {
+        // When a transfer has an error, RetryInfo should be populated.
+        let result = TransferResult {
+            copied: 3,
+            total: 5,
+            last_error: Some("connection reset".into()),
+        };
+        let retry = if result.last_error.is_some() {
+            Some(RetryInfo {
+                targets: vec![("/src/a.txt".into(), "a.txt".into(), false, 100)],
+                direction: TransferDirection::LocalToRemote,
+                source_side: Side::Left,
+                dst_cwd: "/dst".into(),
+                is_move: false,
+            })
+        } else {
+            None
+        };
+        assert!(retry.is_some());
+        let info = retry.unwrap();
+        assert_eq!(info.targets.len(), 1);
+        assert_eq!(info.dst_cwd, "/dst");
+        assert!(!info.is_move);
+    }
+
+    #[test]
+    fn test_retry_info_absent_on_success() {
+        // When a transfer succeeds, retry should be None.
+        let result = TransferResult {
+            copied: 5,
+            total: 5,
+            last_error: None,
+        };
+        let retry: Option<RetryInfo> = if result.last_error.is_some() {
+            Some(RetryInfo {
+                targets: vec![],
+                direction: TransferDirection::LocalToRemote,
+                source_side: Side::Left,
+                dst_cwd: "/dst".into(),
+                is_move: false,
+            })
+        } else {
+            None
+        };
+        assert!(retry.is_none());
     }
 }

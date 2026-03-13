@@ -2,6 +2,7 @@
 /// mlocked CryptoVec pages from russh) is returned to the OS promptly.
 /// Without this, macOS's system allocator holds freed pages indefinitely,
 /// inflating RSS to ~500 MB during SFTP transfers despite low actual usage.
+#[cfg(unix)]
 #[global_allocator]
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
@@ -12,6 +13,7 @@ static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 ///   reducing RSS. `munmap()` forces the kernel to reclaim them immediately,
 ///   preventing phantom RSS inflation from short-lived CryptoVec allocations.
 /// - `background_thread:true` — enables async purging for any residual pages.
+#[cfg(unix)]
 #[allow(non_upper_case_globals)]
 #[unsafe(export_name = "malloc_conf")]
 pub static malloc_conf: &[u8] =

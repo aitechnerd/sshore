@@ -60,6 +60,8 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 # Memory allocator — returns freed pages to OS aggressively,
 # preventing RSS bloat from russh's mlocked CryptoVec allocations.
+# Not supported on Windows (jemalloc requires a C compiler configure step).
+[target.'cfg(unix)'.dependencies]
 tikv-jemallocator = { version = "0.6", features = ["background_threads"] }
 
 # Unix stdin poll

@@ -3079,7 +3079,7 @@ fn spawn_worker(
                         0.0
                     };
                     // Log memory every 5 files or on first file to track RSS over time.
-                    if files_completed == 1 || files_completed % 5 == 0 {
+                    if files_completed == 1 || files_completed.is_multiple_of(5) {
                         tracing::debug!(
                             "MEM[worker:file_done]: {:.1} MB RSS — worker[{worker_id}] #{files_completed} {} {:.1}MB {mbps:.1}MB/s",
                             rss_mb(),
@@ -3642,29 +3642,29 @@ async fn start_copy_transfer(
 
             // Open remaining primary-connection workers in the background so they
             // don't allocate channel buffers during the scan phase.
-            if WORKERS_PER_CONNECTION > 1 {
-                if let Some(primary_arc) = remote_backend.ssh_handle_arc() {
-                    let primary_tx = extra_tx.clone();
-                    let primary_cancel = Arc::clone(&cancel);
-                    tokio::spawn(async move {
-                        for i in 1..WORKERS_PER_CONNECTION {
-                            if primary_cancel.load(Ordering::Relaxed) {
-                                break;
-                            }
-                            match open_pipelined_worker(&primary_arc).await {
-                                Ok(w) => {
-                                    if primary_tx.send(w).await.is_err() {
-                                        break;
-                                    }
-                                }
-                                Err(e) => {
-                                    tracing::warn!("primary extra worker {i}: {e}");
+            if WORKERS_PER_CONNECTION > 1
+                && let Some(primary_arc) = remote_backend.ssh_handle_arc()
+            {
+                let primary_tx = extra_tx.clone();
+                let primary_cancel = Arc::clone(&cancel);
+                tokio::spawn(async move {
+                    for i in 1..WORKERS_PER_CONNECTION {
+                        if primary_cancel.load(Ordering::Relaxed) {
+                            break;
+                        }
+                        match open_pipelined_worker(&primary_arc).await {
+                            Ok(w) => {
+                                if primary_tx.send(w).await.is_err() {
                                     break;
                                 }
                             }
+                            Err(e) => {
+                                tracing::warn!("primary extra worker {i}: {e}");
+                                break;
+                            }
                         }
-                    });
-                }
+                    }
+                });
             }
 
             // Open a second TCP connection in the background for extra workers.

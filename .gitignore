@@ -3,3 +3,6 @@ plan/
 /target/
 docs/scans/
 docs/features/
+.claude/
+crates/*/target/
+crates/*/Cargo.lock

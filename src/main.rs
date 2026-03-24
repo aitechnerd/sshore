@@ -994,9 +994,25 @@ fn cmd_tunnel_stop(bookmark_name: &str) -> Result<()> {
 
     // Terminate the tunnel process
     if terminate_process(pid) {
+        for _ in 0..20 {
+            if !ssh::tunnel::is_process_alive(pid) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        if ssh::tunnel::is_process_alive(pid) {
+            eprintln!(
+                "Warning: PID {pid} did not exit after the stop signal; keeping tunnel entry."
+            );
+            return Ok(());
+        }
         println!("Stopped tunnel for '{bookmark_name}' (PID {pid}).");
     } else {
-        eprintln!("Warning: failed to send signal to PID {pid}, removing stale entry.");
+        if ssh::tunnel::is_process_alive(pid) {
+            eprintln!("Warning: failed to signal PID {pid}; tunnel is still running.");
+            return Ok(());
+        }
+        eprintln!("Warning: PID {pid} is no longer running; removing stale entry.");
     }
 
     // Remove from state file

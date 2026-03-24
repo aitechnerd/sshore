@@ -25,6 +25,32 @@ struct LocalForwardRuntime {
     task: tokio::task::JoinHandle<()>,
 }
 
+/// Wait for a process-termination signal relevant to tunnel sessions.
+#[cfg(unix)]
+async fn wait_for_termination_signal() -> Result<()> {
+    use tokio::signal::unix::{SignalKind, signal};
+
+    let mut sigterm = signal(SignalKind::terminate()).context("Failed to listen for SIGTERM")?;
+    let mut sighup = signal(SignalKind::hangup()).context("Failed to listen for SIGHUP")?;
+
+    tokio::select! {
+        _ = tokio::signal::ctrl_c() => {}
+        _ = sigterm.recv() => {}
+        _ = sighup.recv() => {}
+    }
+
+    Ok(())
+}
+
+/// Wait for a process-termination signal relevant to tunnel sessions.
+#[cfg(not(unix))]
+async fn wait_for_termination_signal() -> Result<()> {
+    tokio::signal::ctrl_c()
+        .await
+        .context("Failed to listen for Ctrl+C")?;
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Constants
 // ---------------------------------------------------------------------------
@@ -548,10 +574,8 @@ pub async fn run_foreground(
 
     eprintln!("Tunnel active. Press Ctrl+C to stop.");
 
-    // Wait for Ctrl+C
-    tokio::signal::ctrl_c()
-        .await
-        .context("Failed to listen for Ctrl+C")?;
+    // Wait for a termination signal from the terminal or `sshore tunnel stop`.
+    wait_for_termination_signal().await?;
 
     eprintln!("\nShutting down tunnel...");
     stop_local_forwards(&mut local_forwards).await;
@@ -603,10 +627,11 @@ pub async fn run_daemon_loop(
                     reconnect_count,
                 );
 
-                // Check for SIGTERM while sleeping
+                // Check for termination while sleeping
                 tokio::select! {
                     _ = tokio::time::sleep(std::time::Duration::from_secs(delay_secs)) => {}
-                    _ = tokio::signal::ctrl_c() => {
+                    result = wait_for_termination_signal() => {
+                        result?;
                         eprintln!("Received signal, stopping tunnel.");
                         break;
                     }
@@ -656,12 +681,13 @@ async fn run_single_session(
             .context("Failed to open keepalive channel")?
     };
 
-    // Wait for the session to die or Ctrl+C
+    // Wait for the session to die or a local termination signal.
     let result = tokio::select! {
         _ = wait_for_channel_close(channel) => {
             Err(anyhow::anyhow!("SSH session closed unexpectedly"))
         }
-        _ = tokio::signal::ctrl_c() => {
+        result = wait_for_termination_signal() => {
+            result?;
             // Clean exit
             Ok(())
         }

@@ -7,3 +7,10 @@ docs/features/
 crates/*/target/
 crates/*/Cargo.lock
 .ai-team/
+# AI Dev Team (generated, per-project)
+.claude/stack.md
+.claude/project-context.md
+.claude/codemap.md
+.claude/settings.local.json
+.claude/agent-memory/
+.claude/agent-memory-local/

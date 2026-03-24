@@ -1,3 +1,5 @@
+Read `.claude/ai-team.md` for the AI Dev Team system reference.
+
 # CLAUDE.md
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.

@@ -16,7 +16,9 @@ use anyhow::{Context, Result};
 
 use std::collections::HashSet;
 
-use crate::config::model::{AppConfig, Bookmark, Settings};
+use crate::config::model::{
+    AppConfig, Bookmark, Settings, validate_bookmark_name, validate_hostname,
+};
 use crate::config::writer::atomic_write;
 
 /// Return the XDG-compliant config file path.
@@ -111,10 +113,24 @@ pub fn load_from(path: &Path) -> Result<AppConfig> {
     let content = fs::read_to_string(path)
         .with_context(|| format!("Failed to read config file: {}", path.display()))?;
 
-    let config: AppConfig = toml::from_str(&content)
-        .with_context(|| format!("Failed to parse config file: {}", path.display()))?;
+    let config: AppConfig = match toml::from_str(&content) {
+        Ok(c) => c,
+        Err(e) => {
+            // If a .bak file exists, hint at recovery
+            let backup_path = path.with_extension("toml.bak");
+            if backup_path.exists() {
+                eprintln!(
+                    "Config file is corrupted. A backup exists at {}",
+                    backup_path.display()
+                );
+            }
+            return Err(e)
+                .with_context(|| format!("Failed to parse config file: {}", path.display()));
+        }
+    };
 
     warn_duplicate_names(&config.bookmarks);
+    validate_bookmarks(&config.bookmarks);
 
     Ok(config)
 }
@@ -134,6 +150,51 @@ fn warn_duplicate_names(bookmarks: &[Bookmark]) {
                 b.name
             );
         }
+    }
+}
+
+/// Validate bookmark names and hostnames, logging warnings for invalid values.
+/// Does not reject the config — graceful degradation for hand-edited configs.
+fn validate_bookmarks(bookmarks: &[Bookmark]) {
+    for b in bookmarks {
+        if let Err(e) = validate_bookmark_name(&b.name) {
+            eprintln!(
+                "Warning: bookmark has invalid name '{}': {e}",
+                sanitize_for_display(&b.name)
+            );
+        }
+        if let Err(e) = validate_hostname(&b.host) {
+            eprintln!(
+                "Warning: bookmark '{}' has invalid hostname '{}': {e}",
+                sanitize_for_display(&b.name),
+                sanitize_for_display(&b.host)
+            );
+        }
+    }
+}
+
+/// Sanitize a string for safe terminal display.
+///
+/// Replaces all control characters (U+0000–U+001F, U+007F–U+009F) with `?`
+/// and truncates to 200 characters. Prevents terminal escape injection from
+/// malicious imported configs.
+pub fn sanitize_for_display(input: &str) -> String {
+    let sanitized: String = input
+        .chars()
+        .map(|c| {
+            if c <= '\u{001F}' || ('\u{007F}'..='\u{009F}').contains(&c) {
+                '?'
+            } else {
+                c
+            }
+        })
+        .collect();
+    if sanitized.len() > 200 {
+        let mut truncated: String = sanitized.chars().take(200).collect();
+        truncated.push_str("...");
+        truncated
+    } else {
+        sanitized
     }
 }
 
@@ -753,5 +814,84 @@ mod tests {
         // import_from_source reads the file, so it should fail for missing files
         let result = import_from_source(path, ImportSourceKind::Csv, None, &[]);
         assert!(result.is_err());
+    }
+
+    // --- Phase 1A.2: Config Load Validation tests ---
+
+    #[test]
+    fn test_load_corrupt_config_suggests_backup() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let backup_path = dir.path().join("config.toml.bak");
+
+        // Write a valid config first, then create a .bak (simulating prior backup)
+        let config = AppConfig::default();
+        save_to(&config, &path).unwrap();
+
+        // Create .bak file (as if a prior write created it)
+        std::fs::copy(&path, &backup_path).unwrap();
+
+        // Now corrupt the main config
+        std::fs::write(&path, "this is {{{{ not valid TOML at all!!!!").unwrap();
+
+        // Load should fail, and the error path prints a hint about .bak to stderr.
+        // We verify the load fails — the hint is printed to stderr (hard to capture
+        // in unit tests, but we verify the code path is exercised by checking the error).
+        let result = load_from(&path);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("Failed to parse config file"),
+            "expected parse error, got: {err}"
+        );
+        // The .bak file should still exist (load_from doesn't delete it)
+        assert!(backup_path.exists());
+    }
+
+    #[test]
+    fn test_load_validates_bookmark_names_warns_but_loads() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+
+        // Write a config with an invalid bookmark name (contains spaces)
+        // by writing raw TOML directly (bypassing validation on save)
+        let raw_toml = r#"
+[settings]
+
+[[bookmarks]]
+name = "invalid name with spaces"
+host = "10.0.1.5"
+port = 22
+env = "development"
+connect_count = 0
+"#;
+        std::fs::write(&path, raw_toml).unwrap();
+
+        // load_from should succeed (warnings only, no rejection)
+        let config = load_from(&path).unwrap();
+        assert_eq!(config.bookmarks.len(), 1);
+        assert_eq!(config.bookmarks[0].name, "invalid name with spaces");
+    }
+
+    #[test]
+    fn test_sanitize_for_display_replaces_control_chars() {
+        let input = "hello\x00world\x1b[31mred";
+        let result = sanitize_for_display(input);
+        assert_eq!(result, "hello?world?[31mred");
+    }
+
+    #[test]
+    fn test_sanitize_for_display_truncates_long_strings() {
+        let long_input: String = "a".repeat(250);
+        let result = sanitize_for_display(&long_input);
+        // 200 chars + "..."
+        assert_eq!(result.len(), 203);
+        assert!(result.ends_with("..."));
+    }
+
+    #[test]
+    fn test_sanitize_for_display_passes_clean_strings() {
+        let input = "normal-hostname.example.com";
+        assert_eq!(sanitize_for_display(input), input);
     }
 }

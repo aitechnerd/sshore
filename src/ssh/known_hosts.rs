@@ -53,14 +53,46 @@ pub fn check_host_key(hostname: &str, port: u16, server_key: &PublicKey) -> Resu
     let content =
         std::fs::read_to_string(&known_hosts_file).context("Failed to read known_hosts")?;
 
-    // Build the host pattern to match (hostname, or [hostname]:port for non-22)
+    let server_key_data = server_key.to_bytes().unwrap_or_default();
+    let fingerprint = format_fingerprint(server_key);
+    let key_type = format_key_type(server_key);
+
+    Ok(check_host_key_in_content(
+        hostname,
+        port,
+        &server_key_data,
+        &fingerprint,
+        &key_type,
+        &content,
+    ))
+}
+
+/// Core known_hosts matching logic, separated from filesystem access for testability.
+///
+/// Scans ALL entries before making a decision. Tracks two flags:
+/// - `host_found`: at least one entry matched the hostname
+/// - `key_matched`: at least one entry matched both hostname AND key
+///
+/// Does NOT return early on match — continues checking for `@revoked` entries.
+/// Final decision: `key_matched` → Known; `host_found && !key_matched` → Changed;
+/// `!host_found` → Unknown.
+fn check_host_key_in_content(
+    hostname: &str,
+    port: u16,
+    server_key_data: &[u8],
+    fingerprint: &str,
+    key_type: &str,
+    content: &str,
+) -> HostKeyStatus {
     let host_pattern = if port == 22 {
         hostname.to_string()
     } else {
         format!("[{}]:{}", hostname, port)
     };
 
-    let server_key_data = server_key.to_bytes().unwrap_or_default();
+    let mut host_found = false;
+    let mut key_matched = false;
+    let mut last_changed_line = 0usize;
 
     for (line_num, line) in content.lines().enumerate() {
         let line = line.trim();
@@ -71,33 +103,38 @@ pub fn check_host_key(hostname: &str, port: u16, server_key: &PublicKey) -> Resu
         if let Some(entry) = parse_known_hosts_line(line)
             && entry.matches_host(&host_pattern)
         {
-            if entry.key_matches(&server_key_data) {
+            host_found = true;
+
+            if entry.key_matches(server_key_data) {
                 if entry.is_revoked {
-                    return Ok(HostKeyStatus::Revoked {
-                        fingerprint: format_fingerprint(server_key),
+                    // Revoked key — immediate return, this is always authoritative
+                    return HostKeyStatus::Revoked {
+                        fingerprint: fingerprint.to_string(),
                         known_hosts_line: line_num + 1,
-                    });
+                    };
                 }
-                return Ok(HostKeyStatus::Known);
-            } else {
-                // KEY CHANGED — potential MITM
-                if !entry.is_revoked {
-                    return Ok(HostKeyStatus::Changed {
-                        fingerprint_new: format_fingerprint(server_key),
-                        known_hosts_line: line_num + 1,
-                    });
-                }
+                key_matched = true;
+            } else if !entry.is_revoked {
+                // Track last line where host matched but key didn't,
+                // for the Changed status message
+                last_changed_line = line_num + 1;
             }
         }
     }
 
-    // Not found in known_hosts
-    let fingerprint = format_fingerprint(server_key);
-    let key_type = format_key_type(server_key);
-    Ok(HostKeyStatus::Unknown {
-        fingerprint,
-        key_type,
-    })
+    if key_matched {
+        HostKeyStatus::Known
+    } else if host_found {
+        HostKeyStatus::Changed {
+            fingerprint_new: fingerprint.to_string(),
+            known_hosts_line: last_changed_line,
+        }
+    } else {
+        HostKeyStatus::Unknown {
+            fingerprint: fingerprint.to_string(),
+            key_type: key_type.to_string(),
+        }
+    }
 }
 
 /// Append a new host key entry to ~/.ssh/known_hosts.
@@ -211,6 +248,11 @@ fn parse_known_hosts_line(line: &str) -> Option<KnownHostEntry> {
     }
 
     let (is_revoked, base_idx) = if parts[0].starts_with('@') {
+        // Skip @cert-authority lines — they define CA keys for certificate-based
+        // auth and should not participate in regular host key matching.
+        if parts[0].eq_ignore_ascii_case("@cert-authority") {
+            return None;
+        }
         (parts[0].eq_ignore_ascii_case("@revoked"), 1usize)
     } else {
         (false, 0usize)
@@ -555,5 +597,159 @@ mod tests {
             is_revoked: false,
         };
         assert!(!entry.key_matches(&[0, 0, 0]));
+    }
+
+    // --- Phase 1A.4: Known-hosts edge case tests ---
+
+    /// Helper: encode key data to base64 for building known_hosts content.
+    fn b64(data: &[u8]) -> String {
+        base64::engine::general_purpose::STANDARD.encode(data)
+    }
+
+    #[test]
+    fn test_check_host_key_ipv6_default_port() {
+        // Bare IPv6 address in known_hosts with default port (22).
+        // In known_hosts, IPv6 at port 22 is stored as-is (no brackets).
+        let key_data = vec![1, 2, 3, 4, 5];
+        let content = format!("::1 ssh-ed25519 {}", b64(&key_data));
+
+        let status =
+            check_host_key_in_content("::1", 22, &key_data, "SHA256:test", "ssh-ed25519", &content);
+        assert!(matches!(status, HostKeyStatus::Known));
+    }
+
+    #[test]
+    fn test_check_host_key_ipv6_nonstandard_port() {
+        // IPv6 with non-standard port uses [host]:port format.
+        let key_data = vec![10, 20, 30];
+        let content = format!("[::1]:2222 ssh-ed25519 {}", b64(&key_data));
+
+        let status = check_host_key_in_content(
+            "::1",
+            2222,
+            &key_data,
+            "SHA256:test",
+            "ssh-ed25519",
+            &content,
+        );
+        assert!(matches!(status, HostKeyStatus::Known));
+
+        // Same host but default port should NOT match
+        let status_default =
+            check_host_key_in_content("::1", 22, &key_data, "SHA256:test", "ssh-ed25519", &content);
+        assert!(matches!(status_default, HostKeyStatus::Unknown { .. }));
+    }
+
+    #[test]
+    fn test_check_host_key_multiple_keys_same_host() {
+        // Host has RSA and ED25519 entries. Presenting ED25519 should return Known,
+        // even though RSA entry doesn't match the presented key.
+        let rsa_key = vec![100, 200, 255];
+        let ed25519_key = vec![50, 60, 70];
+        let content = format!(
+            "example.com ssh-rsa {}\nexample.com ssh-ed25519 {}",
+            b64(&rsa_key),
+            b64(&ed25519_key)
+        );
+
+        // Present the ED25519 key
+        let status = check_host_key_in_content(
+            "example.com",
+            22,
+            &ed25519_key,
+            "SHA256:test",
+            "ssh-ed25519",
+            &content,
+        );
+        assert!(
+            matches!(status, HostKeyStatus::Known),
+            "expected Known for ED25519 key, got: {status:?}"
+        );
+
+        // Present the RSA key
+        let status_rsa = check_host_key_in_content(
+            "example.com",
+            22,
+            &rsa_key,
+            "SHA256:test",
+            "ssh-rsa",
+            &content,
+        );
+        assert!(
+            matches!(status_rsa, HostKeyStatus::Known),
+            "expected Known for RSA key, got: {status_rsa:?}"
+        );
+
+        // Present an unknown key — should be Changed (host is known but key differs)
+        let unknown_key = vec![99, 88, 77];
+        let status_unknown = check_host_key_in_content(
+            "example.com",
+            22,
+            &unknown_key,
+            "SHA256:test",
+            "ssh-ed25519",
+            &content,
+        );
+        assert!(
+            matches!(status_unknown, HostKeyStatus::Changed { .. }),
+            "expected Changed for unknown key, got: {status_unknown:?}"
+        );
+    }
+
+    #[test]
+    fn test_check_host_key_cert_authority_skipped() {
+        // @cert-authority lines should not participate in host key matching.
+        // Without the skip, this would set host_found=true and cause false Changed.
+        let ca_key = vec![200, 201, 202];
+        let content = format!("@cert-authority example.com ssh-rsa {}", b64(&ca_key));
+
+        let server_key = vec![10, 20, 30];
+        let status = check_host_key_in_content(
+            "example.com",
+            22,
+            &server_key,
+            "SHA256:test",
+            "ssh-ed25519",
+            &content,
+        );
+        // Should be Unknown (not Changed), because @cert-authority is skipped
+        assert!(
+            matches!(status, HostKeyStatus::Unknown { .. }),
+            "expected Unknown when only @cert-authority present, got: {status:?}"
+        );
+    }
+
+    #[test]
+    fn test_parse_known_hosts_line_cert_authority_returns_none() {
+        let line = "@cert-authority *.example.com ssh-rsa AAAA";
+        assert!(
+            parse_known_hosts_line(line).is_none(),
+            "@cert-authority lines should return None"
+        );
+    }
+
+    #[test]
+    fn test_check_host_key_revoked_still_checked_after_match() {
+        // Even if one entry matches, a revoked entry for the same key should
+        // be detected. This verifies we don't return Known too early.
+        let key_data = vec![1, 2, 3];
+        let content = format!(
+            "example.com ssh-ed25519 {}\n@revoked example.com ssh-ed25519 {}",
+            b64(&key_data),
+            b64(&key_data)
+        );
+
+        let status = check_host_key_in_content(
+            "example.com",
+            22,
+            &key_data,
+            "SHA256:test",
+            "ssh-ed25519",
+            &content,
+        );
+        assert!(
+            matches!(status, HostKeyStatus::Revoked { .. }),
+            "expected Revoked even when a non-revoked entry also matches, got: {status:?}"
+        );
     }
 }

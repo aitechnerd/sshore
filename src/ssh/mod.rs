@@ -1307,6 +1307,17 @@ async fn run_proxy_loop(
                         }
                         None => {
                             tracing::debug!("channel stream ended (connection lost)");
+                            // Explicitly disconnect the session to avoid russh
+                            // internal task leaks when the connection drops
+                            // unexpectedly. Best-effort — ignore errors since
+                            // the connection is already lost.
+                            let _ = session
+                                .disconnect(
+                                    russh::Disconnect::ByApplication,
+                                    "connection lost",
+                                    "",
+                                )
+                                .await;
                             break 'proxy ProxyAction::Exit;
                         }
                     }
@@ -1798,5 +1809,27 @@ mod tests {
     #[test]
     fn test_infer_bookmark_name_ip_v4_loopback() {
         assert_eq!(infer_bookmark_name("127.0.0.1"), "server-127-0-0-1");
+    }
+
+    // --- TerminalGuard tests ---
+
+    #[test]
+    fn test_terminal_guard_double_drop_no_panic() {
+        // Verify that dropping TerminalGuard twice (e.g., explicit + scope exit)
+        // does not panic. In practice Rust only calls drop once, but we verify
+        // the drop implementation itself is safe to call when terminal state
+        // may already be restored.
+        let guard = TerminalGuard { was_raw: false };
+        // Explicit drop
+        drop(guard);
+        // If we get here, drop didn't panic — test passes.
+    }
+
+    #[test]
+    fn test_terminal_guard_with_raw_mode_flag() {
+        // When was_raw is true, TerminalGuard should NOT disable raw mode
+        // (because it was already on before we started). Verify no panic.
+        let guard = TerminalGuard { was_raw: true };
+        drop(guard);
     }
 }

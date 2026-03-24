@@ -673,8 +673,14 @@ fn try_save_form(app: &mut App) {
             if let Some(ref old) = old_name {
                 // Rename: migrate keychain entry from old name to new name
                 if let Ok(Some(pw)) = keychain::get_password(old) {
-                    let _ = keychain::set_password(&name, &pw);
-                    let _ = keychain::delete_password(old);
+                    if let Err(e) = keychain::set_password(&name, &pw) {
+                        app.set_status(format!("Warning: failed to migrate password: {e}"));
+                    }
+                    if let Err(e) = keychain::delete_password(old) {
+                        app.set_status(format!(
+                            "Warning: failed to remove old keychain entry: {e}"
+                        ));
+                    }
                 }
             }
 
@@ -686,7 +692,9 @@ fn try_save_form(app: &mut App) {
                     }
                 } else if has_stored {
                     // User cleared the password field — remove from keychain
-                    let _ = keychain::delete_password(&name);
+                    if let Err(e) = keychain::delete_password(&name) {
+                        app.set_status(format!("Warning: failed to remove password: {e}"));
+                    }
                 }
             }
 
@@ -726,8 +734,12 @@ fn handle_confirm_key(app: &mut App, key: KeyEvent) {
                     app.set_status(format!("Bookmark '{name}' deleted"));
                 }
 
-                // Clean up keychain entry (best-effort, ignore errors)
-                let _ = keychain::delete_password(&name);
+                // Clean up keychain entry — surface errors so user knows
+                if let Err(e) = keychain::delete_password(&name) {
+                    app.set_status(format!(
+                        "Bookmark deleted, but failed to remove keychain entry: {e}"
+                    ));
+                }
 
                 app.confirm_state = None;
                 app.screen = Screen::List;

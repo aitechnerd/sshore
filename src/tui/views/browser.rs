@@ -1,4 +1,5 @@
 use std::collections::HashSet;
+use std::io::{Seek, SeekFrom, Write};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
@@ -3570,6 +3571,35 @@ async fn run_background_transfer(
 /// an existing file at the target path.
 const PART_FILE_SUFFIX: &str = ".part";
 
+/// Wrapper that shifts all `SeekFrom::Start` positions by a fixed offset.
+/// Used for download resume: the pipeline writes at `offset - start_offset` (local
+/// position 0 for the first new chunk), but the `.part` file already has
+/// `start_offset` bytes. This wrapper transparently adds `start_offset` to all
+/// absolute seeks so the pipeline writes after the existing content.
+struct ResumeOffsetWriter<W> {
+    inner: W,
+    offset_shift: u64,
+}
+
+impl<W: Write> Write for ResumeOffsetWriter<W> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.inner.write(buf)
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+impl<W: Seek> Seek for ResumeOffsetWriter<W> {
+    fn seek(&mut self, pos: SeekFrom) -> std::io::Result<u64> {
+        let shifted = match pos {
+            SeekFrom::Start(p) => SeekFrom::Start(p + self.offset_shift),
+            other => other,
+        };
+        self.inner.seek(shifted)
+    }
+}
+
 /// Run a pipelined transfer for a single file using a pre-opened SFTP handle.
 /// Handles both upload and download directions. Does NOT open or close the handle.
 ///
@@ -3674,8 +3704,15 @@ async fn run_file_transfer(
                 std::fs::File::create(&part_path)
                     .with_context(|| format!("Failed to create: {part_path}"))?
             };
-            let mut local_file =
+            // Wrap with ResumeOffsetWriter so the pipeline's seek(Start(0))
+            // maps to seek(Start(start_offset)) on the actual file, preserving
+            // already-downloaded bytes in the .part file.
+            let buf =
                 std::io::BufWriter::with_capacity((pipeline::CHUNK_SIZE * 2) as usize, local_file);
+            let mut local_file = ResumeOffsetWriter {
+                inner: buf,
+                offset_shift: start_offset,
+            };
 
             let mut on_bytes = |bytes: u64| {
                 progress.mark_transfer_start();
@@ -6068,6 +6105,48 @@ mod tests {
             "partial",
             ".part file should contain partial data"
         );
+    }
+
+    #[test]
+    fn test_resume_offset_writer_shifts_seek() {
+        // ResumeOffsetWriter must shift SeekFrom::Start positions by offset_shift
+        // so the pipeline's seek(Start(0)) becomes seek(Start(start_offset)).
+        let mut cursor = std::io::Cursor::new(vec![0u8; 100]);
+        // Pre-fill first 50 bytes to simulate existing .part content.
+        for i in 0..50u8 {
+            cursor.get_mut()[i as usize] = i;
+        }
+
+        let mut writer = ResumeOffsetWriter {
+            inner: cursor,
+            offset_shift: 50,
+        };
+
+        // Pipeline seeks to local offset 0 — should map to absolute 50.
+        writer.seek(SeekFrom::Start(0)).unwrap();
+        writer.write_all(b"HELLO").unwrap();
+
+        let data = writer.inner.into_inner();
+        // Original bytes 0..50 should be untouched.
+        assert_eq!(data[0], 0);
+        assert_eq!(data[49], 49);
+        // New data should be at positions 50..55.
+        assert_eq!(&data[50..55], b"HELLO");
+    }
+
+    #[test]
+    fn test_resume_offset_writer_zero_shift() {
+        // With offset_shift=0, seeks are passed through unchanged.
+        let cursor = std::io::Cursor::new(vec![0u8; 20]);
+        let mut writer = ResumeOffsetWriter {
+            inner: cursor,
+            offset_shift: 0,
+        };
+        writer.seek(SeekFrom::Start(5)).unwrap();
+        writer.write_all(b"AB").unwrap();
+        let data = writer.inner.into_inner();
+        assert_eq!(&data[5..7], b"AB");
+        assert_eq!(data[0], 0); // untouched
     }
 
     #[test]

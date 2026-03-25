@@ -6,7 +6,7 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
 use ratatui::Frame;
-use ratatui::layout::{Constraint, Direction, Layout, Rect};
+use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph};
@@ -187,6 +187,10 @@ pub enum InputMode {
         msg: String,
         retry: Option<RetryInfo>,
     },
+    /// Help overlay listing all browser keybindings.
+    HelpOverlay,
+    /// Quick directory jump prompt (Ctrl+G).
+    GotoPrompt(String),
 }
 
 /// Info needed to retry a failed transfer from the completion popup.
@@ -540,6 +544,8 @@ pub struct BrowserState {
     /// Persistent overwrite policy across transfers in this browser session.
     /// 0=ask, 1=overwrite all, 2=skip all.
     overwrite_policy: Arc<AtomicU64>,
+    /// Scroll offset for the help overlay.
+    help_scroll: u16,
 }
 
 /// Whether a pane shows a local or remote filesystem.
@@ -609,6 +615,7 @@ pub async fn run(
         overwrite_response_tx: None,
         needs_full_redraw: false,
         overwrite_policy: Arc::new(AtomicU64::new(0)),
+        help_scroll: 0,
     };
 
     // Initial load
@@ -931,11 +938,9 @@ async fn handle_key(
             }
         }
 
-        KeyCode::F(1) => {
-            state.status_message = Some(
-                "F3=View F5=Copy F6=Move F7=Mkdir F8=Del F10=Quit | r=Rename v=Mark *=Invert +=Select -=Deselect Tab=Switch"
-                    .to_string(),
-            );
+        KeyCode::F(1) | KeyCode::Char('?') => {
+            state.help_scroll = 0;
+            state.input_mode = InputMode::HelpOverlay;
         }
 
         KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
@@ -1173,6 +1178,12 @@ async fn handle_key(
 
         KeyCode::Char('/') => {
             state.input_mode = InputMode::Filter(String::new());
+        }
+
+        KeyCode::Char('g') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            let pane = active_pane_mut(left_pane, right_pane, state);
+            state.popup_focus = 0;
+            state.input_mode = InputMode::GotoPrompt(pane.cwd.clone());
         }
 
         KeyCode::Char('s') => {
@@ -1543,8 +1554,8 @@ fn draw(
         );
     }
 
-    // F-key bar (always visible)
-    draw_fkey_bar(frame, main_chunks[4], &state.theme);
+    // F-key bar (always visible, context-aware)
+    draw_fkey_bar(frame, main_chunks[4], state);
 
     // Popup overlays (rendered on top of everything)
     match &state.input_mode {
@@ -1611,6 +1622,12 @@ fn draw(
                 *case_sensitive,
                 state.popup_focus,
             );
+        }
+        InputMode::HelpOverlay => {
+            draw_browser_help_overlay(frame, size, &state.theme, state.help_scroll);
+        }
+        InputMode::GotoPrompt(input) => {
+            draw_goto_popup(frame, size, input, state.popup_focus);
         }
         _ => {}
     }
@@ -4119,7 +4136,7 @@ async fn expand_directory_targets(
 }
 
 /// Handle input modes: filter, mkdir prompt, rename prompt, confirm delete, pattern select,
-/// copy confirm, transfer progress popup, transfer complete popup.
+/// copy confirm, transfer progress popup, transfer complete popup, help overlay, goto prompt.
 async fn handle_input_mode(
     key: KeyEvent,
     left_pane: &mut PaneState,
@@ -4128,6 +4145,32 @@ async fn handle_input_mode(
     left: &mut Backend,
     right: &mut Backend,
 ) -> Result<()> {
+    // Help overlay: scroll with arrows/j/k, dismiss with Esc/F1/?/q
+    if matches!(state.input_mode, InputMode::HelpOverlay) {
+        match key.code {
+            KeyCode::Esc | KeyCode::F(1) | KeyCode::Char('?') | KeyCode::Char('q') => {
+                state.input_mode = InputMode::Normal;
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                state.help_scroll = state.help_scroll.saturating_sub(1);
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                state.help_scroll = state.help_scroll.saturating_add(1);
+            }
+            KeyCode::PageUp => {
+                state.help_scroll = state.help_scroll.saturating_sub(10);
+            }
+            KeyCode::PageDown => {
+                state.help_scroll = state.help_scroll.saturating_add(10);
+            }
+            KeyCode::Home => {
+                state.help_scroll = 0;
+            }
+            _ => {}
+        }
+        return Ok(());
+    }
+
     // Transfer complete popup
     if let InputMode::TransferComplete { retry, .. } = &state.input_mode {
         if retry.is_none() {
@@ -4323,6 +4366,7 @@ async fn handle_input_mode(
     if matches!(
         state.input_mode,
         InputMode::MkdirPrompt(_)
+            | InputMode::GotoPrompt(_)
             | InputMode::RenamePrompt { .. }
             | InputMode::ConfirmDelete { .. }
             | InputMode::CopyConfirm { .. }
@@ -4438,6 +4482,7 @@ async fn handle_input_mode(
         let input_ref = match &mut state.input_mode {
             InputMode::Filter(input)
             | InputMode::MkdirPrompt(input)
+            | InputMode::GotoPrompt(input)
             | InputMode::SelectPattern { input, .. } => Some(input),
             InputMode::RenamePrompt { input, .. } => Some(input),
             _ => None,
@@ -4572,6 +4617,37 @@ async fn handle_input_mode(
                 }
                 // else: Cancel — mode already set to Normal
             }
+            InputMode::GotoPrompt(input) => {
+                if state.popup_focus == 0 {
+                    // OK — navigate to the entered path
+                    let path = input.trim().to_string();
+                    if path.is_empty() {
+                        state.status_message = Some("Empty path".to_string());
+                    } else {
+                        let backend = active_backend_mut(left, right, state);
+                        match backend.cd(&path).await {
+                            Ok(()) => {
+                                let new_cwd = backend.cwd().unwrap_or_default();
+                                let pane = active_pane_mut(left_pane, right_pane, state);
+                                pane.cwd = new_cwd;
+                                pane.selected = 0;
+                                pane.list_state.select(Some(0));
+                                pane.marked.clear();
+                                state.filter = None;
+                                let pane = active_pane_mut(left_pane, right_pane, state);
+                                let backend = active_backend_mut(left, right, state);
+                                refresh_pane(pane, backend, state).await?;
+                                state.status_message = None;
+                            }
+                            Err(e) => {
+                                tracing::error!("goto failed: {path}: {e:#}");
+                                state.status_message = Some(format!("Go to error: {e}"));
+                            }
+                        }
+                    }
+                }
+                // else: Cancel — mode already set to Normal
+            }
             InputMode::RenamePrompt { input, source } => {
                 if state.popup_focus == 0 {
                     // OK — rename/move
@@ -4648,7 +4724,8 @@ async fn handle_input_mode(
             | InputMode::CopyConfirm { .. }
             | InputMode::TransferPopup
             | InputMode::OverwriteConfirm { .. }
-            | InputMode::TransferComplete { .. } => {}
+            | InputMode::TransferComplete { .. }
+            | InputMode::HelpOverlay => {}
         }
         return Ok(());
     }
@@ -4658,6 +4735,222 @@ async fn handle_input_mode(
 
 /// Draw the MC-style F-key bar at the bottom.
 /// Build a key badge + label span pair, matching the bookmark list status bar style.
+/// Draw the browser help overlay popup with all keybindings grouped by category.
+/// Mirrors the pattern from `src/tui/views/help.rs`.
+fn draw_browser_help_overlay(frame: &mut Frame, area: Rect, theme: &ThemeColors, scroll: u16) {
+    let sections = build_browser_help_sections(theme);
+    let content_height = sections.len() as u16 + 2; // +2 for borders
+
+    // Size to content, capped at 90% of terminal height
+    let max_height = (area.height as u32 * 90 / 100) as u16;
+    let popup_height = content_height.min(max_height);
+
+    // 70% width to fit keybinding descriptions
+    let popup_width = (area.width as u32 * 70 / 100).min(72) as u16;
+    let v_pad = area.height.saturating_sub(popup_height) / 2;
+    let h_pad = area.width.saturating_sub(popup_width) / 2;
+    let popup = Rect::new(area.x + h_pad, area.y + v_pad, popup_width, popup_height);
+
+    frame.render_widget(Clear, popup);
+
+    let is_scrollable = content_height > popup_height;
+    let title_bottom = if is_scrollable {
+        " \u{2191}\u{2193} scroll | Esc close "
+    } else {
+        " Esc close "
+    };
+
+    let block = Block::default()
+        .title(" Browser Keybindings ")
+        .title_alignment(Alignment::Center)
+        .title_bottom(Line::from(title_bottom).alignment(Alignment::Center))
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(theme.border))
+        .style(Style::default().bg(theme.surface));
+
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
+
+    let paragraph = Paragraph::new(sections).scroll((scroll, 0));
+    frame.render_widget(paragraph, inner);
+}
+
+/// Build help sections for the browser help overlay.
+fn build_browser_help_sections(theme: &ThemeColors) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
+
+    help_section_header(&mut lines, "Navigation", theme);
+    help_key_hint(&mut lines, "\u{2191}/k", "Move selection up", theme);
+    help_key_hint(&mut lines, "\u{2193}/j", "Move selection down", theme);
+    help_key_hint(&mut lines, "Home/g", "Jump to first item", theme);
+    help_key_hint(&mut lines, "End/G", "Jump to last item", theme);
+    help_key_hint(&mut lines, "PgUp/PgDn", "Scroll up/down by 10", theme);
+    help_key_hint(&mut lines, "Enter", "Open directory / view file", theme);
+    help_key_hint(&mut lines, "Backspace", "Go to parent directory", theme);
+    help_key_hint(&mut lines, "Tab", "Switch active pane", theme);
+    help_key_hint(&mut lines, "Ctrl+G", "Go to directory (path prompt)", theme);
+    lines.push(Line::from(""));
+
+    help_section_header(&mut lines, "File Operations", theme);
+    help_key_hint(&mut lines, "F3", "View file (external pager)", theme);
+    help_key_hint(
+        &mut lines,
+        "F5 / Space",
+        "Copy selected/marked to other pane",
+        theme,
+    );
+    help_key_hint(
+        &mut lines,
+        "F6",
+        "Move selected/marked to other pane",
+        theme,
+    );
+    help_key_hint(&mut lines, "F7", "Create new directory", theme);
+    help_key_hint(&mut lines, "F8 / d", "Delete selected/marked", theme);
+    help_key_hint(&mut lines, "r", "Rename / move", theme);
+    lines.push(Line::from(""));
+
+    help_section_header(&mut lines, "Selection", theme);
+    help_key_hint(
+        &mut lines,
+        "v / Insert",
+        "Toggle mark on current item",
+        theme,
+    );
+    help_key_hint(&mut lines, "* / +", "Select by pattern", theme);
+    help_key_hint(&mut lines, "-", "Deselect by pattern", theme);
+    lines.push(Line::from(""));
+
+    help_section_header(&mut lines, "Display & Filtering", theme);
+    help_key_hint(&mut lines, "/", "Toggle filter mode (glob)", theme);
+    help_key_hint(&mut lines, ".", "Toggle hidden files", theme);
+    help_key_hint(
+        &mut lines,
+        "s",
+        "Cycle sort field (name/size/modified)",
+        theme,
+    );
+    help_key_hint(&mut lines, "S", "Toggle sort direction", theme);
+    lines.push(Line::from(""));
+
+    help_section_header(&mut lines, "Transfers", theme);
+    help_key_hint(&mut lines, "p", "Show transfer progress popup", theme);
+    help_key_hint(&mut lines, "Ctrl+R", "Refresh both panes", theme);
+    lines.push(Line::from(""));
+
+    help_section_header(&mut lines, "General", theme);
+    help_key_hint(&mut lines, "F1 / ?", "Toggle this help", theme);
+    help_key_hint(&mut lines, "q / F10", "Quit browser", theme);
+    help_key_hint(
+        &mut lines,
+        "Esc",
+        "Cancel / quit (cancels transfers first)",
+        theme,
+    );
+    help_key_hint(&mut lines, "Ctrl+C", "Cancel active transfers", theme);
+
+    lines
+}
+
+/// Render a section header for browser help overlay.
+fn help_section_header(lines: &mut Vec<Line<'static>>, title: &str, theme: &ThemeColors) {
+    lines.push(Line::from(Span::styled(
+        format!("  {title}"),
+        Style::default()
+            .fg(theme.accent)
+            .add_modifier(Modifier::BOLD),
+    )));
+    lines.push(Line::from(""));
+}
+
+/// Render a key-description pair for browser help overlay.
+fn help_key_hint(lines: &mut Vec<Line<'static>>, key: &str, desc: &str, theme: &ThemeColors) {
+    lines.push(Line::from(vec![
+        Span::styled(
+            format!("    {key:<20}"),
+            Style::default()
+                .fg(theme.warning)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(desc.to_string(), Style::default().fg(theme.fg)),
+    ]));
+}
+
+/// Draw the "Go to directory" popup overlay, mirroring the mkdir popup pattern.
+fn draw_goto_popup(frame: &mut Frame, area: Rect, input: &str, popup_focus: usize) {
+    let popup_h: u16 = 8;
+    let popup_area = centered_fixed_rect(POPUP_WIDTH, popup_h, area);
+    if popup_area.width < 20 || popup_area.height < popup_h {
+        return;
+    }
+
+    let block = Block::default()
+        .title(" Go to Directory ")
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan));
+
+    frame.render_widget(Clear, popup_area);
+    frame.render_widget(block, popup_area);
+
+    let inner = Rect::new(
+        popup_area.x + 2,
+        popup_area.y + 1,
+        popup_area.width.saturating_sub(4),
+        popup_area.height.saturating_sub(2),
+    );
+
+    // Label
+    frame.render_widget(
+        Paragraph::new("Enter path:").style(Style::default().fg(Color::White)),
+        Rect::new(inner.x, inner.y, inner.width, 1),
+    );
+
+    // Input field with background
+    let field_y = inner.y + 1;
+    let field_w = inner.width;
+    let field_area = Rect::new(inner.x, field_y, field_w, 1);
+
+    // Show the tail of input if it overflows
+    let max_visible = field_w.saturating_sub(1) as usize;
+    let display_input = if input.len() > max_visible {
+        &input[input.len() - max_visible..]
+    } else {
+        input
+    };
+
+    let cursor_char = if display_input.len() < max_visible {
+        "\u{2588}"
+    } else {
+        ""
+    };
+    let text_len = display_input.len() + cursor_char.len();
+    let pad = (field_w as usize).saturating_sub(text_len);
+    let field_line = Line::from(vec![
+        Span::styled(
+            display_input.to_string(),
+            Style::default().fg(Color::White).bg(Color::DarkGray),
+        ),
+        Span::styled(
+            cursor_char.to_string(),
+            Style::default().fg(Color::White).bg(Color::DarkGray),
+        ),
+        Span::styled(" ".repeat(pad), Style::default().bg(Color::DarkGray)),
+    ]);
+    frame.render_widget(Paragraph::new(field_line), field_area);
+
+    // Separator line
+    let sep_y = inner.y + 3;
+    let sep_line = "\u{2500}".repeat(inner.width as usize);
+    frame.render_widget(
+        Paragraph::new(sep_line).style(Style::default().fg(Color::Cyan)),
+        Rect::new(inner.x, sep_y, inner.width, 1),
+    );
+
+    // Centered button row
+    let btn_y = inner.y + 4;
+    render_button_row(&["Go", "Cancel"], popup_focus, inner, btn_y, frame);
+}
+
 fn hint_pair<'a>(key: &str, action: &str, theme: &ThemeColors) -> Vec<Span<'a>> {
     vec![
         Span::styled(
@@ -4671,8 +4964,55 @@ fn hint_pair<'a>(key: &str, action: &str, theme: &ThemeColors) -> Vec<Span<'a>> 
     ]
 }
 
-fn draw_fkey_bar(frame: &mut Frame, area: Rect, theme: &ThemeColors) {
+fn draw_fkey_bar(frame: &mut Frame, area: Rect, state: &BrowserState) {
+    let theme = &state.theme;
+    let spans = build_fkey_bar_hints(state, theme);
+    frame.render_widget(Paragraph::new(Line::from(spans)), area);
+}
+
+/// Build the context-aware footer bar hints based on current browser state.
+fn build_fkey_bar_hints<'a>(state: &BrowserState, theme: &ThemeColors) -> Vec<Span<'a>> {
+    // Transfer in progress: show transfer-specific hints
+    if !state.background_transfers.is_empty()
+        && matches!(state.input_mode, InputMode::TransferPopup)
+    {
+        let mut spans = Vec::new();
+        spans.extend(hint_pair("s", "Skip", theme));
+        spans.extend(hint_pair("b", "Background", theme));
+        spans.extend(hint_pair("Tab", "Next xfer", theme));
+        spans.extend(hint_pair("Esc", "Cancel", theme));
+        return spans;
+    }
+
+    // Help overlay
+    if matches!(state.input_mode, InputMode::HelpOverlay) {
+        let mut spans = Vec::new();
+        spans.extend(hint_pair("\u{2191}\u{2193}", "Scroll", theme));
+        spans.extend(hint_pair("Esc/?", "Close", theme));
+        return spans;
+    }
+
+    // Filter mode
+    if matches!(state.input_mode, InputMode::Filter(_)) {
+        let mut spans = Vec::new();
+        spans.extend(hint_pair("Type", "Filter pattern", theme));
+        spans.extend(hint_pair("Enter", "Apply", theme));
+        spans.extend(hint_pair("Esc", "Cancel", theme));
+        return spans;
+    }
+
+    // Goto prompt
+    if matches!(state.input_mode, InputMode::GotoPrompt(_)) {
+        let mut spans = Vec::new();
+        spans.extend(hint_pair("Type", "Path", theme));
+        spans.extend(hint_pair("Enter", "Go", theme));
+        spans.extend(hint_pair("Esc", "Cancel", theme));
+        return spans;
+    }
+
+    // Default: normal mode
     let mut spans = Vec::new();
+    spans.extend(hint_pair("F1/?", "Help", theme));
     spans.extend(hint_pair("F3", "View", theme));
     spans.extend(hint_pair("F5", "Copy", theme));
     spans.extend(hint_pair("F6", "Move", theme));
@@ -4681,8 +5021,8 @@ fn draw_fkey_bar(frame: &mut Frame, area: Rect, theme: &ThemeColors) {
     spans.extend(hint_pair("v", "Mark", theme));
     spans.extend(hint_pair("/", "Filter", theme));
     spans.extend(hint_pair("Tab", "Switch", theme));
-    spans.extend(hint_pair("Esc", "Quit", theme));
-    frame.render_widget(Paragraph::new(Line::from(spans)), area);
+    spans.extend(hint_pair("q", "Quit", theme));
+    spans
 }
 
 /// Open a new SFTP session from an SSH handle (standalone function for use in spawned tasks).
@@ -4769,6 +5109,7 @@ fn rss_mb() -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tui::theme::resolve_theme;
     use chrono::Utc;
 
     fn file_entry(name: &str, is_dir: bool, size: u64) -> FileEntry {
@@ -5297,5 +5638,267 @@ mod tests {
         let msg = format_transfer_summary(&result, 500, Duration::from_millis(50), false);
         assert!(msg.contains("1 file"));
         assert!(!msg.contains("avg"));
+    }
+
+    // --- Help Overlay ---
+
+    #[test]
+    fn test_browser_help_sections_contain_navigation_keys() {
+        let theme = resolve_theme("default");
+        let sections = build_browser_help_sections(&theme);
+        let text: String =
+            sections
+                .iter()
+                .flat_map(|l| l.spans.iter())
+                .fold(String::new(), |mut acc, span| {
+                    acc.push_str(&span.content);
+                    acc
+                });
+        assert!(
+            text.contains("Navigation"),
+            "should have Navigation section"
+        );
+        assert!(text.contains("Move selection up"), "should list up key");
+        assert!(text.contains("Tab"), "should list Tab key");
+        assert!(text.contains("Ctrl+G"), "should list Ctrl+G for goto");
+    }
+
+    #[test]
+    fn test_browser_help_sections_contain_file_operations() {
+        let theme = resolve_theme("default");
+        let sections = build_browser_help_sections(&theme);
+        let text: String =
+            sections
+                .iter()
+                .flat_map(|l| l.spans.iter())
+                .fold(String::new(), |mut acc, span| {
+                    acc.push_str(&span.content);
+                    acc
+                });
+        assert!(
+            text.contains("File Operations"),
+            "should have File Operations section"
+        );
+        assert!(text.contains("Copy"), "should list copy");
+        assert!(text.contains("Move"), "should list move");
+        assert!(text.contains("Delete"), "should list delete");
+        assert!(text.contains("Rename"), "should list rename");
+        assert!(text.contains("Create new directory"), "should list mkdir");
+    }
+
+    #[test]
+    fn test_browser_help_sections_contain_selection() {
+        let theme = resolve_theme("default");
+        let sections = build_browser_help_sections(&theme);
+        let text: String =
+            sections
+                .iter()
+                .flat_map(|l| l.spans.iter())
+                .fold(String::new(), |mut acc, span| {
+                    acc.push_str(&span.content);
+                    acc
+                });
+        assert!(text.contains("Selection"), "should have Selection section");
+        assert!(text.contains("Toggle mark"), "should list mark toggle");
+        assert!(
+            text.contains("Select by pattern"),
+            "should list select pattern"
+        );
+        assert!(
+            text.contains("Deselect by pattern"),
+            "should list deselect pattern"
+        );
+    }
+
+    #[test]
+    fn test_browser_help_sections_contain_display_and_general() {
+        let theme = resolve_theme("default");
+        let sections = build_browser_help_sections(&theme);
+        let text: String =
+            sections
+                .iter()
+                .flat_map(|l| l.spans.iter())
+                .fold(String::new(), |mut acc, span| {
+                    acc.push_str(&span.content);
+                    acc
+                });
+        assert!(text.contains("Display"), "should have Display section");
+        assert!(
+            text.contains("Toggle hidden files"),
+            "should list hidden toggle"
+        );
+        assert!(text.contains("General"), "should have General section");
+        assert!(text.contains("Toggle this help"), "should list help toggle");
+        assert!(text.contains("Quit browser"), "should list quit");
+    }
+
+    #[test]
+    fn test_browser_help_sections_contain_transfers() {
+        let theme = resolve_theme("default");
+        let sections = build_browser_help_sections(&theme);
+        let text: String =
+            sections
+                .iter()
+                .flat_map(|l| l.spans.iter())
+                .fold(String::new(), |mut acc, span| {
+                    acc.push_str(&span.content);
+                    acc
+                });
+        assert!(text.contains("Transfers"), "should have Transfers section");
+        assert!(
+            text.contains("transfer progress"),
+            "should list progress shortcut"
+        );
+        assert!(text.contains("Refresh"), "should list refresh");
+    }
+
+    // --- Input Mode state machine ---
+
+    #[test]
+    fn test_input_mode_help_overlay_variant() {
+        // Verify HelpOverlay can be constructed and pattern-matched
+        let mode = InputMode::HelpOverlay;
+        assert!(matches!(mode, InputMode::HelpOverlay));
+    }
+
+    #[test]
+    fn test_input_mode_goto_prompt_variant() {
+        // Verify GotoPrompt can be constructed with a path
+        let mode = InputMode::GotoPrompt("/home/user".to_string());
+        if let InputMode::GotoPrompt(ref path) = mode {
+            assert_eq!(path, "/home/user");
+        } else {
+            panic!("Expected GotoPrompt variant");
+        }
+    }
+
+    // --- Footer bar (context-aware) ---
+
+    #[test]
+    fn test_fkey_bar_normal_mode_contains_help() {
+        let theme = resolve_theme("default");
+        let state = BrowserState {
+            active_pane: Side::Left,
+            show_hidden: false,
+            sort_by: SortField::Name,
+            sort_asc: true,
+            filter: None,
+            input_mode: InputMode::Normal,
+            status_message: None,
+            bookmark_name: "test".to_string(),
+            env: "development".to_string(),
+            left_label: PaneLabel::Local,
+            right_label: PaneLabel::Remote,
+            background_transfers: Vec::new(),
+            theme: theme.clone(),
+            popup_focus: 0,
+            popup_transfer_index: 0,
+            overwrite_response_tx: None,
+            needs_full_redraw: false,
+            overwrite_policy: Arc::new(AtomicU64::new(0)),
+            help_scroll: 0,
+        };
+        let spans = build_fkey_bar_hints(&state, &theme);
+        let text: String = spans.iter().map(|s| s.content.to_string()).collect();
+        assert!(text.contains("Help"), "normal mode should show Help");
+        assert!(text.contains("F1/?"), "normal mode should show F1/?");
+        assert!(text.contains("Quit"), "normal mode should show Quit");
+        assert!(text.contains("Copy"), "normal mode should show Copy");
+    }
+
+    #[test]
+    fn test_fkey_bar_help_overlay_mode() {
+        let theme = resolve_theme("default");
+        let state = BrowserState {
+            active_pane: Side::Left,
+            show_hidden: false,
+            sort_by: SortField::Name,
+            sort_asc: true,
+            filter: None,
+            input_mode: InputMode::HelpOverlay,
+            status_message: None,
+            bookmark_name: "test".to_string(),
+            env: "development".to_string(),
+            left_label: PaneLabel::Local,
+            right_label: PaneLabel::Remote,
+            background_transfers: Vec::new(),
+            theme: theme.clone(),
+            popup_focus: 0,
+            popup_transfer_index: 0,
+            overwrite_response_tx: None,
+            needs_full_redraw: false,
+            overwrite_policy: Arc::new(AtomicU64::new(0)),
+            help_scroll: 0,
+        };
+        let spans = build_fkey_bar_hints(&state, &theme);
+        let text: String = spans.iter().map(|s| s.content.to_string()).collect();
+        assert!(text.contains("Scroll"), "help mode should show Scroll");
+        assert!(text.contains("Close"), "help mode should show Close");
+        assert!(!text.contains("Copy"), "help mode should not show Copy");
+    }
+
+    #[test]
+    fn test_fkey_bar_filter_mode() {
+        let theme = resolve_theme("default");
+        let state = BrowserState {
+            active_pane: Side::Left,
+            show_hidden: false,
+            sort_by: SortField::Name,
+            sort_asc: true,
+            filter: None,
+            input_mode: InputMode::Filter(String::new()),
+            status_message: None,
+            bookmark_name: "test".to_string(),
+            env: "development".to_string(),
+            left_label: PaneLabel::Local,
+            right_label: PaneLabel::Remote,
+            background_transfers: Vec::new(),
+            theme: theme.clone(),
+            popup_focus: 0,
+            popup_transfer_index: 0,
+            overwrite_response_tx: None,
+            needs_full_redraw: false,
+            overwrite_policy: Arc::new(AtomicU64::new(0)),
+            help_scroll: 0,
+        };
+        let spans = build_fkey_bar_hints(&state, &theme);
+        let text: String = spans.iter().map(|s| s.content.to_string()).collect();
+        assert!(
+            text.contains("Filter pattern"),
+            "filter mode should show filter hint"
+        );
+        assert!(text.contains("Apply"), "filter mode should show Apply");
+        assert!(text.contains("Cancel"), "filter mode should show Cancel");
+    }
+
+    #[test]
+    fn test_fkey_bar_goto_mode() {
+        let theme = resolve_theme("default");
+        let state = BrowserState {
+            active_pane: Side::Left,
+            show_hidden: false,
+            sort_by: SortField::Name,
+            sort_asc: true,
+            filter: None,
+            input_mode: InputMode::GotoPrompt("/var/log".to_string()),
+            status_message: None,
+            bookmark_name: "test".to_string(),
+            env: "development".to_string(),
+            left_label: PaneLabel::Local,
+            right_label: PaneLabel::Remote,
+            background_transfers: Vec::new(),
+            theme: theme.clone(),
+            popup_focus: 0,
+            popup_transfer_index: 0,
+            overwrite_response_tx: None,
+            needs_full_redraw: false,
+            overwrite_policy: Arc::new(AtomicU64::new(0)),
+            help_scroll: 0,
+        };
+        let spans = build_fkey_bar_hints(&state, &theme);
+        let text: String = spans.iter().map(|s| s.content.to_string()).collect();
+        assert!(text.contains("Path"), "goto mode should show Path");
+        assert!(text.contains("Go"), "goto mode should show Go");
+        assert!(text.contains("Cancel"), "goto mode should show Cancel");
     }
 }

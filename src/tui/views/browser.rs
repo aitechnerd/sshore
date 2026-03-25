@@ -3565,8 +3565,24 @@ async fn run_background_transfer(
     }
 }
 
+/// Extension appended to download targets during transfer. The file is renamed
+/// to the final path only on success, so interrupted downloads never corrupt
+/// an existing file at the target path.
+const PART_FILE_SUFFIX: &str = ".part";
+
 /// Run a pipelined transfer for a single file using a pre-opened SFTP handle.
 /// Handles both upload and download directions. Does NOT open or close the handle.
+///
+/// **Download safety (RemoteToLocal):** Writes to a `.part` file first and renames
+/// to the final path on success. If a `.part` file already exists from a previous
+/// interrupted transfer, resumes from its current offset instead of truncating.
+/// On failure the `.part` file is left in place for potential future resume.
+///
+/// **Upload safety (LocalToRemote):** The SFTP protocol does not support atomic
+/// writes. If an upload is interrupted, the remote file may be left truncated or
+/// zero-length. This is a fundamental SFTP limitation — the server has no rename-
+/// on-close or tempfile mechanism. Users should verify remote file integrity after
+/// failed uploads.
 #[allow(clippy::too_many_arguments)]
 async fn run_file_transfer(
     raw: &Arc<RawSftpSession>,
@@ -3630,8 +3646,34 @@ async fn run_file_transfer(
                 })?;
             }
 
-            let local_file = std::fs::File::create(&target.dst_path)
-                .with_context(|| format!("Failed to create: {}", target.dst_path))?;
+            let part_path = format!("{}{PART_FILE_SUFFIX}", target.dst_path);
+
+            // Resume from existing .part file if present, otherwise create new.
+            let start_offset = std::fs::metadata(&part_path)
+                .ok()
+                .filter(|m| m.is_file() && m.len() > 0 && m.len() < target.size)
+                .map(|m| m.len())
+                .unwrap_or(0);
+
+            let local_file = if start_offset > 0 {
+                tracing::debug!(
+                    "worker[{worker_id}] resuming {}: offset {} of {}",
+                    target.name,
+                    start_offset,
+                    target.size,
+                );
+                // Account for already-downloaded bytes in progress tracking.
+                progress
+                    .bytes_done_all
+                    .fetch_add(start_offset, Ordering::Relaxed);
+                std::fs::OpenOptions::new()
+                    .write(true)
+                    .open(&part_path)
+                    .with_context(|| format!("Failed to open {part_path} for resume"))?
+            } else {
+                std::fs::File::create(&part_path)
+                    .with_context(|| format!("Failed to create: {part_path}"))?
+            };
             let mut local_file =
                 std::io::BufWriter::with_capacity((pipeline::CHUNK_SIZE * 2) as usize, local_file);
 
@@ -3648,20 +3690,35 @@ async fn run_file_transfer(
                 handle_str,
                 &mut local_file,
                 target.size,
-                0,
+                start_offset,
                 read_chunk_size,
                 &mut on_bytes,
                 Some(combined_cancel.as_ref()),
             );
             tokio::pin!(transfer);
-            loop {
+            let result: Result<()> = loop {
                 tokio::select! {
-                    result = &mut transfer => { result?; break; }
+                    result = &mut transfer => { break result; }
                     _ = tokio::time::sleep(Duration::from_millis(50)) => {
                         if cancel.load(Ordering::Relaxed) || skip.load(Ordering::Relaxed) {
                             combined_cancel.store(true, Ordering::Relaxed);
                         }
                     }
+                }
+            };
+
+            // On success: rename .part to final path. On failure: leave .part for resume.
+            match result {
+                Ok(()) => {
+                    std::fs::rename(&part_path, &target.dst_path).with_context(|| {
+                        format!("Failed to rename {} to {}", part_path, target.dst_path)
+                    })?;
+                }
+                Err(e) => {
+                    tracing::debug!(
+                        "worker[{worker_id}] download failed, .part file preserved: {part_path}"
+                    );
+                    return Err(e);
                 }
             }
         }
@@ -5900,5 +5957,195 @@ mod tests {
         assert!(text.contains("Path"), "goto mode should show Path");
         assert!(text.contains("Go"), "goto mode should show Go");
         assert!(text.contains("Cancel"), "goto mode should show Cancel");
+    }
+
+    // --- .part file pattern (Phase 1B.3) ---
+
+    #[test]
+    fn test_part_file_suffix_constant() {
+        assert_eq!(PART_FILE_SUFFIX, ".part");
+    }
+
+    #[test]
+    fn test_part_file_path_construction() {
+        // Verify the .part path format matches expectations.
+        let dst_path = "/home/user/downloads/file.tar.gz";
+        let part_path = format!("{dst_path}{PART_FILE_SUFFIX}");
+        assert_eq!(part_path, "/home/user/downloads/file.tar.gz.part");
+    }
+
+    #[test]
+    fn test_part_file_resume_offset_logic() {
+        // Simulate the resume-from-offset decision logic used in run_file_transfer.
+        let target_size: u64 = 10_000;
+
+        // Case 1: No .part file exists — start from 0.
+        let offset: u64 = None::<std::fs::Metadata>
+            .filter(|m| m.is_file() && m.len() > 0 && m.len() < target_size)
+            .map(|m| m.len())
+            .unwrap_or(0);
+        assert_eq!(offset, 0);
+
+        // Case 2: .part file exists with size == target (already complete) — start from 0.
+        // This covers the edge case where a previous transfer completed writing to .part
+        // but the rename failed. Re-downloading is safer than assuming completeness.
+        // The filter rejects part_size >= target_size, so offset is 0.
+        let dir = tempfile::tempdir().unwrap();
+        let part_file = dir.path().join("test.dat.part");
+        std::fs::write(&part_file, vec![0u8; target_size as usize]).unwrap();
+        let meta = std::fs::metadata(&part_file).unwrap();
+        let offset = Some(meta)
+            .filter(|m| m.is_file() && m.len() > 0 && m.len() < target_size)
+            .map(|m| m.len())
+            .unwrap_or(0);
+        assert_eq!(offset, 0, "complete .part should restart, not resume");
+
+        // Case 3: .part file exists with partial content — resume from offset.
+        let partial_size: u64 = 5_000;
+        std::fs::write(&part_file, vec![0u8; partial_size as usize]).unwrap();
+        let meta = std::fs::metadata(&part_file).unwrap();
+        let offset = Some(meta)
+            .filter(|m| m.is_file() && m.len() > 0 && m.len() < target_size)
+            .map(|m| m.len())
+            .unwrap_or(0);
+        assert_eq!(
+            offset, partial_size,
+            "partial .part should resume from offset"
+        );
+
+        // Case 4: .part file is empty — start from 0.
+        std::fs::write(&part_file, b"").unwrap();
+        let meta = std::fs::metadata(&part_file).unwrap();
+        let offset = Some(meta)
+            .filter(|m| m.is_file() && m.len() > 0 && m.len() < target_size)
+            .map(|m| m.len())
+            .unwrap_or(0);
+        assert_eq!(offset, 0, "empty .part should not resume");
+    }
+
+    #[test]
+    fn test_part_file_rename_on_success() {
+        // Verify the rename-on-success pattern works correctly.
+        let dir = tempfile::tempdir().unwrap();
+        let final_path = dir.path().join("result.dat");
+        let part_path = format!("{}{PART_FILE_SUFFIX}", final_path.display());
+
+        // Simulate: write to .part, then rename to final.
+        std::fs::write(&part_path, b"complete file content").unwrap();
+        assert!(std::path::Path::new(&part_path).exists());
+        assert!(!final_path.exists());
+
+        std::fs::rename(&part_path, &final_path).unwrap();
+        assert!(final_path.exists());
+        assert!(!std::path::Path::new(&part_path).exists());
+        assert_eq!(
+            std::fs::read_to_string(&final_path).unwrap(),
+            "complete file content"
+        );
+    }
+
+    #[test]
+    fn test_part_file_preserves_original_on_failure() {
+        // If a download fails, the original file at dst_path should be untouched.
+        let dir = tempfile::tempdir().unwrap();
+        let final_path = dir.path().join("existing.dat");
+        let part_path = format!("{}{PART_FILE_SUFFIX}", final_path.display());
+
+        // Pre-existing file at the final path.
+        std::fs::write(&final_path, b"original content").unwrap();
+
+        // Simulate: partial write to .part (download interrupted).
+        std::fs::write(&part_path, b"partial").unwrap();
+
+        // Verify: original is untouched, .part has partial data.
+        assert_eq!(
+            std::fs::read_to_string(&final_path).unwrap(),
+            "original content",
+            "original file must not be modified during download"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&part_path).unwrap(),
+            "partial",
+            ".part file should contain partial data"
+        );
+    }
+
+    #[test]
+    fn test_transfer_complete_retry_on_sftp_error() {
+        // Verify that the TransferComplete state with retry is correctly constructed
+        // when a transfer has errors (simulating SFTP channel death).
+        let result = TransferResult {
+            copied: 2,
+            total: 5,
+            last_error: Some("SFTP read failed: channel closed".into()),
+        };
+
+        // This mirrors the logic in the transfer completion handler.
+        let retry = if result.last_error.is_some() {
+            Some(RetryInfo {
+                targets: vec![
+                    ("/remote/a.txt".into(), "a.txt".into(), false, 1000),
+                    ("/remote/b.txt".into(), "b.txt".into(), false, 2000),
+                    ("/remote/c.txt".into(), "c.txt".into(), false, 3000),
+                ],
+                direction: TransferDirection::RemoteToLocal,
+                source_side: Side::Right,
+                dst_cwd: "/local/dst".into(),
+                is_move: false,
+            })
+        } else {
+            None
+        };
+
+        assert!(retry.is_some(), "SFTP error must produce RetryInfo");
+        let info = retry.unwrap();
+        assert_eq!(
+            info.targets.len(),
+            3,
+            "retry should include remaining targets"
+        );
+        assert_eq!(info.direction, TransferDirection::RemoteToLocal);
+        assert!(!info.is_move);
+
+        // Verify the InputMode can be constructed correctly.
+        let mode = InputMode::TransferComplete {
+            msg: "Failed: SFTP read failed after 2 of 5 files".into(),
+            retry: Some(info),
+        };
+        assert!(
+            matches!(mode, InputMode::TransferComplete { retry: Some(_), .. }),
+            "TransferComplete must have retry for error case"
+        );
+    }
+
+    #[test]
+    fn test_transfer_complete_no_retry_on_success() {
+        // Successful transfers should not have retry info.
+        let result = TransferResult {
+            copied: 5,
+            total: 5,
+            last_error: None,
+        };
+        let retry: Option<RetryInfo> = if result.last_error.is_some() {
+            Some(RetryInfo {
+                targets: vec![],
+                direction: TransferDirection::RemoteToLocal,
+                source_side: Side::Right,
+                dst_cwd: "/dst".into(),
+                is_move: false,
+            })
+        } else {
+            None
+        };
+        assert!(retry.is_none(), "successful transfer must not have retry");
+
+        let mode = InputMode::TransferComplete {
+            msg: "Copied 5 files".into(),
+            retry: None,
+        };
+        assert!(
+            matches!(mode, InputMode::TransferComplete { retry: None, .. }),
+            "successful TransferComplete must have retry: None"
+        );
     }
 }

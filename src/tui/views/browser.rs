@@ -1692,8 +1692,19 @@ fn render_button_row(labels: &[&str], focus: usize, inner: Rect, y: u16, frame: 
     );
 }
 
-/// Draw the mkdir popup overlay for entering a new directory name.
-fn draw_mkdir_popup(frame: &mut Frame, area: Rect, input: &str, popup_focus: usize) {
+/// Draw a single-input popup overlay — shared by mkdir, goto, and similar prompts.
+///
+/// `title` is the popup border title; `label` is the text above the input field;
+/// `buttons` is the ordered list of button labels shown in the button row.
+fn draw_input_popup(
+    frame: &mut Frame,
+    area: Rect,
+    title: &str,
+    label: &str,
+    input: &str,
+    buttons: &[&str],
+    popup_focus: usize,
+) {
     let popup_h: u16 = 8;
     let popup_area = centered_fixed_rect(POPUP_WIDTH, popup_h, area);
     if popup_area.width < 20 || popup_area.height < popup_h {
@@ -1701,7 +1712,7 @@ fn draw_mkdir_popup(frame: &mut Frame, area: Rect, input: &str, popup_focus: usi
     }
 
     let block = Block::default()
-        .title(" Create a New Directory ")
+        .title(format!(" {title} "))
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::Cyan));
 
@@ -1717,7 +1728,7 @@ fn draw_mkdir_popup(frame: &mut Frame, area: Rect, input: &str, popup_focus: usi
 
     // Label
     frame.render_widget(
-        Paragraph::new("Enter directory name:").style(Style::default().fg(Color::White)),
+        Paragraph::new(label.to_string()).style(Style::default().fg(Color::White)),
         Rect::new(inner.x, inner.y, inner.width, 1),
     );
 
@@ -1765,7 +1776,20 @@ fn draw_mkdir_popup(frame: &mut Frame, area: Rect, input: &str, popup_focus: usi
 
     // Centered button row
     let btn_y = inner.y + 4;
-    render_button_row(&["OK", "Cancel"], popup_focus, inner, btn_y, frame);
+    render_button_row(buttons, popup_focus, inner, btn_y, frame);
+}
+
+/// Draw the mkdir popup overlay for entering a new directory name.
+fn draw_mkdir_popup(frame: &mut Frame, area: Rect, input: &str, popup_focus: usize) {
+    draw_input_popup(
+        frame,
+        area,
+        "Create a New Directory",
+        "Enter directory name:",
+        input,
+        &["OK", "Cancel"],
+        popup_focus,
+    );
 }
 
 /// Draw the rename/move popup overlay.
@@ -4970,79 +4994,17 @@ fn help_key_hint(lines: &mut Vec<Line<'static>>, key: &str, desc: &str, theme: &
     ]));
 }
 
-/// Draw the "Go to directory" popup overlay, mirroring the mkdir popup pattern.
+/// Draw the "Go to directory" popup overlay.
 fn draw_goto_popup(frame: &mut Frame, area: Rect, input: &str, popup_focus: usize) {
-    let popup_h: u16 = 8;
-    let popup_area = centered_fixed_rect(POPUP_WIDTH, popup_h, area);
-    if popup_area.width < 20 || popup_area.height < popup_h {
-        return;
-    }
-
-    let block = Block::default()
-        .title(" Go to Directory ")
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Cyan));
-
-    frame.render_widget(Clear, popup_area);
-    frame.render_widget(block, popup_area);
-
-    let inner = Rect::new(
-        popup_area.x + 2,
-        popup_area.y + 1,
-        popup_area.width.saturating_sub(4),
-        popup_area.height.saturating_sub(2),
+    draw_input_popup(
+        frame,
+        area,
+        "Go to Directory",
+        "Enter path:",
+        input,
+        &["Go", "Cancel"],
+        popup_focus,
     );
-
-    // Label
-    frame.render_widget(
-        Paragraph::new("Enter path:").style(Style::default().fg(Color::White)),
-        Rect::new(inner.x, inner.y, inner.width, 1),
-    );
-
-    // Input field with background
-    let field_y = inner.y + 1;
-    let field_w = inner.width;
-    let field_area = Rect::new(inner.x, field_y, field_w, 1);
-
-    // Show the tail of input if it overflows
-    let max_visible = field_w.saturating_sub(1) as usize;
-    let display_input = if input.len() > max_visible {
-        &input[input.len() - max_visible..]
-    } else {
-        input
-    };
-
-    let cursor_char = if display_input.len() < max_visible {
-        "\u{2588}"
-    } else {
-        ""
-    };
-    let text_len = display_input.len() + cursor_char.len();
-    let pad = (field_w as usize).saturating_sub(text_len);
-    let field_line = Line::from(vec![
-        Span::styled(
-            display_input.to_string(),
-            Style::default().fg(Color::White).bg(Color::DarkGray),
-        ),
-        Span::styled(
-            cursor_char.to_string(),
-            Style::default().fg(Color::White).bg(Color::DarkGray),
-        ),
-        Span::styled(" ".repeat(pad), Style::default().bg(Color::DarkGray)),
-    ]);
-    frame.render_widget(Paragraph::new(field_line), field_area);
-
-    // Separator line
-    let sep_y = inner.y + 3;
-    let sep_line = "\u{2500}".repeat(inner.width as usize);
-    frame.render_widget(
-        Paragraph::new(sep_line).style(Style::default().fg(Color::Cyan)),
-        Rect::new(inner.x, sep_y, inner.width, 1),
-    );
-
-    // Centered button row
-    let btn_y = inner.y + 4;
-    render_button_row(&["Go", "Cancel"], popup_focus, inner, btn_y, frame);
 }
 
 fn hint_pair<'a>(key: &str, action: &str, theme: &ThemeColors) -> Vec<Span<'a>> {
@@ -5066,57 +5028,60 @@ fn draw_fkey_bar(frame: &mut Frame, area: Rect, state: &BrowserState) {
 
 /// Build the context-aware footer bar hints based on current browser state.
 fn build_fkey_bar_hints<'a>(state: &BrowserState, theme: &ThemeColors) -> Vec<Span<'a>> {
-    // Transfer in progress: show transfer-specific hints
-    if !state.background_transfers.is_empty()
-        && matches!(state.input_mode, InputMode::TransferPopup)
-    {
-        let mut spans = Vec::new();
-        spans.extend(hint_pair("s", "Skip", theme));
-        spans.extend(hint_pair("b", "Background", theme));
-        spans.extend(hint_pair("Tab", "Next xfer", theme));
-        spans.extend(hint_pair("Esc", "Cancel", theme));
-        return spans;
+    /// Flatten a list of (key, action) pairs into a flat `Vec<Span>`.
+    fn hints<'a>(pairs: &[(&str, &str)], theme: &ThemeColors) -> Vec<Span<'a>> {
+        pairs
+            .iter()
+            .flat_map(|(k, a)| hint_pair(k, a, theme))
+            .collect()
     }
 
-    // Help overlay
-    if matches!(state.input_mode, InputMode::HelpOverlay) {
-        let mut spans = Vec::new();
-        spans.extend(hint_pair("\u{2191}\u{2193}", "Scroll", theme));
-        spans.extend(hint_pair("Esc/?", "Close", theme));
-        return spans;
+    match &state.input_mode {
+        // Transfer popup: show transfer-specific controls
+        InputMode::TransferPopup if !state.background_transfers.is_empty() => hints(
+            &[
+                ("s", "Skip"),
+                ("b", "Background"),
+                ("Tab", "Next xfer"),
+                ("Esc", "Cancel"),
+            ],
+            theme,
+        ),
+        // Help overlay: show scroll/close hints
+        InputMode::HelpOverlay => {
+            hints(&[("\u{2191}\u{2193}", "Scroll"), ("Esc/?", "Close")], theme)
+        }
+        // Filter mode
+        InputMode::Filter(_) => hints(
+            &[
+                ("Type", "Filter pattern"),
+                ("Enter", "Apply"),
+                ("Esc", "Cancel"),
+            ],
+            theme,
+        ),
+        // Goto prompt
+        InputMode::GotoPrompt(_) => hints(
+            &[("Type", "Path"), ("Enter", "Go"), ("Esc", "Cancel")],
+            theme,
+        ),
+        // Default: normal mode
+        _ => hints(
+            &[
+                ("F1/?", "Help"),
+                ("F3", "View"),
+                ("F5", "Copy"),
+                ("F6", "Move"),
+                ("F7", "Mkdir"),
+                ("F8", "Del"),
+                ("v", "Mark"),
+                ("/", "Filter"),
+                ("Tab", "Switch"),
+                ("q", "Quit"),
+            ],
+            theme,
+        ),
     }
-
-    // Filter mode
-    if matches!(state.input_mode, InputMode::Filter(_)) {
-        let mut spans = Vec::new();
-        spans.extend(hint_pair("Type", "Filter pattern", theme));
-        spans.extend(hint_pair("Enter", "Apply", theme));
-        spans.extend(hint_pair("Esc", "Cancel", theme));
-        return spans;
-    }
-
-    // Goto prompt
-    if matches!(state.input_mode, InputMode::GotoPrompt(_)) {
-        let mut spans = Vec::new();
-        spans.extend(hint_pair("Type", "Path", theme));
-        spans.extend(hint_pair("Enter", "Go", theme));
-        spans.extend(hint_pair("Esc", "Cancel", theme));
-        return spans;
-    }
-
-    // Default: normal mode
-    let mut spans = Vec::new();
-    spans.extend(hint_pair("F1/?", "Help", theme));
-    spans.extend(hint_pair("F3", "View", theme));
-    spans.extend(hint_pair("F5", "Copy", theme));
-    spans.extend(hint_pair("F6", "Move", theme));
-    spans.extend(hint_pair("F7", "Mkdir", theme));
-    spans.extend(hint_pair("F8", "Del", theme));
-    spans.extend(hint_pair("v", "Mark", theme));
-    spans.extend(hint_pair("/", "Filter", theme));
-    spans.extend(hint_pair("Tab", "Switch", theme));
-    spans.extend(hint_pair("q", "Quit", theme));
-    spans
 }
 
 /// Open a new SFTP session from an SSH handle (standalone function for use in spawned tasks).
@@ -5205,6 +5170,18 @@ mod tests {
     use super::*;
     use crate::tui::theme::resolve_theme;
     use chrono::Utc;
+
+    /// Flatten all span text from a slice of `Line`s into a single string.
+    /// Used by help overlay tests to assert section/key presence.
+    fn flatten_lines(lines: &[ratatui::text::Line]) -> String {
+        lines
+            .iter()
+            .flat_map(|l| l.spans.iter())
+            .fold(String::new(), |mut acc, span| {
+                acc.push_str(&span.content);
+                acc
+            })
+    }
 
     fn file_entry(name: &str, is_dir: bool, size: u64) -> FileEntry {
         FileEntry {
@@ -5739,15 +5716,7 @@ mod tests {
     #[test]
     fn test_browser_help_sections_contain_navigation_keys() {
         let theme = resolve_theme("default");
-        let sections = build_browser_help_sections(&theme);
-        let text: String =
-            sections
-                .iter()
-                .flat_map(|l| l.spans.iter())
-                .fold(String::new(), |mut acc, span| {
-                    acc.push_str(&span.content);
-                    acc
-                });
+        let text = flatten_lines(&build_browser_help_sections(&theme));
         assert!(
             text.contains("Navigation"),
             "should have Navigation section"
@@ -5760,15 +5729,7 @@ mod tests {
     #[test]
     fn test_browser_help_sections_contain_file_operations() {
         let theme = resolve_theme("default");
-        let sections = build_browser_help_sections(&theme);
-        let text: String =
-            sections
-                .iter()
-                .flat_map(|l| l.spans.iter())
-                .fold(String::new(), |mut acc, span| {
-                    acc.push_str(&span.content);
-                    acc
-                });
+        let text = flatten_lines(&build_browser_help_sections(&theme));
         assert!(
             text.contains("File Operations"),
             "should have File Operations section"
@@ -5783,15 +5744,7 @@ mod tests {
     #[test]
     fn test_browser_help_sections_contain_selection() {
         let theme = resolve_theme("default");
-        let sections = build_browser_help_sections(&theme);
-        let text: String =
-            sections
-                .iter()
-                .flat_map(|l| l.spans.iter())
-                .fold(String::new(), |mut acc, span| {
-                    acc.push_str(&span.content);
-                    acc
-                });
+        let text = flatten_lines(&build_browser_help_sections(&theme));
         assert!(text.contains("Selection"), "should have Selection section");
         assert!(text.contains("Toggle mark"), "should list mark toggle");
         assert!(
@@ -5807,15 +5760,7 @@ mod tests {
     #[test]
     fn test_browser_help_sections_contain_display_and_general() {
         let theme = resolve_theme("default");
-        let sections = build_browser_help_sections(&theme);
-        let text: String =
-            sections
-                .iter()
-                .flat_map(|l| l.spans.iter())
-                .fold(String::new(), |mut acc, span| {
-                    acc.push_str(&span.content);
-                    acc
-                });
+        let text = flatten_lines(&build_browser_help_sections(&theme));
         assert!(text.contains("Display"), "should have Display section");
         assert!(
             text.contains("Toggle hidden files"),
@@ -5829,15 +5774,7 @@ mod tests {
     #[test]
     fn test_browser_help_sections_contain_transfers() {
         let theme = resolve_theme("default");
-        let sections = build_browser_help_sections(&theme);
-        let text: String =
-            sections
-                .iter()
-                .flat_map(|l| l.spans.iter())
-                .fold(String::new(), |mut acc, span| {
-                    acc.push_str(&span.content);
-                    acc
-                });
+        let text = flatten_lines(&build_browser_help_sections(&theme));
         assert!(text.contains("Transfers"), "should have Transfers section");
         assert!(
             text.contains("transfer progress"),

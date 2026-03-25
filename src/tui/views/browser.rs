@@ -256,6 +256,9 @@ struct ActiveFile {
 /// Number of speed samples kept for the rolling window average.
 const SPEED_WINDOW_SAMPLES: usize = 100;
 
+/// Minimum number of speed samples before showing ETA (avoids wild estimates).
+const MIN_ETA_SPEED_SAMPLES: usize = 3;
+
 /// Rolling speed sample: (instant_nanos, cumulative_bytes).
 struct SpeedSample {
     nanos: u64,
@@ -395,6 +398,85 @@ impl TransferProgress {
             );
         }
         Some(speed)
+    }
+
+    /// Number of speed samples collected so far.
+    fn speed_sample_count(&self) -> usize {
+        let samples = self.speed_samples.lock().unwrap();
+        samples.len()
+    }
+}
+
+/// Calculate ETA in seconds from remaining bytes and current speed.
+///
+/// Returns `None` when ETA cannot be reliably estimated:
+/// - speed is zero or negative
+/// - total bytes is unknown (0)
+/// - all bytes already transferred
+/// - fewer than `MIN_ETA_SPEED_SAMPLES` have been collected
+fn calculate_eta(
+    bytes_done: u64,
+    total_bytes: u64,
+    speed_bytes_per_sec: f64,
+    sample_count: usize,
+) -> Option<u64> {
+    if total_bytes == 0 || bytes_done >= total_bytes {
+        return None;
+    }
+    if speed_bytes_per_sec <= 0.0 || sample_count < MIN_ETA_SPEED_SAMPLES {
+        return None;
+    }
+    let remaining = (total_bytes - bytes_done) as f64;
+    // Guard: avoid producing absurdly large ETAs from near-zero speed.
+    let eta = remaining / speed_bytes_per_sec;
+    Some(eta as u64)
+}
+
+/// Format a transfer summary message for the completion popup.
+///
+/// Includes file count, total bytes, elapsed time, and average speed.
+/// For partial failures, includes the error and how many files completed.
+fn format_transfer_summary(
+    result: &TransferResult,
+    total_bytes: u64,
+    elapsed: Duration,
+    is_move: bool,
+) -> String {
+    let verb_past = if is_move { "Moved" } else { "Copied" };
+    let verb_noun = if is_move { "Move" } else { "Copy" };
+    let elapsed_secs = elapsed.as_secs();
+    let elapsed_f64 = elapsed.as_secs_f64();
+
+    if result.copied == 0 && result.last_error.is_none() {
+        return format!("{verb_noun} cancelled");
+    }
+
+    let size_str = format_bytes(total_bytes);
+    let time_str = format_duration(elapsed_secs);
+    let avg_speed = if elapsed_f64 > 0.1 {
+        format!(
+            ", avg {}",
+            format_bytes_per_sec(total_bytes as f64 / elapsed_f64)
+        )
+    } else {
+        String::new()
+    };
+
+    if let Some(ref err) = result.last_error {
+        format!(
+            "Failed: {err} after {} of {} files ({}{} in {})",
+            result.copied, result.total, size_str, avg_speed, time_str,
+        )
+    } else if result.total == 1 {
+        format!(
+            "\u{2713} {verb_past} 1 file ({} in {}{})",
+            size_str, time_str, avg_speed,
+        )
+    } else {
+        format!(
+            "\u{2713} {verb_past} {} files ({} in {}{})",
+            result.total, size_str, time_str, avg_speed,
+        )
     }
 }
 
@@ -568,7 +650,7 @@ pub async fn run(
                     {
                         let total_bytes = transfer.progress.bytes_done_all.load(Ordering::Relaxed);
                         let completion_msg =
-                            format_transfer_complete(&result, total_bytes, elapsed, is_move);
+                            format_transfer_summary(&result, total_bytes, elapsed, is_move);
                         let retry = if result.last_error.is_some() {
                             Some(RetryInfo {
                                 targets: transfer.retry_targets,
@@ -2130,11 +2212,8 @@ fn draw_transfer_popup(frame: &mut Frame, area: Rect, state: &BrowserState) {
             }
         }
     };
-    let eta_secs = if speed > 0.0 && total_bytes_all > bytes_done_all {
-        ((total_bytes_all - bytes_done_all) as f64 / speed) as u64
-    } else {
-        0
-    };
+    let sample_count = p.speed_sample_count();
+    let eta_secs = calculate_eta(bytes_done_all, total_bytes_all, speed, sample_count);
 
     // Log display speed periodically (~every 5s at 100ms poll).
     {
@@ -2142,13 +2221,13 @@ fn draw_transfer_popup(frame: &mut Frame, area: Rect, state: &BrowserState) {
         if sample_idx.is_multiple_of(50) && sample_idx > 0 {
             tracing::debug!(
                 "speed display: source={speed_source} {:.2} MB/s, \
-                 done={:.1}/{:.1} MB, files={}/{}, eta={}s",
+                 done={:.1}/{:.1} MB, files={}/{}, eta={:?}s",
                 speed / 1_048_576.0,
                 bytes_done_all as f64 / 1_048_576.0,
                 total_bytes_all as f64 / 1_048_576.0,
                 p.files_done.load(Ordering::Relaxed),
                 total_files,
-                eta_secs,
+                eta_secs.unwrap_or(0),
             );
         }
     }
@@ -2283,17 +2362,38 @@ fn draw_transfer_popup(frame: &mut Frame, area: Rect, state: &BrowserState) {
 
     // Files done/total + size + speed + ETA
     let files_done = p.files_done.load(Ordering::Relaxed);
+    let eta_display = match eta_secs {
+        Some(secs) => format!("~{} remaining", format_duration(secs)),
+        None if bytes_done_all > 0 && bytes_done_all < total_bytes_all => {
+            "calculating...".to_string()
+        }
+        _ => String::new(),
+    };
     let stats_line = if speed > 0.0 {
+        if eta_display.is_empty() {
+            format!(
+                " Files: {files_done}/{total_files}  {} / {}  {}",
+                format_bytes(bytes_done_all),
+                format_bytes(total_bytes_all),
+                format_bytes_per_sec(speed),
+            )
+        } else {
+            format!(
+                " Files: {files_done}/{total_files}  {} / {}  {}  {eta_display}",
+                format_bytes(bytes_done_all),
+                format_bytes(total_bytes_all),
+                format_bytes_per_sec(speed),
+            )
+        }
+    } else if eta_display.is_empty() {
         format!(
-            " Files: {files_done}/{total_files}  {} / {}  {}  ETA {}",
+            " Files: {files_done}/{total_files}  {} / {}",
             format_bytes(bytes_done_all),
             format_bytes(total_bytes_all),
-            format_bytes_per_sec(speed),
-            format_duration(eta_secs),
         )
     } else {
         format!(
-            " Files: {files_done}/{total_files}  {} / {}",
+            " Files: {files_done}/{total_files}  {} / {}  {eta_display}",
             format_bytes(bytes_done_all),
             format_bytes(total_bytes_all),
         )
@@ -2489,39 +2589,6 @@ fn draw_transfer_complete_popup(
             Paragraph::new(Line::from(" Press any key to close")),
             Rect::new(inner.x, inner.y + 2, inner.width, 1),
         );
-    }
-}
-
-/// Format a completion message for the transfer complete popup.
-fn format_transfer_complete(
-    result: &TransferResult,
-    total_bytes: u64,
-    elapsed: Duration,
-    is_move: bool,
-) -> String {
-    let verb_past = if is_move { "Moved" } else { "Copied" };
-    let verb_noun = if is_move { "Move" } else { "Copy" };
-    let elapsed_secs = elapsed.as_secs();
-    if result.copied == 0 && result.last_error.is_none() {
-        format!("{verb_noun} cancelled")
-    } else if let Some(ref err) = result.last_error {
-        format!(
-            "{verb_past} {}/{} files, error: {err}",
-            result.copied, result.total
-        )
-    } else if result.total == 1 {
-        format!(
-            "\u{2713} {verb_past} 1 file ({}) in {}",
-            format_bytes(total_bytes),
-            format_duration(elapsed_secs),
-        )
-    } else {
-        format!(
-            "\u{2713} {verb_past} {} files ({}) in {}",
-            result.total,
-            format_bytes(total_bytes),
-            format_duration(elapsed_secs),
-        )
     }
 }
 
@@ -5078,5 +5145,157 @@ mod tests {
             None
         };
         assert!(retry.is_none());
+    }
+
+    // --- ETA calculation ---
+
+    #[test]
+    fn test_eta_calculation_normal() {
+        // 50% done at 1 MB/s with enough samples => ~5s remaining
+        let eta = calculate_eta(5_000_000, 10_000_000, 1_000_000.0, 5);
+        assert_eq!(eta, Some(5));
+    }
+
+    #[test]
+    fn test_eta_calculation_insufficient_samples() {
+        // Only 2 samples (below MIN_ETA_SPEED_SAMPLES=3) => None
+        let eta = calculate_eta(5_000_000, 10_000_000, 1_000_000.0, 2);
+        assert!(eta.is_none());
+    }
+
+    #[test]
+    fn test_eta_calculation_zero_speed() {
+        let eta = calculate_eta(5_000_000, 10_000_000, 0.0, 10);
+        assert!(eta.is_none());
+    }
+
+    #[test]
+    fn test_eta_calculation_negative_speed() {
+        let eta = calculate_eta(5_000_000, 10_000_000, -100.0, 10);
+        assert!(eta.is_none());
+    }
+
+    #[test]
+    fn test_eta_calculation_zero_total_bytes() {
+        // Unknown total size => None
+        let eta = calculate_eta(5_000, 0, 1_000.0, 10);
+        assert!(eta.is_none());
+    }
+
+    #[test]
+    fn test_eta_calculation_transfer_complete() {
+        // All bytes done => None (no remaining time)
+        let eta = calculate_eta(10_000, 10_000, 1_000.0, 10);
+        assert!(eta.is_none());
+    }
+
+    #[test]
+    fn test_eta_calculation_nearly_done() {
+        // 1 byte remaining at 1 byte/s => 1 second
+        let eta = calculate_eta(9_999, 10_000, 1.0, 5);
+        assert_eq!(eta, Some(1));
+    }
+
+    #[test]
+    fn test_eta_calculation_large_transfer() {
+        // 1 GB remaining at 10 MB/s => 100 seconds
+        let gb = 1_073_741_824u64;
+        let done = gb;
+        let total = 2 * gb;
+        let speed = 10.0 * 1_048_576.0; // 10 MB/s
+        let eta = calculate_eta(done, total, speed, 50);
+        // 1 GB / 10 MB/s = 102.4 seconds
+        assert_eq!(eta, Some(102));
+    }
+
+    // --- Transfer summary format ---
+
+    #[test]
+    fn test_transfer_summary_format_success_single_file() {
+        let result = TransferResult {
+            copied: 1,
+            total: 1,
+            last_error: None,
+        };
+        let msg = format_transfer_summary(&result, 14_900_000, Duration::from_secs(12), false);
+        assert!(msg.starts_with('\u{2713}'));
+        assert!(msg.contains("1 file"));
+        assert!(msg.contains("14.2MB"));
+        assert!(msg.contains("12s"));
+        assert!(msg.contains("avg"));
+    }
+
+    #[test]
+    fn test_transfer_summary_format_success_multiple_files() {
+        let result = TransferResult {
+            copied: 3,
+            total: 3,
+            last_error: None,
+        };
+        let msg = format_transfer_summary(&result, 14_900_000, Duration::from_secs(12), false);
+        assert!(msg.contains("3 files"));
+        assert!(msg.contains("14.2MB"));
+        assert!(msg.contains("12s"));
+        assert!(msg.contains("avg"));
+    }
+
+    #[test]
+    fn test_transfer_summary_format_partial_failure() {
+        let result = TransferResult {
+            copied: 2,
+            total: 5,
+            last_error: Some("connection lost".into()),
+        };
+        let msg = format_transfer_summary(&result, 5_000_000, Duration::from_secs(8), false);
+        assert!(msg.starts_with("Failed:"));
+        assert!(msg.contains("connection lost"));
+        assert!(msg.contains("2 of 5"));
+    }
+
+    #[test]
+    fn test_transfer_summary_format_cancelled() {
+        let result = TransferResult {
+            copied: 0,
+            total: 5,
+            last_error: None,
+        };
+        let msg = format_transfer_summary(&result, 0, Duration::from_secs(1), false);
+        assert_eq!(msg, "Copy cancelled");
+    }
+
+    #[test]
+    fn test_transfer_summary_format_move() {
+        let result = TransferResult {
+            copied: 2,
+            total: 2,
+            last_error: None,
+        };
+        let msg = format_transfer_summary(&result, 1_000_000, Duration::from_secs(5), true);
+        assert!(msg.contains("Moved"));
+        assert!(!msg.contains("Copied"));
+    }
+
+    #[test]
+    fn test_transfer_summary_format_move_cancelled() {
+        let result = TransferResult {
+            copied: 0,
+            total: 3,
+            last_error: None,
+        };
+        let msg = format_transfer_summary(&result, 0, Duration::from_secs(0), true);
+        assert_eq!(msg, "Move cancelled");
+    }
+
+    #[test]
+    fn test_transfer_summary_format_very_fast_transfer() {
+        // Transfer completes in < 0.1s — avg speed omitted (avoid divide-by-near-zero)
+        let result = TransferResult {
+            copied: 1,
+            total: 1,
+            last_error: None,
+        };
+        let msg = format_transfer_summary(&result, 500, Duration::from_millis(50), false);
+        assert!(msg.contains("1 file"));
+        assert!(!msg.contains("avg"));
     }
 }

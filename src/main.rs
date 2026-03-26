@@ -6,18 +6,18 @@
 #[global_allocator]
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
-/// Jemalloc tuning:
-/// - `dirty_decay_ms:0,muzzy_decay_ms:0` — purge freed pages immediately.
-/// - `retain:false` — use `munmap()` instead of `madvise()` to return pages.
-///   On macOS, `madvise(MADV_FREE)` only marks pages as reusable without
-///   reducing RSS. `munmap()` forces the kernel to reclaim them immediately,
-///   preventing phantom RSS inflation from short-lived CryptoVec allocations.
-/// - `background_thread:true` — enables async purging for any residual pages.
+/// Jemalloc tuning: `dirty_decay_ms:0,muzzy_decay_ms:0` purges freed pages
+/// immediately. `retain:false` uses `munmap()` instead of `madvise()` to return
+/// pages — on macOS, `madvise(MADV_FREE)` only marks pages as reusable without
+/// reducing RSS, while `munmap()` forces the kernel to reclaim them immediately.
+///
+/// `background_thread` is omitted: with zero decay times, purging is synchronous
+/// and the background thread has nothing to do. It also prints a noisy warning
+/// on macOS ("option background_thread currently supports pthread only").
 #[cfg(unix)]
 #[allow(non_upper_case_globals)]
 #[unsafe(export_name = "malloc_conf")]
-pub static malloc_conf: &[u8] =
-    b"background_thread:true,dirty_decay_ms:0,muzzy_decay_ms:0,retain:false\0";
+pub static malloc_conf: &[u8] = b"dirty_decay_ms:0,muzzy_decay_ms:0,retain:false\0";
 
 mod cli;
 mod config;

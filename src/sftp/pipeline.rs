@@ -5,12 +5,14 @@
 /// requests without spawning a Tokio task per chunk.
 ///
 /// **Architecture**: Fire N concurrent `SSH_FXP_READ` requests via a bounded
-/// future queue, write each response directly at its file offset (via seek)
-/// as it arrives — no reorder buffer needed. This matches OpenSSH's approach
-/// of lseek + write per response, keeping peak memory proportional to the
-/// pipeline depth rather than total file size.
+/// future queue. Responses may arrive out of order, so a reorder buffer
+/// (`BTreeMap<offset, data>`) ensures chunks are written sequentially from
+/// `start_offset`. This guarantees the local file always contains contiguous
+/// data from byte 0, making `.part` file size a safe resume point on cancel.
+/// Peak memory is bounded by pipeline depth × chunk_size (~2 MB).
+use std::collections::BTreeMap;
 use std::future::Future;
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::{Read, Seek, Write};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -35,10 +37,9 @@ const MAX_PIPELINE_DEPTH: usize = 64;
 
 /// Target upper bound on in-flight bytes across all concurrent requests.
 /// Matches SSH_WINDOW_SIZE (2 MB) — the SSH channel backpressure limit.
-/// With no reorder buffer (direct offset writes like OpenSSH), each chunk
-/// exists only briefly between SFTP response and disk write. 2 MB in-flight
-/// saturates most links (at 100 ms RTT, covers ~160 Mbps — typical SSH
-/// single-connection throughput).
+/// The reorder buffer holds at most this many bytes before they are written
+/// sequentially. 2 MB in-flight saturates most links (at 100 ms RTT,
+/// covers ~160 Mbps — typical SSH single-connection throughput).
 const MAX_INFLIGHT_BYTES: u64 = 2 * 1024 * 1024;
 
 /// Result of creating a raw SFTP session, including negotiated limits.
@@ -98,16 +99,17 @@ pub async fn create_raw_session(
 
 /// Pipelined SFTP download.
 ///
-/// Fires up to `MAX_PIPELINE_DEPTH` concurrent `SSH_FXP_READ` requests and
-/// writes each response directly at its file offset as it arrives (like
-/// OpenSSH's lseek + write). No reorder buffer — peak memory is bounded
-/// by pipeline depth × chunk_size.
+/// Fires up to `MAX_PIPELINE_DEPTH` concurrent `SSH_FXP_READ` requests.
+/// Responses may arrive out of order; a reorder buffer ensures chunks are
+/// written to the local file sequentially from `start_offset`. This makes
+/// the file always contain contiguous data, so its size is a safe resume
+/// point on cancel.
 ///
 /// `chunk_size` should come from `PipelinedSession::read_chunk_size` to
 /// match the server's negotiated limits and avoid short reads.
 ///
-/// `on_bytes_written` is called after each chunk is written to disk,
-/// with the number of bytes just written. This enables progress reporting.
+/// `on_bytes_written` is called as soon as each chunk arrives (for progress
+/// display), regardless of whether it's written immediately or buffered.
 #[allow(clippy::too_many_arguments)]
 pub async fn download<F: FnMut(u64)>(
     raw: &Arc<RawSftpSession>,
@@ -173,9 +175,15 @@ pub async fn download<F: FnMut(u64)>(
 
 /// Inner download loop. Separated so the handle is always closed in `download()`.
 ///
-/// Like OpenSSH's sftp client, writes each response directly at its file
-/// offset as it arrives. No reorder buffer — out-of-order responses are
-/// handled via seek. Peak memory is bounded by pipeline depth × chunk_size.
+/// Uses a reorder buffer (`BTreeMap<offset, data>`) to ensure chunks are
+/// written sequentially. When a response arrives:
+/// - If offset == write_cursor: write directly and drain any contiguous
+///   buffered chunks.
+/// - If offset > write_cursor: buffer for later.
+///
+/// This guarantees the file always contains contiguous data from byte 0,
+/// making file size a safe resume point. Peak memory is bounded by
+/// pipeline depth × chunk_size (~2 MB with 8 × 256 KB).
 #[allow(clippy::too_many_arguments)]
 async fn download_inner<F: FnMut(u64)>(
     raw: &Arc<RawSftpSession>,
@@ -197,6 +205,12 @@ async fn download_inner<F: FnMut(u64)>(
     let by_bytes = (MAX_INFLIGHT_BYTES / chunk_size).max(8) as usize;
     let depth = total_chunks.min(MAX_PIPELINE_DEPTH).min(by_bytes);
 
+    // Reorder buffer: holds out-of-order chunks until they can be written
+    // sequentially. Keyed by absolute file offset.
+    let mut reorder_buf: BTreeMap<u64, Vec<u8>> = BTreeMap::new();
+    // Next sequential offset to write. All bytes before this are on disk.
+    let mut write_cursor = start_offset;
+
     // Seed the pipeline with concurrent read requests.
     while inflight.len() < depth && next_request_offset < total_size {
         let len = std::cmp::min(chunk_size, total_size - next_request_offset);
@@ -211,9 +225,48 @@ async fn download_inner<F: FnMut(u64)>(
     }
 
     // Process responses and refill pipeline.
-    // Like OpenSSH: seek to offset, write, free. No reorder buffer.
     while let Some((offset, expected_len, sftp_result)) = inflight.next().await {
         if cancel.is_some_and(|c| c.load(Ordering::Relaxed)) {
+            // Drain this chunk + all already-resolved futures so the .part
+            // file preserves as much contiguous data as possible.
+            // Helper: buffer or write a chunk, drain contiguous.
+            let mut flush_chunk = |off: u64, bytes: &[u8]| {
+                if off == write_cursor {
+                    let _ = local_file.write_all(bytes);
+                    write_cursor += bytes.len() as u64;
+                    while let Some(entry) = reorder_buf.first_entry() {
+                        if *entry.key() != write_cursor {
+                            break;
+                        }
+                        let buf = entry.remove();
+                        let _ = local_file.write_all(&buf);
+                        write_cursor += buf.len() as u64;
+                    }
+                } else if off > write_cursor {
+                    reorder_buf.insert(off, bytes.to_vec());
+                }
+            };
+            // Process the current chunk.
+            if let Ok(data) = sftp_result {
+                flush_chunk(offset, &data.data);
+            }
+            // Drain all remaining already-resolved futures (no await).
+            use futures::FutureExt;
+            while let Some(Some((off, _expected, result))) = inflight.next().now_or_never() {
+                if let Ok(data) = result {
+                    flush_chunk(off, &data.data);
+                }
+            }
+            // Final drain of contiguous reorder buffer.
+            while let Some(entry) = reorder_buf.first_entry() {
+                if *entry.key() != write_cursor {
+                    break;
+                }
+                let buf = entry.remove();
+                let _ = local_file.write_all(&buf);
+                write_cursor += buf.len() as u64;
+            }
+            let _ = local_file.flush();
             anyhow::bail!("Transfer cancelled");
         }
 
@@ -226,7 +279,8 @@ async fn download_inner<F: FnMut(u64)>(
 
         // If the server returned less data than requested (short read),
         // re-request the remaining range to fill the gap.
-        if received_len < expected_len && offset + received_len < total_size {
+        let is_gap_fill = received_len < expected_len && offset + received_len < total_size;
+        if is_gap_fill {
             let gap_offset = offset + received_len;
             let gap_len = expected_len - received_len;
             queue_read(
@@ -238,20 +292,36 @@ async fn download_inner<F: FnMut(u64)>(
             );
         }
 
-        // Write directly at the correct file offset (like OpenSSH's lseek + write).
-        // No reorder buffer needed — out-of-order responses just seek to their
-        // position. The chunk data is freed immediately after write.
-        let local_offset = offset - start_offset;
-        local_file
-            .seek(SeekFrom::Start(local_offset))
-            .context("Failed to seek in local file")?;
-        local_file
-            .write_all(&data.data)
-            .context("Failed to write to local file")?;
-        // `data` (mmap-backed Bytes) is dropped here → munmap → RSS freed.
+        // Buffer or write the chunk depending on whether it's the next sequential one.
+        if offset == write_cursor {
+            // This chunk is next in sequence — write directly.
+            local_file
+                .write_all(&data.data)
+                .context("Failed to write to local file")?;
+            write_cursor += received_len;
 
+            // Drain any buffered chunks that are now contiguous.
+            while let Some(entry) = reorder_buf.first_entry() {
+                if *entry.key() != write_cursor {
+                    break;
+                }
+                let buffered = entry.remove();
+                local_file
+                    .write_all(&buffered)
+                    .context("Failed to write to local file")?;
+                write_cursor += buffered.len() as u64;
+            }
+        } else {
+            // Out of order — buffer for later.
+            reorder_buf.insert(offset, data.data.to_vec());
+        }
+
+        // Periodic debug: track write_cursor vs reorder buffer divergence.
         // Refill pipeline with new chunks beyond what's already requested.
-        if next_request_offset < total_size {
+        // Skip refill for gap-fill responses — they're re-requests for ranges
+        // already counted in next_request_offset. Without this guard, each short
+        // read produces 2 requests (gap + new), causing inflight to grow unbounded.
+        if !is_gap_fill && next_request_offset < total_size {
             let len = std::cmp::min(chunk_size, total_size - next_request_offset);
             queue_read(
                 &mut inflight,
@@ -637,5 +707,113 @@ mod tests {
         let n = read_chunk_into(&mut reader, &mut buf, 6).unwrap();
         assert_eq!(n, 6);
         assert_eq!(&buf[..6], b"abcdef");
+    }
+
+    // --- Reorder buffer logic tests ---
+    //
+    // These test the reorder buffer pattern used in download_inner by
+    // simulating it directly (since download_inner requires a real SFTP
+    // session). The logic is: maintain a BTreeMap of out-of-order chunks
+    // and a write_cursor, writing sequentially.
+
+    /// Simulate the reorder buffer logic from download_inner.
+    /// Takes (offset, data) pairs in arrival order and returns the
+    /// final file contents.
+    fn simulate_reorder_download(chunks: Vec<(u64, Vec<u8>)>, start_offset: u64) -> Vec<u8> {
+        let mut output = Vec::new();
+        let mut reorder_buf: BTreeMap<u64, Vec<u8>> = BTreeMap::new();
+        let mut write_cursor = start_offset;
+
+        for (offset, data) in chunks {
+            if offset == write_cursor {
+                output.extend_from_slice(&data);
+                write_cursor += data.len() as u64;
+
+                while let Some(entry) = reorder_buf.first_entry() {
+                    if *entry.key() != write_cursor {
+                        break;
+                    }
+                    let buffered = entry.remove();
+                    output.extend_from_slice(&buffered);
+                    write_cursor += buffered.len() as u64;
+                }
+            } else {
+                reorder_buf.insert(offset, data);
+            }
+        }
+
+        output
+    }
+
+    #[test]
+    fn test_reorder_buffer_in_order() {
+        // Chunks arrive in order — should be written directly with no buffering.
+        let chunks = vec![
+            (0, b"AAAA".to_vec()),
+            (4, b"BBBB".to_vec()),
+            (8, b"CCCC".to_vec()),
+        ];
+        let result = simulate_reorder_download(chunks, 0);
+        assert_eq!(result, b"AAAABBBBCCCC");
+    }
+
+    #[test]
+    fn test_reorder_buffer_reversed() {
+        // Chunks arrive in reverse order — all buffered until the first one arrives.
+        let chunks = vec![
+            (8, b"CCCC".to_vec()),
+            (4, b"BBBB".to_vec()),
+            (0, b"AAAA".to_vec()),
+        ];
+        let result = simulate_reorder_download(chunks, 0);
+        assert_eq!(result, b"AAAABBBBCCCC");
+    }
+
+    #[test]
+    fn test_reorder_buffer_interleaved() {
+        // Middle chunk arrives first, then first, then last.
+        let chunks = vec![
+            (10, b"BB".to_vec()),
+            (0, b"AAAAAAAAAA".to_vec()), // 10 bytes — triggers drain of offset 10
+            (12, b"CC".to_vec()),
+        ];
+        let result = simulate_reorder_download(chunks, 0);
+        assert_eq!(result, b"AAAAAAAAAABBCC");
+    }
+
+    #[test]
+    fn test_reorder_buffer_with_start_offset() {
+        // Resume scenario: start_offset = 100. Chunks keyed by absolute offset.
+        let chunks = vec![
+            (110, b"BB".to_vec()),         // out of order
+            (100, b"AAAAAAAAAA".to_vec()), // triggers write + drain
+            (112, b"CC".to_vec()),
+        ];
+        let result = simulate_reorder_download(chunks, 100);
+        assert_eq!(result, b"AAAAAAAAAABBCC");
+    }
+
+    #[test]
+    fn test_reorder_buffer_single_chunk() {
+        let chunks = vec![(0, b"ONLY".to_vec())];
+        let result = simulate_reorder_download(chunks, 0);
+        assert_eq!(result, b"ONLY");
+    }
+
+    #[test]
+    fn test_reorder_buffer_many_out_of_order() {
+        // 8 chunks of 4 bytes each, arriving in a scrambled order.
+        let chunks = vec![
+            (16, b"EEEE".to_vec()),
+            (28, b"HHHH".to_vec()),
+            (4, b"BBBB".to_vec()),
+            (20, b"FFFF".to_vec()),
+            (0, b"AAAA".to_vec()), // triggers drain of 4
+            (12, b"DDDD".to_vec()),
+            (8, b"CCCC".to_vec()),  // triggers drain of 8, 12, 16, 20
+            (24, b"GGGG".to_vec()), // triggers drain of 24, 28
+        ];
+        let result = simulate_reorder_download(chunks, 0);
+        assert_eq!(result, b"AAAABBBBCCCCDDDDEEEEFFFFGGGGHHHH");
     }
 }

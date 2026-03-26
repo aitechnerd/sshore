@@ -76,7 +76,7 @@ fs2 = "0.4"
 # preventing RSS bloat from russh's mlocked CryptoVec allocations.
 # Not supported on Windows (jemalloc requires a C compiler configure step).
 [target.'cfg(unix)'.dependencies]
-tikv-jemallocator = { version = "0.6", features = ["background_threads"] }
+tikv-jemallocator = "0.6"
 
 # Unix stdin poll
 libc = "0.2"

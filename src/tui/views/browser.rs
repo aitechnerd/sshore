@@ -1,5 +1,5 @@
 use std::collections::HashSet;
-use std::io::{Seek, SeekFrom, Write};
+use std::io::Write;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
@@ -624,8 +624,30 @@ pub async fn run(
     refresh_pane(&mut right_pane, right, &state).await?;
 
     let mut needs_redraw = true;
+    // How often to auto-refresh the local pane during active transfers.
+    const LOCAL_REFRESH_INTERVAL: Duration = Duration::from_secs(2);
+    let mut last_local_refresh = std::time::Instant::now();
 
     loop {
+        // Auto-refresh local pane during transfers so .part files appear/update.
+        if !state.background_transfers.is_empty()
+            && last_local_refresh.elapsed() >= LOCAL_REFRESH_INTERVAL
+        {
+            let local_pane = if state.left_label == PaneLabel::Local {
+                &mut left_pane
+            } else {
+                &mut right_pane
+            };
+            let local_backend = if state.left_label == PaneLabel::Local {
+                &mut *left
+            } else {
+                &mut *right
+            };
+            refresh_pane(local_pane, local_backend, &state).await?;
+            last_local_refresh = std::time::Instant::now();
+            needs_redraw = true;
+        }
+
         // === Poll background transfers for completion ===
         {
             let mut i = 0;
@@ -992,7 +1014,11 @@ async fn handle_key(
             pane.page_down();
         }
 
-        KeyCode::Home | KeyCode::Char('g') if !key.modifiers.contains(KeyModifiers::SHIFT) => {
+        KeyCode::Home | KeyCode::Char('g')
+            if !key
+                .modifiers
+                .intersects(KeyModifiers::SHIFT | KeyModifiers::CONTROL) =>
+        {
             let pane = active_pane_mut(left_pane, right_pane, state);
             if !pane.entries.is_empty() {
                 pane.selected = 0;
@@ -3595,35 +3621,6 @@ async fn run_background_transfer(
 /// an existing file at the target path.
 const PART_FILE_SUFFIX: &str = ".part";
 
-/// Wrapper that shifts all `SeekFrom::Start` positions by a fixed offset.
-/// Used for download resume: the pipeline writes at `offset - start_offset` (local
-/// position 0 for the first new chunk), but the `.part` file already has
-/// `start_offset` bytes. This wrapper transparently adds `start_offset` to all
-/// absolute seeks so the pipeline writes after the existing content.
-struct ResumeOffsetWriter<W> {
-    inner: W,
-    offset_shift: u64,
-}
-
-impl<W: Write> Write for ResumeOffsetWriter<W> {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        self.inner.write(buf)
-    }
-    fn flush(&mut self) -> std::io::Result<()> {
-        self.inner.flush()
-    }
-}
-
-impl<W: Seek> Seek for ResumeOffsetWriter<W> {
-    fn seek(&mut self, pos: SeekFrom) -> std::io::Result<u64> {
-        let shifted = match pos {
-            SeekFrom::Start(p) => SeekFrom::Start(p + self.offset_shift),
-            other => other,
-        };
-        self.inner.seek(shifted)
-    }
-}
-
 /// Run a pipelined transfer for a single file using a pre-opened SFTP handle.
 /// Handles both upload and download directions. Does NOT open or close the handle.
 ///
@@ -3721,22 +3718,19 @@ async fn run_file_transfer(
                     .bytes_done_all
                     .fetch_add(start_offset, Ordering::Relaxed);
                 std::fs::OpenOptions::new()
-                    .write(true)
+                    .append(true)
                     .open(&part_path)
                     .with_context(|| format!("Failed to open {part_path} for resume"))?
             } else {
                 std::fs::File::create(&part_path)
                     .with_context(|| format!("Failed to create: {part_path}"))?
             };
-            // Wrap with ResumeOffsetWriter so the pipeline's seek(Start(0))
-            // maps to seek(Start(start_offset)) on the actual file, preserving
-            // already-downloaded bytes in the .part file.
-            let buf =
+            // The pipeline writes sequentially from start_offset via its
+            // reorder buffer, so no offset shifting is needed. The file
+            // is appended to from start_offset and its size always equals
+            // the contiguous watermark — safe for resume on cancel.
+            let mut local_file =
                 std::io::BufWriter::with_capacity((pipeline::CHUNK_SIZE * 2) as usize, local_file);
-            let mut local_file = ResumeOffsetWriter {
-                inner: buf,
-                offset_shift: start_offset,
-            };
 
             let mut on_bytes = |bytes: u64| {
                 progress.mark_transfer_start();
@@ -3746,38 +3740,45 @@ async fn run_file_transfer(
                     af.bytes_done += bytes;
                 }
             };
-            let transfer = pipeline::download_from_handle(
-                raw,
-                handle_str,
-                &mut local_file,
-                target.size,
-                start_offset,
-                read_chunk_size,
-                &mut on_bytes,
-                Some(combined_cancel.as_ref()),
-            );
-            tokio::pin!(transfer);
-            let result: Result<()> = loop {
-                tokio::select! {
-                    result = &mut transfer => { break result; }
-                    _ = tokio::time::sleep(Duration::from_millis(50)) => {
-                        if cancel.load(Ordering::Relaxed) || skip.load(Ordering::Relaxed) {
-                            combined_cancel.store(true, Ordering::Relaxed);
+            let result: Result<()> = {
+                let transfer = pipeline::download_from_handle(
+                    raw,
+                    handle_str,
+                    &mut local_file,
+                    target.size,
+                    start_offset,
+                    read_chunk_size,
+                    &mut on_bytes,
+                    Some(combined_cancel.as_ref()),
+                );
+                tokio::pin!(transfer);
+                loop {
+                    tokio::select! {
+                        result = &mut transfer => { break result; }
+                        _ = tokio::time::sleep(Duration::from_millis(50)) => {
+                            if cancel.load(Ordering::Relaxed) || skip.load(Ordering::Relaxed) {
+                                combined_cancel.store(true, Ordering::Relaxed);
+                            }
                         }
                     }
                 }
             };
 
-            // On success: rename .part to final path. On failure: leave .part for resume.
+            // On success: rename .part to final path. On failure: flush and
+            // leave .part in place. Since the pipeline writes sequentially,
+            // the file size IS the contiguous watermark — no truncation needed.
             match result {
                 Ok(()) => {
+                    let _ = local_file.flush();
                     std::fs::rename(&part_path, &target.dst_path).with_context(|| {
                         format!("Failed to rename {} to {}", part_path, target.dst_path)
                     })?;
                 }
                 Err(e) => {
+                    let _ = local_file.flush();
                     tracing::debug!(
-                        "worker[{worker_id}] download failed, .part file preserved: {part_path}"
+                        "worker[{worker_id}] download failed, .part left for resume \
+                         (start={start_offset}): {part_path}"
                     );
                     return Err(e);
                 }
@@ -4292,8 +4293,10 @@ async fn handle_input_mode(
     // Transfer complete popup
     if let InputMode::TransferComplete { retry, .. } = &state.input_mode {
         if retry.is_none() {
-            // Success: any key dismisses
+            // Success: any key dismisses — refresh both panes to show new files
             state.input_mode = InputMode::Normal;
+            refresh_pane(left_pane, left, state).await?;
+            refresh_pane(right_pane, right, state).await?;
             return Ok(());
         }
         // Error with retry: Tab/arrows switch focus, Enter acts, Esc dismisses
@@ -4303,6 +4306,9 @@ async fn handle_input_mode(
             }
             KeyCode::Esc => {
                 state.input_mode = InputMode::Normal;
+                // Refresh to show .part files from interrupted transfer
+                refresh_pane(left_pane, left, state).await?;
+                refresh_pane(right_pane, right, state).await?;
             }
             KeyCode::Enter => {
                 if state.popup_focus == 0 {
@@ -4330,8 +4336,10 @@ async fn handle_input_mode(
                     )
                     .await?;
                 } else {
-                    // OK: dismiss
+                    // OK: dismiss — refresh to show transferred/partial files
                     state.input_mode = InputMode::Normal;
+                    refresh_pane(left_pane, left, state).await?;
+                    refresh_pane(right_pane, right, state).await?;
                 }
             }
             _ => {}
@@ -4356,16 +4364,23 @@ async fn handle_input_mode(
             }
             KeyCode::Char('b') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 state.input_mode = InputMode::Normal;
+                refresh_pane(left_pane, left, state).await?;
+                refresh_pane(right_pane, right, state).await?;
             }
             KeyCode::Char('b') => {
                 state.input_mode = InputMode::Normal;
+                refresh_pane(left_pane, left, state).await?;
+                refresh_pane(right_pane, right, state).await?;
             }
             KeyCode::Esc => {
                 if idx < state.background_transfers.len() {
                     let label = transfer_label(&state.background_transfers, idx);
                     let transfer = state.background_transfers.remove(idx);
                     transfer.cancel.store(true, Ordering::Relaxed);
-                    transfer.handle.abort();
+                    // Don't abort() — let the pipeline exit gracefully so it can
+                    // flush the BufWriter and reorder buffer to preserve .part data.
+                    // The pipeline checks the cancel flag every iteration (~50ms).
+                    let _ = tokio::time::timeout(Duration::from_secs(2), transfer.handle).await;
                     state.status_message = Some(format!("Cancelled transfer {label}"));
                     // Clamp popup index after removal
                     if state.popup_transfer_index >= state.background_transfers.len()
@@ -4373,6 +4388,9 @@ async fn handle_input_mode(
                     {
                         state.popup_transfer_index = state.background_transfers.len() - 1;
                     }
+                    // Refresh to show .part files from cancelled transfer
+                    refresh_pane(left_pane, left, state).await?;
+                    refresh_pane(right_pane, right, state).await?;
                 }
                 if state.background_transfers.is_empty() {
                     state.input_mode = InputMode::Normal;
@@ -6042,48 +6060,6 @@ mod tests {
             "partial",
             ".part file should contain partial data"
         );
-    }
-
-    #[test]
-    fn test_resume_offset_writer_shifts_seek() {
-        // ResumeOffsetWriter must shift SeekFrom::Start positions by offset_shift
-        // so the pipeline's seek(Start(0)) becomes seek(Start(start_offset)).
-        let mut cursor = std::io::Cursor::new(vec![0u8; 100]);
-        // Pre-fill first 50 bytes to simulate existing .part content.
-        for i in 0..50u8 {
-            cursor.get_mut()[i as usize] = i;
-        }
-
-        let mut writer = ResumeOffsetWriter {
-            inner: cursor,
-            offset_shift: 50,
-        };
-
-        // Pipeline seeks to local offset 0 — should map to absolute 50.
-        writer.seek(SeekFrom::Start(0)).unwrap();
-        writer.write_all(b"HELLO").unwrap();
-
-        let data = writer.inner.into_inner();
-        // Original bytes 0..50 should be untouched.
-        assert_eq!(data[0], 0);
-        assert_eq!(data[49], 49);
-        // New data should be at positions 50..55.
-        assert_eq!(&data[50..55], b"HELLO");
-    }
-
-    #[test]
-    fn test_resume_offset_writer_zero_shift() {
-        // With offset_shift=0, seeks are passed through unchanged.
-        let cursor = std::io::Cursor::new(vec![0u8; 20]);
-        let mut writer = ResumeOffsetWriter {
-            inner: cursor,
-            offset_shift: 0,
-        };
-        writer.seek(SeekFrom::Start(5)).unwrap();
-        writer.write_all(b"AB").unwrap();
-        let data = writer.inner.into_inner();
-        assert_eq!(&data[5..7], b"AB");
-        assert_eq!(data[0], 0); // untouched
     }
 
     #[test]

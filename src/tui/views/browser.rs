@@ -2812,19 +2812,30 @@ fn draw_pane(
 
     let highlight_bg = if is_active {
         if let Some(ctx) = remote_ctx {
-            // Brighter tint for the selected row in remote pane
+            // Brighter tint for the selected row in active remote pane
             dim_color(ctx.env_color, 100)
         } else {
-            Color::DarkGray
+            // Active local pane: visible gray highlight
+            Color::Rgb(70, 70, 80)
         }
+    } else if let Some(ctx) = remote_ctx {
+        // Dim tint for selected row in inactive remote pane
+        dim_color(ctx.env_color, 40)
     } else {
-        Color::Black
+        // Inactive local pane: subtle dim highlight
+        Color::Rgb(40, 40, 45)
+    };
+
+    let highlight_modifier = if is_active {
+        Modifier::BOLD
+    } else {
+        Modifier::empty()
     };
 
     let list = List::new(items).block(block).highlight_style(
         Style::default()
             .bg(highlight_bg)
-            .add_modifier(Modifier::BOLD),
+            .add_modifier(highlight_modifier),
     );
 
     frame.render_stateful_widget(list, area, &mut pane.list_state);

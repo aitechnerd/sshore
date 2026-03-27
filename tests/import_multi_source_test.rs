@@ -236,6 +236,7 @@ fn test_import_skip_existing() {
         snippets: vec![],
         ssh_options: std::collections::HashMap::new(),
         connect_timeout_secs: None,
+        profile: None,
     }];
 
     let imported = import_fixture("hosts.csv", ImportSourceKind::Csv, None, &[]);
@@ -268,6 +269,7 @@ fn test_import_overwrite_existing() {
         snippets: vec![],
         ssh_options: std::collections::HashMap::new(),
         connect_timeout_secs: None,
+        profile: None,
     }];
 
     let imported = import_fixture("hosts.csv", ImportSourceKind::Csv, None, &[]);

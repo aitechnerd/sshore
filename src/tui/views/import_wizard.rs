@@ -815,6 +815,7 @@ mod tests {
             snippets: vec![],
             connect_timeout_secs: None,
             ssh_options: std::collections::HashMap::new(),
+            profile: None,
         }
     }
 

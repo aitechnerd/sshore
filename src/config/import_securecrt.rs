@@ -242,6 +242,7 @@ fn session_to_bookmark(
         snippets: vec![],
         ssh_options: HashMap::new(),
         connect_timeout_secs: None,
+        profile: None,
     }
 }
 

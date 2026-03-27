@@ -442,6 +442,7 @@ pub fn show_save_bookmark_form(
                         snippets: vec![],
                         connect_timeout_secs: None,
                         ssh_options: std::collections::HashMap::new(),
+                        profile: None,
                     };
                     return Ok(Some(bookmark));
                 }

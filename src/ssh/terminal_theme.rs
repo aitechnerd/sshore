@@ -413,6 +413,7 @@ mod tests {
             snippets: vec![],
             connect_timeout_secs: None,
             ssh_options: std::collections::HashMap::new(),
+            profile: None,
         }
     }
 
@@ -493,6 +494,7 @@ mod tests {
             snippets: vec![],
             connect_timeout_secs: None,
             ssh_options: std::collections::HashMap::new(),
+            profile: None,
         };
         let result = render_tab_title("{name}", &bookmark, &settings);
         assert_eq!(result, "prod]0;hacked");

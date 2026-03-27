@@ -240,6 +240,7 @@ pub async fn connect_adhoc(
         snippets: vec![],
         connect_timeout_secs: None,
         ssh_options: std::collections::HashMap::new(),
+        profile: None,
     };
 
     // Temporarily add the bookmark for connection, then remove it
@@ -1722,6 +1723,7 @@ mod tests {
             snippets: vec![],
             connect_timeout_secs: None,
             ssh_options: std::collections::HashMap::new(),
+            profile: None,
         }
     }
 

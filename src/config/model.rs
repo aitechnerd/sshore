@@ -30,11 +30,47 @@ const BOOKMARK_NAME_EXTRA_CHARS: &[char] = &['-', '_', '.'];
 /// Map of environment name to color configuration.
 pub type EnvColorMap = HashMap<String, EnvColor>;
 
+/// A reusable set of SSH connection settings that can be shared across bookmarks.
+///
+/// Bookmarks reference profiles by name. At connect time, fields resolve as:
+/// bookmark field > profile field > settings default > hardcoded default.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct Profile {
+    /// Unique identifier for this profile (same naming rules as bookmarks).
+    pub name: String,
+
+    /// SSH username.
+    #[serde(default)]
+    pub user: Option<String>,
+
+    /// Path to SSH private key file (supports ~ expansion).
+    #[serde(default)]
+    pub identity_file: Option<String>,
+
+    /// ProxyJump host (equivalent to ssh -J).
+    #[serde(default)]
+    pub proxy_jump: Option<String>,
+
+    /// Command to run automatically after SSH session starts.
+    #[serde(default)]
+    pub on_connect: Option<String>,
+
+    /// Additional SSH options as key-value pairs.
+    #[serde(default)]
+    pub ssh_options: HashMap<String, String>,
+
+    /// Connection timeout in seconds.
+    #[serde(default)]
+    pub connect_timeout_secs: Option<u64>,
+}
+
 /// Top-level application configuration.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct AppConfig {
     #[serde(default)]
     pub settings: Settings,
+    #[serde(default)]
+    pub profiles: Vec<Profile>,
     #[serde(default)]
     pub bookmarks: Vec<Bookmark>,
 }
@@ -179,6 +215,11 @@ pub struct Bookmark {
     /// dedicated fields. Applied at connection time.
     #[serde(default)]
     pub ssh_options: HashMap<String, String>,
+
+    /// Name of the connection profile to inherit settings from.
+    /// References a `Profile.name` in `AppConfig.profiles`.
+    #[serde(default)]
+    pub profile: Option<String>,
 }
 
 impl Default for Settings {
@@ -412,6 +453,23 @@ mod tests {
             snippets: vec![],
             connect_timeout_secs: None,
             ssh_options: std::collections::HashMap::new(),
+            profile: None,
+        }
+    }
+
+    fn sample_profile() -> Profile {
+        Profile {
+            name: "corp-bastion".into(),
+            user: Some("deploy".into()),
+            identity_file: Some("~/.ssh/corp_key".into()),
+            proxy_jump: Some("bastion.corp.com".into()),
+            on_connect: Some("cd /app".into()),
+            ssh_options: {
+                let mut m = HashMap::new();
+                m.insert("ServerAliveInterval".into(), "60".into());
+                m
+            },
+            connect_timeout_secs: Some(30),
         }
     }
 
@@ -421,6 +479,7 @@ mod tests {
                 default_user: Some("admin".into()),
                 ..Settings::default()
             },
+            profiles: vec![],
             bookmarks: vec![sample_bookmark()],
         }
     }

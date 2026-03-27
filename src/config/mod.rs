@@ -361,11 +361,13 @@ pub fn export_bookmarks(
         AppConfig {
             settings: config.settings.clone(),
             bookmarks: export_bookmarks,
+            profiles: config.profiles.clone(),
         }
     } else {
         AppConfig {
             settings: Settings::default(),
             bookmarks: export_bookmarks,
+            profiles: Vec::new(),
         }
     };
 
@@ -452,6 +454,7 @@ mod tests {
             snippets: vec![],
             connect_timeout_secs: None,
             ssh_options: std::collections::HashMap::new(),
+            profile: None,
         });
         save_to(&config, &path).unwrap();
 
@@ -494,12 +497,14 @@ mod tests {
             snippets: vec![],
             connect_timeout_secs: None,
             ssh_options: std::collections::HashMap::new(),
+            profile: None,
         }
     }
 
     fn sample_config_with_bookmarks() -> AppConfig {
         AppConfig {
             settings: Settings::default(),
+            profiles: Vec::new(),
             bookmarks: vec![
                 sample_bookmark("prod-web-01", "production", vec!["web".into()]),
                 sample_bookmark("prod-db-01", "production", vec!["db".into()]),
@@ -601,6 +606,7 @@ mod tests {
         let path = dir.path().join("config.toml");
         let config = AppConfig {
             settings: Settings::default(),
+            profiles: Vec::new(),
             bookmarks: vec![sample_bookmark("prod-web-01", "production", vec![])],
         };
         let toml_str = toml::to_string_pretty(&config).unwrap();

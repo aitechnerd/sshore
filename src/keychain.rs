@@ -115,6 +115,7 @@ mod tests {
                 snippets: vec![],
                 connect_timeout_secs: None,
                 ssh_options: std::collections::HashMap::new(),
+                profile: None,
             },
             Bookmark {
                 name: unstored_name.into(),
@@ -132,6 +133,7 @@ mod tests {
                 snippets: vec![],
                 connect_timeout_secs: None,
                 ssh_options: std::collections::HashMap::new(),
+                profile: None,
             },
         ];
 

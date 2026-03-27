@@ -151,6 +151,7 @@ Host server-b
         snippets: vec![],
         connect_timeout_secs: None,
         ssh_options: std::collections::HashMap::new(),
+        profile: None,
     }];
 
     let result = merge_imports(&mut existing, imported, false);

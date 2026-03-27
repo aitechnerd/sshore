@@ -131,6 +131,7 @@ pub fn parse_csv(
             snippets: vec![],
             ssh_options: HashMap::new(),
             connect_timeout_secs: None,
+            profile: None,
         });
     }
 

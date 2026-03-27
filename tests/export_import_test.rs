@@ -21,12 +21,14 @@ fn sample_bookmark(name: &str, env: &str) -> Bookmark {
         snippets: vec![],
         connect_timeout_secs: None,
         ssh_options: std::collections::HashMap::new(),
+        profile: None,
     }
 }
 
 fn sample_config() -> AppConfig {
     AppConfig {
         settings: Settings::default(),
+        profiles: Vec::new(),
         bookmarks: vec![
             sample_bookmark("prod-web-01", "production"),
             sample_bookmark("staging-api", "staging"),
@@ -101,6 +103,7 @@ fn test_import_overwrite_vs_skip() {
         snippets: vec![],
         connect_timeout_secs: None,
         ssh_options: std::collections::HashMap::new(),
+        profile: None,
     }];
 
     let imported = vec![
@@ -120,6 +123,7 @@ fn test_import_overwrite_vs_skip() {
             snippets: vec![],
             connect_timeout_secs: None,
             ssh_options: std::collections::HashMap::new(),
+            profile: None,
         },
         Bookmark {
             name: "server-b".into(),
@@ -137,6 +141,7 @@ fn test_import_overwrite_vs_skip() {
             snippets: vec![],
             connect_timeout_secs: None,
             ssh_options: std::collections::HashMap::new(),
+            profile: None,
         },
     ];
 
@@ -165,6 +170,7 @@ fn test_import_overwrite_vs_skip() {
         snippets: vec![],
         connect_timeout_secs: None,
         ssh_options: std::collections::HashMap::new(),
+        profile: None,
     }];
 
     let result2 = merge_imports(&mut existing2, imported, true);

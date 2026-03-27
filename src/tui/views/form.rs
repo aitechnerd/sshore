@@ -267,6 +267,7 @@ impl FormState {
             snippets: vec![],
             connect_timeout_secs: None,
             ssh_options: std::collections::HashMap::new(),
+            profile: None,
         })
     }
 }
@@ -581,12 +582,14 @@ mod tests {
             snippets: vec![],
             connect_timeout_secs: None,
             ssh_options: std::collections::HashMap::new(),
+            profile: None,
         }
     }
 
     fn sample_config() -> AppConfig {
         AppConfig {
             settings: Settings::default(),
+            profiles: vec![],
             bookmarks: vec![sample_bookmark()],
         }
     }

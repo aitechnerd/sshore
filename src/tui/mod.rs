@@ -841,12 +841,14 @@ mod tests {
             snippets: vec![],
             connect_timeout_secs: None,
             ssh_options: std::collections::HashMap::new(),
+            profile: None,
         }
     }
 
     fn sample_app() -> App {
         let config = AppConfig {
             settings: Settings::default(),
+            profiles: Vec::new(),
             bookmarks: vec![
                 sample_bookmark("prod-web-01", "production"),
                 sample_bookmark("staging-api", "staging"),
@@ -1088,6 +1090,7 @@ mod tests {
             snippets: vec![],
             connect_timeout_secs: None,
             ssh_options: std::collections::HashMap::new(),
+            profile: None,
         };
         app.config.bookmarks.push(new_bookmark);
         app.refilter();

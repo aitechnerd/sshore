@@ -57,6 +57,7 @@ impl HostBlock {
             snippets: vec![],
             connect_timeout_secs: self.connect_timeout_secs,
             ssh_options: self.ssh_options,
+            profile: None,
         })
     }
 }
@@ -731,6 +732,7 @@ Host relative-host
             snippets: vec![],
             connect_timeout_secs: None,
             ssh_options: std::collections::HashMap::new(),
+            profile: None,
         }];
 
         let imported = vec![
@@ -750,6 +752,7 @@ Host relative-host
                 snippets: vec![],
                 connect_timeout_secs: None,
                 ssh_options: std::collections::HashMap::new(),
+                profile: None,
             },
             Bookmark {
                 name: "server-b".into(),
@@ -767,6 +770,7 @@ Host relative-host
                 snippets: vec![],
                 connect_timeout_secs: None,
                 ssh_options: std::collections::HashMap::new(),
+                profile: None,
             },
         ];
 
@@ -796,6 +800,7 @@ Host relative-host
             snippets: vec![],
             connect_timeout_secs: None,
             ssh_options: std::collections::HashMap::new(),
+            profile: None,
         }];
 
         let imported = vec![Bookmark {
@@ -814,6 +819,7 @@ Host relative-host
             snippets: vec![],
             connect_timeout_secs: None,
             ssh_options: std::collections::HashMap::new(),
+            profile: None,
         }];
 
         let result = merge_imports(&mut existing, imported, true);

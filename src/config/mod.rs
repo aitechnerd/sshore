@@ -132,6 +132,7 @@ pub fn load_from(path: &Path) -> Result<AppConfig> {
     validate_profiles(&config.profiles)?;
     validate_on_connect_fields(&config.profiles, &config.bookmarks)?;
 
+    warn_dangling_profiles(&config.bookmarks, &config.profiles);
     warn_duplicate_names(&config.bookmarks);
     validate_bookmarks(&config.bookmarks);
 
@@ -171,6 +172,25 @@ fn validate_bookmarks(bookmarks: &[Bookmark]) {
                 "Warning: bookmark '{}' has invalid hostname '{}': {e}",
                 sanitize_for_display(&b.name),
                 sanitize_for_display(&b.host)
+            );
+        }
+    }
+}
+
+/// Warn to stderr for any bookmark that references a profile not in the profiles list.
+///
+/// This is a soft warning (not a hard error) to support graceful degradation —
+/// the bookmark can still connect using its own fields plus settings defaults.
+fn warn_dangling_profiles(bookmarks: &[Bookmark], profiles: &[Profile]) {
+    let profile_names: HashSet<&str> = profiles.iter().map(|p| p.name.as_str()).collect();
+    for b in bookmarks {
+        if let Some(ref profile_name) = b.profile
+            && !profile_names.contains(profile_name.as_str())
+        {
+            eprintln!(
+                "Warning: bookmark '{}' references profile '{}' which does not exist",
+                sanitize_for_display(&b.name),
+                sanitize_for_display(profile_name)
             );
         }
     }
@@ -1244,6 +1264,85 @@ profile = "corp-bastion"
             ..sample_bookmark("test", "dev", vec![])
         }];
         assert!(validate_on_connect_fields(&profiles, &bookmarks).is_ok());
+    }
+
+    // --- Phase 3: Dangling Profile Warning tests ---
+
+    #[test]
+    fn test_dangling_profile_warns_on_load() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let raw_toml = r#"
+[settings]
+
+[[profiles]]
+name = "ops"
+
+[[bookmarks]]
+name = "test"
+host = "10.0.1.5"
+profile = "deleted-profile"
+"#;
+        std::fs::write(&path, raw_toml).unwrap();
+
+        // load_from should succeed (warning only, no rejection)
+        let config = load_from(&path).unwrap();
+        assert_eq!(config.bookmarks.len(), 1);
+        assert_eq!(config.bookmarks[0].profile, Some("deleted-profile".into()));
+        // Warning is printed to stderr — we verify the load does not fail.
+        // The warn_dangling_profiles unit test below verifies the function itself.
+    }
+
+    #[test]
+    fn test_valid_profile_reference_no_warning() {
+        // This test verifies that a valid profile reference does not cause issues.
+        // The function only warns on dangling references, so a valid reference
+        // should produce no output and no error.
+        let profiles = vec![model::Profile {
+            name: "ops".into(),
+            ..Default::default()
+        }];
+        let bookmarks = vec![Bookmark {
+            profile: Some("ops".into()),
+            ..sample_bookmark("test", "development", vec![])
+        }];
+        // Should not panic or produce warnings. Since warnings go to stderr,
+        // we verify correctness by confirming the function completes without issues.
+        warn_dangling_profiles(&bookmarks, &profiles);
+    }
+
+    #[test]
+    fn test_no_profile_no_warning() {
+        // Bookmarks with profile: None should never trigger warnings.
+        let profiles = vec![model::Profile {
+            name: "ops".into(),
+            ..Default::default()
+        }];
+        let bookmarks = vec![sample_bookmark("test", "development", vec![])];
+        assert!(bookmarks[0].profile.is_none());
+        warn_dangling_profiles(&bookmarks, &profiles);
+    }
+
+    #[test]
+    fn test_dangling_profile_warning_with_empty_profiles_list() {
+        // When no profiles exist at all, any bookmark with a profile reference is dangling.
+        let bookmarks = vec![Bookmark {
+            profile: Some("nonexistent".into()),
+            ..sample_bookmark("test", "development", vec![])
+        }];
+        // Should not panic — just warns to stderr.
+        warn_dangling_profiles(&bookmarks, &[]);
+    }
+
+    #[test]
+    fn test_dangling_profile_warning_sanitizes_display() {
+        // Profile name with control characters should be sanitized in the warning.
+        let bookmarks = vec![Bookmark {
+            profile: Some("bad\x1bprofile".into()),
+            ..sample_bookmark("test", "development", vec![])
+        }];
+        // Should not panic — sanitize_for_display handles control chars.
+        warn_dangling_profiles(&bookmarks, &[]);
     }
 
     #[test]

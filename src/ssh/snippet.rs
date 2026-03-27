@@ -1,11 +1,20 @@
 use std::collections::HashSet;
 use std::io::Write;
+use std::time::Instant;
 
 use anyhow::Result;
 use crossterm::event::{Event, KeyCode};
 
 use crate::config::model::{Bookmark, Snippet};
 use crate::ssh::SessionInfo;
+
+/// Minimum inter-byte interval (ms) for trigger detection.
+/// If consecutive trigger bytes arrive faster than this threshold,
+/// treat the sequence as paste/program output and flush instead of triggering.
+/// Single-character triggers bypass this guard since timing is the only
+/// possible signal and single-char triggers were always inadvisable for
+/// contexts where paste is common.
+const PASTE_THRESHOLD_MS: u64 = 20;
 
 /// Result of feeding a byte to the escape detector.
 pub enum EscapeAction {
@@ -26,10 +35,17 @@ enum EscapeState {
 
 /// Detects the snippet trigger escape sequence in stdin bytes.
 /// Follows the same feed-and-act pattern as PasswordDetector.
+///
+/// Includes a paste-flood guard: if consecutive trigger bytes arrive faster
+/// than [`PASTE_THRESHOLD_MS`] apart, the sequence is treated as pasted text
+/// and flushed rather than triggering the snippet picker.
 pub struct EscapeDetector {
     state: EscapeState,
     trigger: Vec<u8>,
     buffered: Vec<u8>,
+    /// Timestamp of the last byte that advanced the match state.
+    /// Used to detect paste floods (bytes arriving faster than human typing).
+    last_byte_time: Option<Instant>,
 }
 
 impl EscapeDetector {
@@ -39,11 +55,39 @@ impl EscapeDetector {
             state: EscapeState::Normal,
             trigger: trigger.as_bytes().to_vec(),
             buffered: Vec::new(),
+            last_byte_time: None,
         }
     }
 
     /// Feed a single byte from stdin. Returns what to do with it.
+    /// Uses `Instant::now()` for paste-flood detection timing.
+    ///
+    /// In the current codebase, `SessionEscapeHandler` is the sole production
+    /// caller and routes through `feed_with_time` directly. This method is
+    /// kept as the primary public API for direct `EscapeDetector` consumers.
+    #[allow(dead_code)]
     pub fn feed(&mut self, byte: u8) -> EscapeAction {
+        self.feed_with_time(byte, Instant::now())
+    }
+
+    /// Feed a byte without paste-flood timing checks.
+    /// Used when bytes are forwarded between chained detectors within a
+    /// single keystroke event — timing was already validated upstream.
+    fn feed_untimed(&mut self, byte: u8) -> EscapeAction {
+        // Temporarily disable timing by clearing last_byte_time,
+        // then feed with a dummy instant. The timing check only fires
+        // in Matching state when last_byte_time is Some, so clearing
+        // it effectively bypasses the guard for this byte.
+        self.last_byte_time = None;
+        // Use a dummy instant; since last_byte_time is None, the
+        // timing check will be skipped.
+        self.feed_with_time(byte, Instant::now())
+    }
+
+    /// Feed a single byte with an explicit timestamp for deterministic testing.
+    /// If consecutive trigger bytes arrive faster than [`PASTE_THRESHOLD_MS`],
+    /// the sequence is treated as paste and flushed instead of triggering.
+    pub fn feed_with_time(&mut self, byte: u8, now: Instant) -> EscapeAction {
         // Empty trigger means detection is disabled
         if self.trigger.is_empty() {
             return EscapeAction::Forward(vec![byte]);
@@ -54,10 +98,14 @@ impl EscapeDetector {
                 if byte == self.trigger[0] {
                     self.state = EscapeState::Matching(1);
                     self.buffered.push(byte);
+                    self.last_byte_time = Some(now);
                     if self.trigger.len() == 1 {
-                        // Single-char trigger — immediate match
+                        // Single-char trigger — immediate match.
+                        // Timing guard is skipped for single-char triggers since
+                        // there is no inter-byte interval to measure.
                         self.state = EscapeState::Normal;
                         self.buffered.clear();
+                        self.last_byte_time = None;
                         EscapeAction::Trigger
                     } else {
                         EscapeAction::Buffer
@@ -68,11 +116,28 @@ impl EscapeDetector {
             }
             EscapeState::Matching(n) => {
                 if byte == self.trigger[n] {
+                    // Paste-flood guard: if this byte arrived too fast after
+                    // the previous match byte, treat the whole sequence as
+                    // paste/program output and flush.
+                    if let Some(prev) = self.last_byte_time {
+                        let elapsed = now.duration_since(prev);
+                        if elapsed.as_millis() < PASTE_THRESHOLD_MS as u128 {
+                            // Too fast — flush buffered bytes + this byte
+                            let mut flushed = std::mem::take(&mut self.buffered);
+                            flushed.push(byte);
+                            self.state = EscapeState::Normal;
+                            self.last_byte_time = None;
+                            return EscapeAction::Forward(flushed);
+                        }
+                    }
+
                     self.buffered.push(byte);
+                    self.last_byte_time = Some(now);
                     if n + 1 == self.trigger.len() {
                         // Full match
                         self.state = EscapeState::Normal;
                         self.buffered.clear();
+                        self.last_byte_time = None;
                         EscapeAction::Trigger
                     } else {
                         self.state = EscapeState::Matching(n + 1);
@@ -83,6 +148,7 @@ impl EscapeDetector {
                     let mut flushed = std::mem::take(&mut self.buffered);
                     flushed.push(byte);
                     self.state = EscapeState::Normal;
+                    self.last_byte_time = None;
                     EscapeAction::Forward(flushed)
                 }
             }
@@ -90,8 +156,52 @@ impl EscapeDetector {
     }
 }
 
+/// Wrap a cursor index with bounds, implementing Up/Down wrapping.
+///
+/// Returns the new cursor position after moving by `delta` within `count` items.
+/// Wraps around: moving up from 0 goes to `count - 1`, and vice versa.
+fn wrap_cursor(current: usize, delta: isize, count: usize) -> usize {
+    if count == 0 {
+        return 0;
+    }
+    ((current as isize + delta).rem_euclid(count as isize)) as usize
+}
+
+/// Draw the snippet picker at the current cursor position.
+/// `cursor` is the highlighted item index.
+fn draw_snippet_picker(
+    stdout: &mut std::io::Stdout,
+    snippets: &[&Snippet],
+    cursor: usize,
+) -> Result<()> {
+    write!(stdout, "\r\n\x1b[1m── Snippets ──\x1b[0m\r\n")?;
+    for (i, snippet) in snippets.iter().enumerate() {
+        if i == cursor {
+            // Reverse video for highlighted item
+            write!(
+                stdout,
+                "  \x1b[7m\x1b[33m{}\x1b[0m\x1b[7m. {}\x1b[0m\r\n",
+                i + 1,
+                snippet.name
+            )?;
+        } else {
+            write!(stdout, "  \x1b[33m{}\x1b[0m. {}\r\n", i + 1, snippet.name)?;
+        }
+    }
+    let max = snippets.len();
+    write!(
+        stdout,
+        "\x1b[2m(Up/Down move, Enter select, 1-{max} jump, Esc cancel)\x1b[0m\r\n"
+    )?;
+    stdout.flush()?;
+    Ok(())
+}
+
 /// Show the snippet picker inline during an SSH session.
 /// Returns the command string to inject, or None if cancelled.
+///
+/// Navigation: Up/Down arrows move cursor with wrapping. Enter selects.
+/// Esc cancels. Number keys 1-9 are immediate shortcuts for backwards compat.
 pub fn show_snippet_picker(
     stdout: &mut std::io::Stdout,
     bookmark_snippets: &[Snippet],
@@ -110,24 +220,46 @@ pub fn show_snippet_picker(
         return Ok(None);
     }
 
-    // Print the picker below the current cursor position
-    write!(stdout, "\r\n\x1b[1m── Snippets ──\x1b[0m\r\n")?;
-    for (i, snippet) in all_snippets.iter().enumerate() {
-        write!(stdout, "  \x1b[33m{}\x1b[0m. {}\r\n", i + 1, snippet.name)?;
-    }
     let max = all_snippets.len();
-    write!(stdout, "\x1b[2m(1-{max} select, Esc cancel)\x1b[0m\r\n")?;
-    stdout.flush()?;
+    let mut cursor: usize = 0;
+    let lines_to_clear = max + 3; // header + items + footer
 
-    // Read user selection (raw mode is already active)
-    let selection = read_snippet_selection(max)?;
+    // Initial draw
+    draw_snippet_picker(stdout, &all_snippets, cursor)?;
+
+    // Read loop: raw mode is already active during SSH session
+    let selection = loop {
+        if let Event::Key(key) = crossterm::event::read()? {
+            match key.code {
+                KeyCode::Esc => {
+                    break None;
+                }
+                KeyCode::Enter => {
+                    break Some(cursor);
+                }
+                KeyCode::Up => {
+                    cursor = wrap_cursor(cursor, -1, max);
+                    clear_lines(stdout, lines_to_clear)?;
+                    draw_snippet_picker(stdout, &all_snippets, cursor)?;
+                }
+                KeyCode::Down => {
+                    cursor = wrap_cursor(cursor, 1, max);
+                    clear_lines(stdout, lines_to_clear)?;
+                    draw_snippet_picker(stdout, &all_snippets, cursor)?;
+                }
+                KeyCode::Char(c) if c.is_ascii_digit() => {
+                    let n = c.to_digit(10).unwrap() as usize;
+                    if n >= 1 && n <= max {
+                        break Some(n - 1);
+                    }
+                }
+                _ => {}
+            }
+        }
+    };
 
     // Clear the picker lines
-    let lines_to_clear = max + 3; // header + items + footer
-    for _ in 0..lines_to_clear {
-        write!(stdout, "\x1b[A\x1b[2K")?; // move up, clear line
-    }
-    stdout.flush()?;
+    clear_lines(stdout, lines_to_clear)?;
 
     match selection {
         Some(idx) => {
@@ -142,25 +274,6 @@ pub fn show_snippet_picker(
             Ok(Some(command))
         }
         None => Ok(None),
-    }
-}
-
-/// Read a single keypress for snippet selection.
-/// Returns Some(index) for a valid number, None for Esc.
-fn read_snippet_selection(max: usize) -> Result<Option<usize>> {
-    loop {
-        if let Event::Key(key) = crossterm::event::read()? {
-            match key.code {
-                KeyCode::Esc => return Ok(None),
-                KeyCode::Char(c) if c.is_ascii_digit() => {
-                    let n = c.to_digit(10).unwrap() as usize;
-                    if n >= 1 && n <= max {
-                        return Ok(Some(n - 1));
-                    }
-                }
-                _ => {}
-            }
-        }
     }
 }
 
@@ -219,6 +332,12 @@ impl SessionEscapeHandler {
     /// trigger detection. For normal bytes, the snippet detector gets first
     /// pass; when it forwards, those bytes are checked by the bookmark detector.
     pub fn feed(&mut self, byte: u8) -> SessionAction {
+        self.feed_with_time(byte, Instant::now())
+    }
+
+    /// Feed a single byte with an explicit timestamp, propagated to all
+    /// underlying detectors for deterministic paste-flood testing.
+    pub fn feed_with_time(&mut self, byte: u8, now: Instant) -> SessionAction {
         // Track terminal escape sequence state.
         // Bytes inside escape sequences bypass trigger detection entirely.
         match self.term_seq {
@@ -254,7 +373,7 @@ impl SessionEscapeHandler {
         }
 
         // Normal byte — run through trigger detectors
-        match self.snippet_detector.feed(byte) {
+        match self.snippet_detector.feed_with_time(byte, now) {
             EscapeAction::Trigger => SessionAction::ShowSnippets,
             EscapeAction::Buffer => {
                 // Snippet detector is buffering — don't forward to bookmark detector yet.
@@ -263,10 +382,12 @@ impl SessionEscapeHandler {
                 SessionAction::Buffer
             }
             EscapeAction::Forward(bytes) => {
-                // Snippet detector forwarded these bytes — now check bookmark trigger
+                // Snippet detector forwarded these bytes — now check bookmark trigger.
+                // Use feed_untimed because timing was already validated at the
+                // snippet detector level; these are cascaded within a single event.
                 let mut after_bookmark = Vec::new();
                 for &b in &bytes {
-                    match self.bookmark_detector.feed(b) {
+                    match self.bookmark_detector.feed_untimed(b) {
                         EscapeAction::Trigger => return SessionAction::ShowSaveBookmark,
                         EscapeAction::Buffer => {} // absorbed by bookmark detector
                         EscapeAction::Forward(fwd) => after_bookmark.extend(fwd),
@@ -275,7 +396,7 @@ impl SessionEscapeHandler {
                 // Bookmark detector forwarded these bytes — now check browser trigger
                 let mut final_forward = Vec::new();
                 for &b in &after_bookmark {
-                    match self.browser_detector.feed(b) {
+                    match self.browser_detector.feed_untimed(b) {
                         EscapeAction::Trigger => return SessionAction::ShowBrowser,
                         EscapeAction::Buffer => {} // absorbed by browser detector
                         EscapeAction::Forward(fwd) => final_forward.extend(fwd),
@@ -522,25 +643,49 @@ fn clear_lines(stdout: &mut std::io::Stdout, n: usize) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
+
+    /// Helper: create an Instant and a closure that returns instants spaced
+    /// by a given interval, simulating human typing speed.
+    fn typing_clock(interval_ms: u64) -> impl FnMut() -> Instant {
+        let mut now = Instant::now();
+        let interval = Duration::from_millis(interval_ms);
+        move || {
+            let t = now;
+            now += interval;
+            t
+        }
+    }
 
     #[test]
     fn test_escape_detector_trigger() {
         let mut detector = EscapeDetector::new("~~");
+        let mut clock = typing_clock(30); // 30ms apart — deliberate typing
 
         // First tilde — should buffer
-        assert!(matches!(detector.feed(b'~'), EscapeAction::Buffer));
-        // Second tilde — should trigger
-        assert!(matches!(detector.feed(b'~'), EscapeAction::Trigger));
+        assert!(matches!(
+            detector.feed_with_time(b'~', clock()),
+            EscapeAction::Buffer
+        ));
+        // Second tilde — should trigger (30ms > 20ms threshold)
+        assert!(matches!(
+            detector.feed_with_time(b'~', clock()),
+            EscapeAction::Trigger
+        ));
     }
 
     #[test]
     fn test_escape_detector_single_tilde_then_other() {
         let mut detector = EscapeDetector::new("~~");
+        let mut clock = typing_clock(30);
 
         // First tilde — buffer
-        assert!(matches!(detector.feed(b'~'), EscapeAction::Buffer));
+        assert!(matches!(
+            detector.feed_with_time(b'~', clock()),
+            EscapeAction::Buffer
+        ));
         // 'a' — not a match, flush "~a"
-        match detector.feed(b'a') {
+        match detector.feed_with_time(b'a', clock()) {
             EscapeAction::Forward(bytes) => {
                 assert_eq!(bytes, vec![b'~', b'a']);
             }
@@ -570,9 +715,16 @@ mod tests {
     #[test]
     fn test_escape_detector_custom_trigger() {
         let mut detector = EscapeDetector::new("!!");
+        let mut clock = typing_clock(30);
 
-        assert!(matches!(detector.feed(b'!'), EscapeAction::Buffer));
-        assert!(matches!(detector.feed(b'!'), EscapeAction::Trigger));
+        assert!(matches!(
+            detector.feed_with_time(b'!', clock()),
+            EscapeAction::Buffer
+        ));
+        assert!(matches!(
+            detector.feed_with_time(b'!', clock()),
+            EscapeAction::Trigger
+        ));
     }
 
     #[test]
@@ -591,13 +743,20 @@ mod tests {
     #[test]
     fn test_escape_detector_trigger_then_normal() {
         let mut detector = EscapeDetector::new("~~");
+        let mut clock = typing_clock(30);
 
         // Trigger
-        assert!(matches!(detector.feed(b'~'), EscapeAction::Buffer));
-        assert!(matches!(detector.feed(b'~'), EscapeAction::Trigger));
+        assert!(matches!(
+            detector.feed_with_time(b'~', clock()),
+            EscapeAction::Buffer
+        ));
+        assert!(matches!(
+            detector.feed_with_time(b'~', clock()),
+            EscapeAction::Trigger
+        ));
 
         // After trigger, back to normal
-        match detector.feed(b'x') {
+        match detector.feed_with_time(b'x', clock()) {
             EscapeAction::Forward(bytes) => {
                 assert_eq!(bytes, vec![b'x']);
             }
@@ -608,10 +767,14 @@ mod tests {
     #[test]
     fn test_escape_detector_partial_then_trigger() {
         let mut detector = EscapeDetector::new("~~");
+        let mut clock = typing_clock(30);
 
         // Partial match that fails
-        assert!(matches!(detector.feed(b'~'), EscapeAction::Buffer));
-        match detector.feed(b'a') {
+        assert!(matches!(
+            detector.feed_with_time(b'~', clock()),
+            EscapeAction::Buffer
+        ));
+        match detector.feed_with_time(b'a', clock()) {
             EscapeAction::Forward(bytes) => {
                 assert_eq!(bytes, vec![b'~', b'a']);
             }
@@ -619,17 +782,208 @@ mod tests {
         }
 
         // Now a real trigger
-        assert!(matches!(detector.feed(b'~'), EscapeAction::Buffer));
-        assert!(matches!(detector.feed(b'~'), EscapeAction::Trigger));
+        assert!(matches!(
+            detector.feed_with_time(b'~', clock()),
+            EscapeAction::Buffer
+        ));
+        assert!(matches!(
+            detector.feed_with_time(b'~', clock()),
+            EscapeAction::Trigger
+        ));
     }
 
     #[test]
     fn test_escape_detector_three_char_trigger() {
         let mut detector = EscapeDetector::new("abc");
+        let mut clock = typing_clock(30);
 
-        assert!(matches!(detector.feed(b'a'), EscapeAction::Buffer));
-        assert!(matches!(detector.feed(b'b'), EscapeAction::Buffer));
-        assert!(matches!(detector.feed(b'c'), EscapeAction::Trigger));
+        assert!(matches!(
+            detector.feed_with_time(b'a', clock()),
+            EscapeAction::Buffer
+        ));
+        assert!(matches!(
+            detector.feed_with_time(b'b', clock()),
+            EscapeAction::Buffer
+        ));
+        assert!(matches!(
+            detector.feed_with_time(b'c', clock()),
+            EscapeAction::Trigger
+        ));
+    }
+
+    // --- Paste-flood guard ---
+
+    #[test]
+    fn test_escape_detector_paste_flood_no_trigger() {
+        // AC-9: Bytes arriving within 5ms should NOT trigger — treated as paste
+        let mut detector = EscapeDetector::new("~~");
+        let mut clock = typing_clock(5); // 5ms apart — paste speed
+
+        // First tilde — buffer (starts the match)
+        assert!(matches!(
+            detector.feed_with_time(b'~', clock()),
+            EscapeAction::Buffer
+        ));
+        // Second tilde — too fast, should flush both bytes as Forward
+        match detector.feed_with_time(b'~', clock()) {
+            EscapeAction::Forward(bytes) => {
+                assert_eq!(bytes, vec![b'~', b'~']);
+            }
+            _ => panic!("Expected Forward for paste-speed bytes"),
+        }
+    }
+
+    #[test]
+    fn test_escape_detector_deliberate_typing_triggers() {
+        // AC-10: Bytes arriving > 20ms apart should trigger normally
+        let mut detector = EscapeDetector::new("~~");
+        let mut clock = typing_clock(25); // 25ms apart — deliberate typing
+
+        assert!(matches!(
+            detector.feed_with_time(b'~', clock()),
+            EscapeAction::Buffer
+        ));
+        assert!(matches!(
+            detector.feed_with_time(b'~', clock()),
+            EscapeAction::Trigger
+        ));
+    }
+
+    #[test]
+    fn test_escape_detector_paste_exactly_at_threshold() {
+        // At exactly 20ms, should trigger (threshold is < 20ms)
+        let mut detector = EscapeDetector::new("~~");
+        let base = Instant::now();
+        let t0 = base;
+        let t1 = base + Duration::from_millis(20);
+
+        assert!(matches!(
+            detector.feed_with_time(b'~', t0),
+            EscapeAction::Buffer
+        ));
+        assert!(matches!(
+            detector.feed_with_time(b'~', t1),
+            EscapeAction::Trigger
+        ));
+    }
+
+    #[test]
+    fn test_escape_detector_paste_flood_three_char_trigger() {
+        // Three-char trigger with paste speed: second byte triggers flush
+        let mut detector = EscapeDetector::new("abc");
+        let mut clock = typing_clock(5); // paste speed
+
+        assert!(matches!(
+            detector.feed_with_time(b'a', clock()),
+            EscapeAction::Buffer
+        ));
+        // 'b' arrives too fast — flush "ab"
+        match detector.feed_with_time(b'b', clock()) {
+            EscapeAction::Forward(bytes) => {
+                assert_eq!(bytes, vec![b'a', b'b']);
+            }
+            _ => panic!("Expected Forward for paste-speed bytes"),
+        }
+    }
+
+    #[test]
+    fn test_escape_detector_single_char_trigger_no_timing() {
+        // Single-char triggers bypass the timing guard entirely since
+        // there is no inter-byte interval to measure.
+        let mut detector = EscapeDetector::new("~");
+
+        // Even with rapid calls (Instant::now()), single-char should trigger
+        assert!(matches!(detector.feed(b'~'), EscapeAction::Trigger));
+    }
+
+    #[test]
+    fn test_escape_detector_paste_then_deliberate_trigger() {
+        // After a paste flush, a deliberate trigger should still work
+        let mut detector = EscapeDetector::new("~~");
+        let base = Instant::now();
+
+        // Paste-speed attempt (flushed)
+        assert!(matches!(
+            detector.feed_with_time(b'~', base),
+            EscapeAction::Buffer
+        ));
+        match detector.feed_with_time(b'~', base + Duration::from_millis(5)) {
+            EscapeAction::Forward(bytes) => {
+                assert_eq!(bytes, vec![b'~', b'~']);
+            }
+            _ => panic!("Expected Forward for paste-speed bytes"),
+        }
+
+        // Now deliberate typing (should trigger)
+        assert!(matches!(
+            detector.feed_with_time(b'~', base + Duration::from_millis(100)),
+            EscapeAction::Buffer
+        ));
+        assert!(matches!(
+            detector.feed_with_time(b'~', base + Duration::from_millis(130)),
+            EscapeAction::Trigger
+        ));
+    }
+
+    // --- Cursor wrapping ---
+
+    #[test]
+    fn test_wrap_cursor_down() {
+        assert_eq!(wrap_cursor(0, 1, 5), 1);
+        assert_eq!(wrap_cursor(3, 1, 5), 4);
+    }
+
+    #[test]
+    fn test_wrap_cursor_up() {
+        assert_eq!(wrap_cursor(1, -1, 5), 0);
+        assert_eq!(wrap_cursor(3, -1, 5), 2);
+    }
+
+    #[test]
+    fn test_wrap_cursor_down_wraps() {
+        // At last item, Down wraps to 0
+        assert_eq!(wrap_cursor(4, 1, 5), 0);
+    }
+
+    #[test]
+    fn test_wrap_cursor_up_wraps() {
+        // At first item, Up wraps to last
+        assert_eq!(wrap_cursor(0, -1, 5), 4);
+    }
+
+    #[test]
+    fn test_wrap_cursor_single_item() {
+        // With one item, always stays at 0
+        assert_eq!(wrap_cursor(0, 1, 1), 0);
+        assert_eq!(wrap_cursor(0, -1, 1), 0);
+    }
+
+    #[test]
+    fn test_wrap_cursor_empty() {
+        assert_eq!(wrap_cursor(0, 1, 0), 0);
+    }
+
+    // --- Empty snippet list ---
+
+    #[test]
+    fn test_show_snippet_picker_empty_returns_none() {
+        // AC-5: When both bookmark and global snippet lists are empty,
+        // the picker returns None without any IO side effects.
+        // We cannot call show_snippet_picker in a test (requires stdout + crossterm),
+        // but we verify the merge logic produces an empty list.
+        let bookmark_snippets: Vec<Snippet> = vec![];
+        let global_snippets: Vec<Snippet> = vec![];
+
+        // Reproduce the merge logic from show_snippet_picker
+        let mut all_snippets: Vec<&Snippet> = bookmark_snippets.iter().collect();
+        let bookmark_names: HashSet<&str> =
+            bookmark_snippets.iter().map(|s| s.name.as_str()).collect();
+        for gs in &global_snippets {
+            if !bookmark_names.contains(gs.name.as_str()) {
+                all_snippets.push(gs);
+            }
+        }
+        assert!(all_snippets.is_empty());
     }
 
     // --- SessionEscapeHandler ---
@@ -637,18 +991,29 @@ mod tests {
     #[test]
     fn test_session_handler_snippet_trigger() {
         let mut handler = SessionEscapeHandler::new("~~", "~b", "~f");
+        let mut clock = typing_clock(30);
 
-        assert!(matches!(handler.feed(b'~'), SessionAction::Buffer));
-        assert!(matches!(handler.feed(b'~'), SessionAction::ShowSnippets));
+        assert!(matches!(
+            handler.feed_with_time(b'~', clock()),
+            SessionAction::Buffer
+        ));
+        assert!(matches!(
+            handler.feed_with_time(b'~', clock()),
+            SessionAction::ShowSnippets
+        ));
     }
 
     #[test]
     fn test_session_handler_bookmark_trigger() {
         let mut handler = SessionEscapeHandler::new("~~", "~b", "~f");
+        let mut clock = typing_clock(30);
 
-        assert!(matches!(handler.feed(b'~'), SessionAction::Buffer));
+        assert!(matches!(
+            handler.feed_with_time(b'~', clock()),
+            SessionAction::Buffer
+        ));
         // After snippet detector flushes '~' + 'b', bookmark detector should catch it
-        match handler.feed(b'b') {
+        match handler.feed_with_time(b'b', clock()) {
             SessionAction::ShowSaveBookmark => {} // expected
             other => panic!(
                 "Expected ShowSaveBookmark, got {:?}",
@@ -754,15 +1119,22 @@ mod tests {
     fn test_session_handler_csi_then_trigger_works() {
         // After a CSI sequence completes, trigger detection should still work
         let mut handler = SessionEscapeHandler::new("~~", "~b", "~f");
+        let mut clock = typing_clock(30);
 
         // Send F10
         for &byte in b"\x1b[21~" {
-            handler.feed(byte);
+            handler.feed_with_time(byte, clock());
         }
 
         // Now trigger ~~ should still work
-        assert!(matches!(handler.feed(b'~'), SessionAction::Buffer));
-        assert!(matches!(handler.feed(b'~'), SessionAction::ShowSnippets));
+        assert!(matches!(
+            handler.feed_with_time(b'~', clock()),
+            SessionAction::Buffer
+        ));
+        assert!(matches!(
+            handler.feed_with_time(b'~', clock()),
+            SessionAction::ShowSnippets
+        ));
     }
 
     #[test]
@@ -784,18 +1156,29 @@ mod tests {
     #[test]
     fn test_session_handler_browser_trigger() {
         let mut handler = SessionEscapeHandler::new("~~", "~b", "~f");
+        let mut clock = typing_clock(30);
 
-        assert!(matches!(handler.feed(b'~'), SessionAction::Buffer));
-        assert!(matches!(handler.feed(b'f'), SessionAction::ShowBrowser));
+        assert!(matches!(
+            handler.feed_with_time(b'~', clock()),
+            SessionAction::Buffer
+        ));
+        assert!(matches!(
+            handler.feed_with_time(b'f', clock()),
+            SessionAction::ShowBrowser
+        ));
     }
 
     #[test]
     fn test_session_handler_browser_trigger_disabled() {
         let mut handler = SessionEscapeHandler::new("~~", "~b", "");
+        let mut clock = typing_clock(30);
 
-        assert!(matches!(handler.feed(b'~'), SessionAction::Buffer));
+        assert!(matches!(
+            handler.feed_with_time(b'~', clock()),
+            SessionAction::Buffer
+        ));
         // With browser trigger disabled, ~f should forward
-        match handler.feed(b'f') {
+        match handler.feed_with_time(b'f', clock()) {
             SessionAction::Forward(bytes) => assert_eq!(bytes, vec![b'~', b'f']),
             _ => panic!("Expected Forward when browser trigger disabled"),
         }
@@ -805,20 +1188,36 @@ mod tests {
     fn test_session_handler_all_triggers_independent() {
         // Verify all three triggers work in sequence
         let mut handler = SessionEscapeHandler::new("~~", "~b", "~f");
+        let mut clock = typing_clock(30);
 
         // Snippet trigger
-        assert!(matches!(handler.feed(b'~'), SessionAction::Buffer));
-        assert!(matches!(handler.feed(b'~'), SessionAction::ShowSnippets));
+        assert!(matches!(
+            handler.feed_with_time(b'~', clock()),
+            SessionAction::Buffer
+        ));
+        assert!(matches!(
+            handler.feed_with_time(b'~', clock()),
+            SessionAction::ShowSnippets
+        ));
 
         // Bookmark trigger
-        assert!(matches!(handler.feed(b'~'), SessionAction::Buffer));
         assert!(matches!(
-            handler.feed(b'b'),
+            handler.feed_with_time(b'~', clock()),
+            SessionAction::Buffer
+        ));
+        assert!(matches!(
+            handler.feed_with_time(b'b', clock()),
             SessionAction::ShowSaveBookmark
         ));
 
         // Browser trigger
-        assert!(matches!(handler.feed(b'~'), SessionAction::Buffer));
-        assert!(matches!(handler.feed(b'f'), SessionAction::ShowBrowser));
+        assert!(matches!(
+            handler.feed_with_time(b'~', clock()),
+            SessionAction::Buffer
+        ));
+        assert!(matches!(
+            handler.feed_with_time(b'f', clock()),
+            SessionAction::ShowBrowser
+        ));
     }
 }

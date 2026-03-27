@@ -1426,6 +1426,11 @@ async fn run_proxy_loop(
                                     }
                                 }
                                 SessionAction::ShowSnippets => {
+                                    // Guard: skip picker entirely when no snippets exist
+                                    // to avoid any UI flash or stdin reads.
+                                    if !has_snippets {
+                                        continue;
+                                    }
                                     if !forward_batch.is_empty() {
                                         let _ = tokio::io::AsyncWriteExt::write_all(&mut writer, &forward_batch).await;
                                         forward_batch.clear();

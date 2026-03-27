@@ -24,7 +24,7 @@ use crate::ssh;
 use crate::tui::theme::{ThemeColors, resolve_theme};
 use crate::tui::views::browser::truncate_name;
 use crate::tui::views::confirm::ConfirmState;
-use crate::tui::views::form::FormState;
+use crate::tui::views::form::{FIELD_ENV, FIELD_PROFILE, FormState};
 use crate::tui::views::{confirm, form, help, import_wizard, list};
 use crate::tui::widgets::{search_bar, status_bar};
 
@@ -614,10 +614,10 @@ fn handle_form_key(app: &mut App, key: KeyEvent) {
         }
         KeyCode::Tab | KeyCode::Down => form.next_field(),
         KeyCode::BackTab | KeyCode::Up => form.prev_field(),
-        KeyCode::Left if form.focused == 4 => form.cycle_env_left(),
-        KeyCode::Right if form.focused == 4 => form.cycle_env_right(),
-        KeyCode::Left if form.focused == 11 => form.cycle_profile_left(),
-        KeyCode::Right if form.focused == 11 => form.cycle_profile_right(),
+        KeyCode::Left if form.focused == FIELD_ENV => form.cycle_env_left(),
+        KeyCode::Right if form.focused == FIELD_ENV => form.cycle_env_right(),
+        KeyCode::Left if form.focused == FIELD_PROFILE => form.cycle_profile_left(),
+        KeyCode::Right if form.focused == FIELD_PROFILE => form.cycle_profile_right(),
         KeyCode::Backspace => form.delete_char(),
         KeyCode::Enter => {
             // Attempt to save

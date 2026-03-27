@@ -266,28 +266,34 @@ impl Bookmark {
     /// Resolve the effective identity file path: bookmark -> profile.
     /// Returns `None` if neither bookmark nor profile specifies an identity file.
     pub fn effective_identity_file(&self, profiles: &[Profile]) -> Option<String> {
-        let profile = self.resolve_profile(profiles);
-        self.identity_file
-            .clone()
-            .or_else(|| profile.and_then(|p| p.identity_file.clone()))
+        self.profile_field(profiles, |p| p.identity_file.clone(), &self.identity_file)
     }
 
     /// Resolve the effective proxy jump host: bookmark -> profile.
     /// Returns `None` if neither bookmark nor profile specifies a proxy jump.
     pub fn effective_proxy_jump(&self, profiles: &[Profile]) -> Option<String> {
-        let profile = self.resolve_profile(profiles);
-        self.proxy_jump
-            .clone()
-            .or_else(|| profile.and_then(|p| p.proxy_jump.clone()))
+        self.profile_field(profiles, |p| p.proxy_jump.clone(), &self.proxy_jump)
     }
 
     /// Resolve the effective on_connect command: bookmark -> profile.
     /// Returns `None` if neither bookmark nor profile specifies an on_connect command.
     pub fn effective_on_connect(&self, profiles: &[Profile]) -> Option<String> {
-        let profile = self.resolve_profile(profiles);
-        self.on_connect
+        self.profile_field(profiles, |p| p.on_connect.clone(), &self.on_connect)
+    }
+
+    /// Resolve a two-layer optional field: bookmark value wins, profile value is fallback.
+    fn profile_field<T>(
+        &self,
+        profiles: &[Profile],
+        extract: impl Fn(&Profile) -> Option<T>,
+        bookmark_value: &Option<T>,
+    ) -> Option<T>
+    where
+        T: Clone,
+    {
+        bookmark_value
             .clone()
-            .or_else(|| profile.and_then(|p| p.on_connect.clone()))
+            .or_else(|| self.resolve_profile(profiles).and_then(extract))
     }
 
     /// Resolve the effective connection timeout: bookmark -> profile -> settings -> default.

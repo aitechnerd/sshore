@@ -33,14 +33,14 @@ const FIELD_NAME: usize = 0;
 const FIELD_HOST: usize = 1;
 const FIELD_USER: usize = 2;
 const FIELD_PORT: usize = 3;
-const FIELD_ENV: usize = 4;
+pub(crate) const FIELD_ENV: usize = 4;
 const FIELD_TAGS: usize = 5;
 const FIELD_IDENTITY: usize = 6;
 const FIELD_PROXY: usize = 7;
 const FIELD_NOTES: usize = 8;
 const FIELD_ON_CONNECT: usize = 9;
 const FIELD_PASSWORD: usize = 10;
-const FIELD_PROFILE: usize = 11;
+pub(crate) const FIELD_PROFILE: usize = 11;
 
 /// Form state for add/edit bookmark.
 pub struct FormState {

@@ -16,7 +16,7 @@ use crate::tui::theme::ThemeColors;
 use crate::tui::widgets::env_badge;
 
 /// Number of editable fields in the form.
-const FIELD_COUNT: usize = 11;
+const FIELD_COUNT: usize = 12;
 
 /// Environment options for the cycle selector.
 const ENV_OPTIONS: &[&str] = &[
@@ -40,12 +40,17 @@ const FIELD_PROXY: usize = 7;
 const FIELD_NOTES: usize = 8;
 const FIELD_ON_CONNECT: usize = 9;
 const FIELD_PASSWORD: usize = 10;
+const FIELD_PROFILE: usize = 11;
 
 /// Form state for add/edit bookmark.
 pub struct FormState {
     pub fields: [String; FIELD_COUNT],
     pub focused: usize,
     pub env_index: usize,
+    /// Index into `profile_options` for the profile cycle selector.
+    pub profile_index: usize,
+    /// Dynamic list of profile options: ["(none)", "profile-a", "profile-b", ...].
+    pub profile_options: Vec<String>,
     pub is_edit: bool,
     /// Original bookmark name (for edit mode uniqueness check).
     pub original_name: Option<String>,
@@ -59,17 +64,21 @@ pub struct FormState {
 
 impl FormState {
     /// Create a blank form for adding a new bookmark.
-    pub fn new_add(settings: &Settings) -> Self {
+    pub fn new_add(settings: &Settings, profile_names: &[String]) -> Self {
         let mut fields = std::array::from_fn(|_| String::new());
         fields[FIELD_PORT] = "22".to_string();
         if let Some(ref user) = settings.default_user {
             fields[FIELD_USER] = user.clone();
         }
 
+        let profile_options = build_profile_options(profile_names);
+
         Self {
             fields,
             focused: FIELD_NAME,
-            env_index: 0, // (none)
+            env_index: 0,     // (none)
+            profile_index: 0, // (none)
+            profile_options,
             is_edit: false,
             original_name: None,
             error: None,
@@ -79,7 +88,7 @@ impl FormState {
     }
 
     /// Create a pre-populated form for editing an existing bookmark.
-    pub fn new_edit(bookmark: &Bookmark) -> Self {
+    pub fn new_edit(bookmark: &Bookmark, profile_names: &[String]) -> Self {
         let mut fields = std::array::from_fn(|_| String::new());
         fields[FIELD_NAME] = bookmark.name.clone();
         fields[FIELD_HOST] = bookmark.host.clone();
@@ -97,6 +106,16 @@ impl FormState {
             .position(|&e| e == bookmark.env)
             .unwrap_or(0);
 
+        let profile_options = build_profile_options(profile_names);
+
+        // Find the bookmark's current profile in the options list.
+        // If the profile was deleted since last edit, fall back to "(none)" (index 0).
+        let profile_index = bookmark
+            .profile
+            .as_ref()
+            .and_then(|p| profile_options.iter().position(|opt| opt == p))
+            .unwrap_or(0);
+
         // Check keychain for stored password (best-effort)
         let has_stored_password = keychain::get_password(&bookmark.name)
             .unwrap_or(None)
@@ -106,6 +125,8 @@ impl FormState {
             fields,
             focused: FIELD_NAME,
             env_index,
+            profile_index,
+            profile_options,
             is_edit: true,
             original_name: Some(bookmark.name.clone()),
             error: None,
@@ -142,9 +163,36 @@ impl FormState {
         }
     }
 
-    /// Insert a character at the current field (except env, which uses cycling).
+    /// Cycle profile selection forward.
+    pub fn cycle_profile_right(&mut self) {
+        if !self.profile_options.is_empty() {
+            self.profile_index = (self.profile_index + 1) % self.profile_options.len();
+        }
+    }
+
+    /// Cycle profile selection backward.
+    pub fn cycle_profile_left(&mut self) {
+        if !self.profile_options.is_empty() {
+            if self.profile_index == 0 {
+                self.profile_index = self.profile_options.len() - 1;
+            } else {
+                self.profile_index -= 1;
+            }
+        }
+    }
+
+    /// Get the selected profile name, or None if "(none)" is selected.
+    pub fn selected_profile(&self) -> Option<&str> {
+        if self.profile_index == 0 {
+            None
+        } else {
+            Some(&self.profile_options[self.profile_index])
+        }
+    }
+
+    /// Insert a character at the current field (except env and profile, which use cycling).
     pub fn insert_char(&mut self, c: char) {
-        if self.focused == FIELD_ENV {
+        if self.focused == FIELD_ENV || self.focused == FIELD_PROFILE {
             return;
         }
         self.fields[self.focused].push(c);
@@ -162,7 +210,7 @@ impl FormState {
 
     /// Delete last character from the current field.
     pub fn delete_char(&mut self) {
-        if self.focused == FIELD_ENV {
+        if self.focused == FIELD_ENV || self.focused == FIELD_PROFILE {
             return;
         }
         self.fields[self.focused].pop();
@@ -250,6 +298,7 @@ impl FormState {
         let notes = non_empty_option(&self.fields[FIELD_NOTES]);
         let on_connect = non_empty_option(&self.fields[FIELD_ON_CONNECT]);
         let env = self.selected_env().to_string();
+        let profile = self.selected_profile().map(|s| s.to_string());
 
         Ok(Bookmark {
             name,
@@ -267,9 +316,17 @@ impl FormState {
             snippets: vec![],
             connect_timeout_secs: None,
             ssh_options: std::collections::HashMap::new(),
-            profile: None,
+            profile,
         })
     }
+}
+
+/// Build the profile options list: ["(none)", "profile-a", "profile-b", ...].
+fn build_profile_options(profile_names: &[String]) -> Vec<String> {
+    let mut options = Vec::with_capacity(profile_names.len() + 1);
+    options.push("(none)".to_string());
+    options.extend(profile_names.iter().cloned());
+    options
 }
 
 /// Convert a trimmed string to Option (None if empty).
@@ -334,6 +391,7 @@ pub fn render_form(
         "Notes",
         "On-Connect",
         "Password",
+        "Profile",
     ];
 
     for (i, &label) in field_labels.iter().enumerate() {
@@ -421,11 +479,13 @@ fn render_field(
     let label_line = Line::from(Span::styled(format!("  {label}{marker}"), label_style));
     frame.render_widget(Paragraph::new(label_line), label_area);
 
-    // Input value — special cases for env and password fields
+    // Input value — special cases for env, password, and profile fields
     if field_idx == FIELD_ENV {
         render_env_selector(frame, input_area, state, settings, is_focused, tc);
     } else if field_idx == FIELD_PASSWORD {
         render_password_field(frame, input_area, state, is_focused, tc);
+    } else if field_idx == FIELD_PROFILE {
+        render_profile_selector(frame, input_area, state, is_focused, tc);
     } else {
         let cursor = if is_focused { "_" } else { "" };
         let value = &state.fields[field_idx];
@@ -484,6 +544,41 @@ fn render_env_selector(
                 spans.push(span);
             }
         }
+        spans.push(Span::raw(" "));
+    }
+
+    if is_focused {
+        spans.push(Span::styled(
+            " \u{2190}/\u{2192} to cycle",
+            Style::default().fg(tc.fg_muted),
+        ));
+    }
+
+    let line = Line::from(spans);
+    frame.render_widget(Paragraph::new(line), area);
+}
+
+/// Render the profile cycle selector as text labels.
+fn render_profile_selector(
+    frame: &mut Frame,
+    area: Rect,
+    state: &FormState,
+    is_focused: bool,
+    tc: &ThemeColors,
+) {
+    let mut spans: Vec<Span> = vec![Span::raw(if is_focused { "  > " } else { "    " })];
+
+    for (i, option) in state.profile_options.iter().enumerate() {
+        let is_selected = i == state.profile_index;
+
+        let style = if is_selected {
+            Style::default()
+                .fg(tc.fg)
+                .add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
+        } else {
+            Style::default().fg(tc.fg_muted)
+        };
+        spans.push(Span::styled(option.clone(), style));
         spans.push(Span::raw(" "));
     }
 
@@ -600,12 +695,14 @@ mod tests {
             default_user: Some("admin".into()),
             ..Settings::default()
         };
-        let form = FormState::new_add(&settings);
+        let form = FormState::new_add(&settings, &[]);
         assert!(!form.is_edit);
         assert_eq!(form.focused, FIELD_NAME);
         assert_eq!(form.fields[FIELD_PORT], "22");
         assert_eq!(form.fields[FIELD_USER], "admin");
         assert_eq!(form.env_index, 0); // (none)
+        assert_eq!(form.profile_index, 0); // (none)
+        assert_eq!(form.profile_options, vec!["(none)"]);
         assert!(!form.has_stored_password);
         assert!(!form.password_modified);
         assert!(form.password().is_empty());
@@ -614,7 +711,7 @@ mod tests {
     #[test]
     fn test_new_edit_form_populates() {
         let bookmark = sample_bookmark();
-        let form = FormState::new_edit(&bookmark);
+        let form = FormState::new_edit(&bookmark, &[]);
         assert!(form.is_edit);
         assert_eq!(form.fields[FIELD_NAME], "prod-web-01");
         assert_eq!(form.fields[FIELD_HOST], "10.0.1.5");
@@ -633,7 +730,7 @@ mod tests {
     #[test]
     fn test_field_navigation() {
         let settings = Settings::default();
-        let mut form = FormState::new_add(&settings);
+        let mut form = FormState::new_add(&settings, &[]);
         assert_eq!(form.focused, 0);
 
         form.next_field();
@@ -660,7 +757,7 @@ mod tests {
     #[test]
     fn test_env_cycling() {
         let settings = Settings::default();
-        let mut form = FormState::new_add(&settings);
+        let mut form = FormState::new_add(&settings, &[]);
         assert_eq!(form.env_index, 0);
 
         form.cycle_env_right();
@@ -682,7 +779,7 @@ mod tests {
     #[test]
     fn test_char_insert_and_delete() {
         let settings = Settings::default();
-        let mut form = FormState::new_add(&settings);
+        let mut form = FormState::new_add(&settings, &[]);
         form.focused = FIELD_NAME;
 
         form.insert_char('a');
@@ -696,7 +793,7 @@ mod tests {
     #[test]
     fn test_env_field_ignores_typing() {
         let settings = Settings::default();
-        let mut form = FormState::new_add(&settings);
+        let mut form = FormState::new_add(&settings, &[]);
         form.focused = FIELD_ENV;
 
         form.insert_char('x');
@@ -710,7 +807,7 @@ mod tests {
     fn test_validate_and_build_success() {
         let config = AppConfig::default();
         let settings = Settings::default();
-        let mut form = FormState::new_add(&settings);
+        let mut form = FormState::new_add(&settings, &[]);
         form.fields[FIELD_NAME] = "test-server".into();
         form.fields[FIELD_HOST] = "10.0.1.5".into();
         form.fields[FIELD_PORT] = "2222".into();
@@ -730,7 +827,7 @@ mod tests {
     fn test_validate_empty_name_fails() {
         let config = AppConfig::default();
         let settings = Settings::default();
-        let mut form = FormState::new_add(&settings);
+        let mut form = FormState::new_add(&settings, &[]);
         form.fields[FIELD_HOST] = "10.0.1.5".into();
 
         let result = form.validate_and_build(&config);
@@ -741,7 +838,7 @@ mod tests {
     fn test_validate_empty_host_fails() {
         let config = AppConfig::default();
         let settings = Settings::default();
-        let mut form = FormState::new_add(&settings);
+        let mut form = FormState::new_add(&settings, &[]);
         form.fields[FIELD_NAME] = "test".into();
 
         let result = form.validate_and_build(&config);
@@ -752,7 +849,7 @@ mod tests {
     fn test_validate_invalid_port_fails() {
         let config = AppConfig::default();
         let settings = Settings::default();
-        let mut form = FormState::new_add(&settings);
+        let mut form = FormState::new_add(&settings, &[]);
         form.fields[FIELD_NAME] = "test".into();
         form.fields[FIELD_HOST] = "10.0.1.5".into();
         form.fields[FIELD_PORT] = "abc".into();
@@ -765,7 +862,7 @@ mod tests {
     fn test_validate_duplicate_name_fails() {
         let config = sample_config();
         let settings = Settings::default();
-        let mut form = FormState::new_add(&settings);
+        let mut form = FormState::new_add(&settings, &[]);
         form.fields[FIELD_NAME] = "prod-web-01".into();
         form.fields[FIELD_HOST] = "10.0.1.5".into();
 
@@ -778,7 +875,7 @@ mod tests {
     fn test_validate_edit_same_name_succeeds() {
         let config = sample_config();
         let bookmark = sample_bookmark();
-        let mut form = FormState::new_edit(&bookmark);
+        let mut form = FormState::new_edit(&bookmark, &[]);
 
         let result = form.validate_and_build(&config);
         assert!(result.is_ok());
@@ -794,7 +891,7 @@ mod tests {
         });
 
         let bookmark = sample_bookmark();
-        let mut form = FormState::new_edit(&bookmark);
+        let mut form = FormState::new_edit(&bookmark, &[]);
         form.fields[FIELD_NAME] = "other-server".into();
 
         let result = form.validate_and_build(&config);
@@ -805,7 +902,7 @@ mod tests {
     fn test_validate_shell_metachar_in_host_fails() {
         let config = AppConfig::default();
         let settings = Settings::default();
-        let mut form = FormState::new_add(&settings);
+        let mut form = FormState::new_add(&settings, &[]);
         form.fields[FIELD_NAME] = "test".into();
         form.fields[FIELD_HOST] = "host;evil".into();
 
@@ -816,7 +913,7 @@ mod tests {
     #[test]
     fn test_auto_detect_env_on_name_input() {
         let settings = Settings::default();
-        let mut form = FormState::new_add(&settings);
+        let mut form = FormState::new_add(&settings, &[]);
         form.focused = FIELD_NAME;
         for c in "prod-web".chars() {
             form.insert_char(c);
@@ -835,7 +932,7 @@ mod tests {
     #[test]
     fn test_password_field_masking_and_tracking() {
         let settings = Settings::default();
-        let mut form = FormState::new_add(&settings);
+        let mut form = FormState::new_add(&settings, &[]);
         form.focused = FIELD_PASSWORD;
 
         // Initially not modified
@@ -857,7 +954,7 @@ mod tests {
     #[test]
     fn test_password_field_clearing_marks_modified() {
         let settings = Settings::default();
-        let mut form = FormState::new_add(&settings);
+        let mut form = FormState::new_add(&settings, &[]);
         form.has_stored_password = true; // Simulate stored password
         form.focused = FIELD_PASSWORD;
 
@@ -872,12 +969,119 @@ mod tests {
     fn test_validate_port_zero_fails() {
         let config = AppConfig::default();
         let settings = Settings::default();
-        let mut form = FormState::new_add(&settings);
+        let mut form = FormState::new_add(&settings, &[]);
         form.fields[FIELD_NAME] = "test".into();
         form.fields[FIELD_HOST] = "10.0.1.5".into();
         form.fields[FIELD_PORT] = "0".into();
 
         let result = form.validate_and_build(&config);
         assert!(result.is_err());
+    }
+
+    // --- Profile selector tests (Phase 5) ---
+
+    #[test]
+    fn test_profile_cycling() {
+        let settings = Settings::default();
+        let profiles = vec!["corp-bastion".to_string(), "dev-tunnel".to_string()];
+        let mut form = FormState::new_add(&settings, &profiles);
+
+        assert_eq!(form.profile_index, 0);
+        assert!(form.selected_profile().is_none());
+
+        form.cycle_profile_right();
+        assert_eq!(form.selected_profile(), Some("corp-bastion"));
+
+        form.cycle_profile_right();
+        assert_eq!(form.selected_profile(), Some("dev-tunnel"));
+
+        // Wraps around
+        form.cycle_profile_right();
+        assert_eq!(form.profile_index, 0);
+        assert!(form.selected_profile().is_none());
+
+        // Left from 0 wraps to end
+        form.cycle_profile_left();
+        assert_eq!(form.selected_profile(), Some("dev-tunnel"));
+    }
+
+    #[test]
+    fn test_profile_field_ignores_typing() {
+        let settings = Settings::default();
+        let profiles = vec!["ops".to_string()];
+        let mut form = FormState::new_add(&settings, &profiles);
+        form.focused = FIELD_PROFILE;
+
+        form.insert_char('x');
+        assert_eq!(form.fields[FIELD_PROFILE], "");
+
+        form.delete_char();
+        assert_eq!(form.fields[FIELD_PROFILE], "");
+    }
+
+    #[test]
+    fn test_new_edit_form_populates_profile() {
+        let profiles = vec!["ops".to_string(), "dev".to_string()];
+        let mut bookmark = sample_bookmark();
+        bookmark.profile = Some("dev".to_string());
+
+        let form = FormState::new_edit(&bookmark, &profiles);
+        assert_eq!(form.profile_index, 2); // index 0=(none), 1=ops, 2=dev
+        assert_eq!(form.selected_profile(), Some("dev"));
+    }
+
+    #[test]
+    fn test_new_edit_form_deleted_profile_falls_back_to_none() {
+        let profiles = vec!["ops".to_string()];
+        let mut bookmark = sample_bookmark();
+        bookmark.profile = Some("deleted-profile".to_string());
+
+        let form = FormState::new_edit(&bookmark, &profiles);
+        assert_eq!(form.profile_index, 0); // Falls back to (none)
+        assert!(form.selected_profile().is_none());
+    }
+
+    #[test]
+    fn test_validate_and_build_with_profile() {
+        let config = AppConfig::default();
+        let settings = Settings::default();
+        let profiles = vec!["corp-bastion".to_string()];
+        let mut form = FormState::new_add(&settings, &profiles);
+        form.fields[FIELD_NAME] = "test-server".into();
+        form.fields[FIELD_HOST] = "10.0.1.5".into();
+        form.profile_index = 1; // "corp-bastion"
+
+        let bookmark = form.validate_and_build(&config).unwrap();
+        assert_eq!(bookmark.profile, Some("corp-bastion".to_string()));
+    }
+
+    #[test]
+    fn test_validate_and_build_no_profile() {
+        let config = AppConfig::default();
+        let settings = Settings::default();
+        let profiles = vec!["corp-bastion".to_string()];
+        let mut form = FormState::new_add(&settings, &profiles);
+        form.fields[FIELD_NAME] = "test-server".into();
+        form.fields[FIELD_HOST] = "10.0.1.5".into();
+        // profile_index stays 0 = (none)
+
+        let bookmark = form.validate_and_build(&config).unwrap();
+        assert!(bookmark.profile.is_none());
+    }
+
+    #[test]
+    fn test_profile_options_with_no_profiles() {
+        let settings = Settings::default();
+        let form = FormState::new_add(&settings, &[]);
+        assert_eq!(form.profile_options, vec!["(none)"]);
+        assert_eq!(form.profile_index, 0);
+        assert!(form.selected_profile().is_none());
+    }
+
+    #[test]
+    fn test_build_profile_options() {
+        let names = vec!["alpha".to_string(), "beta".to_string()];
+        let options = build_profile_options(&names);
+        assert_eq!(options, vec!["(none)", "alpha", "beta"]);
     }
 }

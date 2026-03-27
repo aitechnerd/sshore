@@ -563,13 +563,17 @@ fn handle_list_key(app: &mut App, key: KeyEvent) {
             }
         }
         KeyCode::Char('a') => {
-            app.form_state = Some(FormState::new_add(&app.config.settings));
+            let profile_names: Vec<String> =
+                app.config.profiles.iter().map(|p| p.name.clone()).collect();
+            app.form_state = Some(FormState::new_add(&app.config.settings, &profile_names));
             app.screen = Screen::AddForm;
         }
         KeyCode::Char('e') => {
             if let Some(idx) = app.selected_bookmark_index() {
+                let profile_names: Vec<String> =
+                    app.config.profiles.iter().map(|p| p.name.clone()).collect();
                 let bookmark = &app.config.bookmarks[idx];
-                app.form_state = Some(FormState::new_edit(bookmark));
+                app.form_state = Some(FormState::new_edit(bookmark, &profile_names));
                 app.screen = Screen::EditForm(idx);
             }
         }
@@ -612,6 +616,8 @@ fn handle_form_key(app: &mut App, key: KeyEvent) {
         KeyCode::BackTab | KeyCode::Up => form.prev_field(),
         KeyCode::Left if form.focused == 4 => form.cycle_env_left(),
         KeyCode::Right if form.focused == 4 => form.cycle_env_right(),
+        KeyCode::Left if form.focused == 11 => form.cycle_profile_left(),
+        KeyCode::Right if form.focused == 11 => form.cycle_profile_right(),
         KeyCode::Backspace => form.delete_char(),
         KeyCode::Enter => {
             // Attempt to save
@@ -1003,7 +1009,9 @@ mod tests {
     fn test_try_save_form_validation_error_goes_to_status() {
         let mut app = sample_app();
         // Set up a form with invalid data: empty name triggers validation error
-        app.form_state = Some(FormState::new_add(&app.config.settings));
+        let profile_names: Vec<String> =
+            app.config.profiles.iter().map(|p| p.name.clone()).collect();
+        app.form_state = Some(FormState::new_add(&app.config.settings, &profile_names));
         app.screen = Screen::AddForm;
 
         try_save_form(&mut app);
@@ -1029,7 +1037,9 @@ mod tests {
     #[test]
     fn test_open_add_form() {
         let mut app = sample_app();
-        app.form_state = Some(FormState::new_add(&app.config.settings));
+        let profile_names: Vec<String> =
+            app.config.profiles.iter().map(|p| p.name.clone()).collect();
+        app.form_state = Some(FormState::new_add(&app.config.settings, &profile_names));
         app.screen = Screen::AddForm;
         assert!(app.form_state.is_some());
         assert_eq!(app.screen, Screen::AddForm);
@@ -1039,8 +1049,10 @@ mod tests {
     fn test_open_edit_form() {
         let mut app = sample_app();
         if let Some(idx) = app.selected_bookmark_index() {
+            let profile_names: Vec<String> =
+                app.config.profiles.iter().map(|p| p.name.clone()).collect();
             let bookmark = app.config.bookmarks[idx].clone();
-            app.form_state = Some(FormState::new_edit(&bookmark));
+            app.form_state = Some(FormState::new_edit(&bookmark, &profile_names));
             app.screen = Screen::EditForm(idx);
             assert!(app.form_state.is_some());
         }

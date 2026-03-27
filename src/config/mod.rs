@@ -17,7 +17,7 @@ use anyhow::{Context, Result};
 use std::collections::HashSet;
 
 use crate::config::model::{
-    AppConfig, Bookmark, Settings, validate_bookmark_name, validate_hostname,
+    AppConfig, Bookmark, Profile, Settings, validate_bookmark_name, validate_hostname,
 };
 use crate::config::writer::atomic_write;
 
@@ -129,6 +129,9 @@ pub fn load_from(path: &Path) -> Result<AppConfig> {
         }
     };
 
+    validate_profiles(&config.profiles)?;
+    validate_on_connect_fields(&config.profiles, &config.bookmarks)?;
+
     warn_duplicate_names(&config.bookmarks);
     validate_bookmarks(&config.bookmarks);
 
@@ -171,6 +174,75 @@ fn validate_bookmarks(bookmarks: &[Bookmark]) {
             );
         }
     }
+}
+
+/// Maximum allowed length for on_connect commands (bytes).
+const MAX_ON_CONNECT_LEN: usize = 1024;
+
+/// Validate all profiles: reject duplicate names and invalid names.
+///
+/// Unlike bookmark validation (warn-only), profile validation returns hard errors
+/// because profiles are a structural dependency — a duplicate name creates ambiguity
+/// in which profile a bookmark inherits from.
+fn validate_profiles(profiles: &[Profile]) -> Result<()> {
+    let mut seen = HashSet::new();
+    for p in profiles {
+        if validate_bookmark_name(&p.name).is_err() {
+            anyhow::bail!(
+                "Profile has invalid name '{}' (allowed: alphanumeric, -, _, .)",
+                sanitize_for_display(&p.name)
+            );
+        }
+        if !seen.insert(&p.name) {
+            anyhow::bail!("Duplicate profile name '{}'", sanitize_for_display(&p.name));
+        }
+    }
+    Ok(())
+}
+
+/// Validate an on_connect command string.
+///
+/// Rejects values containing ANSI escape sequences (`\x1b`) that could corrupt
+/// the local terminal, and enforces a maximum length to prevent abuse.
+/// Legitimate shell metacharacters (`;`, `|`, `&&`) are allowed — the command
+/// runs remotely.
+fn validate_on_connect(cmd: &str, context: &str) -> Result<()> {
+    if cmd.len() > MAX_ON_CONNECT_LEN {
+        anyhow::bail!(
+            "{} on_connect command exceeds maximum length of {} bytes (actual: {} bytes)",
+            context,
+            MAX_ON_CONNECT_LEN,
+            cmd.len()
+        );
+    }
+    if cmd.contains('\x1b') {
+        anyhow::bail!(
+            "{} on_connect command must not contain escape sequences",
+            context
+        );
+    }
+    Ok(())
+}
+
+/// Validate on_connect fields across all profiles and bookmarks.
+///
+/// Returns a hard error if any on_connect value contains escape sequences or
+/// exceeds the maximum length.
+fn validate_on_connect_fields(profiles: &[Profile], bookmarks: &[Bookmark]) -> Result<()> {
+    for p in profiles {
+        if let Some(ref cmd) = p.on_connect {
+            validate_on_connect(cmd, &format!("Profile '{}'", sanitize_for_display(&p.name)))?;
+        }
+    }
+    for b in bookmarks {
+        if let Some(ref cmd) = b.on_connect {
+            validate_on_connect(
+                cmd,
+                &format!("Bookmark '{}'", sanitize_for_display(&b.name)),
+            )?;
+        }
+    }
+    Ok(())
 }
 
 /// Sanitize a string for safe terminal display.
@@ -899,5 +971,298 @@ connect_count = 0
     fn test_sanitize_for_display_passes_clean_strings() {
         let input = "normal-hostname.example.com";
         assert_eq!(sanitize_for_display(input), input);
+    }
+
+    // --- Phase 2: Profile Validation tests ---
+
+    #[test]
+    fn test_validate_profiles_valid() {
+        let profiles = vec![
+            model::Profile {
+                name: "corp-bastion".into(),
+                ..Default::default()
+            },
+            model::Profile {
+                name: "dev-tunnel".into(),
+                ..Default::default()
+            },
+        ];
+        assert!(validate_profiles(&profiles).is_ok());
+    }
+
+    #[test]
+    fn test_validate_profiles_empty_is_valid() {
+        assert!(validate_profiles(&[]).is_ok());
+    }
+
+    #[test]
+    fn test_validate_profiles_duplicate_names_rejected() {
+        let profiles = vec![
+            model::Profile {
+                name: "ops".into(),
+                ..Default::default()
+            },
+            model::Profile {
+                name: "ops".into(),
+                ..Default::default()
+            },
+        ];
+        let err = validate_profiles(&profiles).unwrap_err();
+        assert!(
+            err.to_string().contains("Duplicate profile name"),
+            "expected duplicate error, got: {err}"
+        );
+        assert!(err.to_string().contains("ops"));
+    }
+
+    #[test]
+    fn test_validate_profiles_invalid_name_with_spaces() {
+        let profiles = vec![model::Profile {
+            name: "my profile".into(),
+            ..Default::default()
+        }];
+        let err = validate_profiles(&profiles).unwrap_err();
+        assert!(
+            err.to_string().contains("invalid name"),
+            "expected invalid name error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_validate_profiles_invalid_name_special_chars() {
+        let profiles = vec![model::Profile {
+            name: "corp@bastion".into(),
+            ..Default::default()
+        }];
+        let err = validate_profiles(&profiles).unwrap_err();
+        assert!(
+            err.to_string().contains("invalid name"),
+            "expected invalid name error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_validate_profiles_empty_name_rejected() {
+        let profiles = vec![model::Profile {
+            name: "".into(),
+            ..Default::default()
+        }];
+        let err = validate_profiles(&profiles).unwrap_err();
+        assert!(
+            err.to_string().contains("invalid name"),
+            "expected invalid name error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_load_rejects_duplicate_profile_names() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let raw_toml = r#"
+[settings]
+
+[[profiles]]
+name = "ops"
+
+[[profiles]]
+name = "ops"
+
+[[bookmarks]]
+name = "test"
+host = "10.0.1.5"
+"#;
+        std::fs::write(&path, raw_toml).unwrap();
+
+        let result = load_from(&path);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("Duplicate profile name"),
+            "expected duplicate profile error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_load_rejects_invalid_profile_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let raw_toml = r#"
+[settings]
+
+[[profiles]]
+name = "my profile with spaces"
+
+[[bookmarks]]
+name = "test"
+host = "10.0.1.5"
+"#;
+        std::fs::write(&path, raw_toml).unwrap();
+
+        let result = load_from(&path);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("invalid name"),
+            "expected invalid name error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_load_valid_profiles_succeeds() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let raw_toml = r#"
+[settings]
+
+[[profiles]]
+name = "corp-bastion"
+user = "deploy"
+
+[[profiles]]
+name = "dev-tunnel"
+
+[[bookmarks]]
+name = "test"
+host = "10.0.1.5"
+profile = "corp-bastion"
+"#;
+        std::fs::write(&path, raw_toml).unwrap();
+
+        let config = load_from(&path).unwrap();
+        assert_eq!(config.profiles.len(), 2);
+        assert_eq!(config.bookmarks[0].profile, Some("corp-bastion".into()));
+    }
+
+    // --- on_connect validation tests ---
+
+    #[test]
+    fn test_validate_on_connect_valid() {
+        assert!(validate_on_connect("cd /app && exec $SHELL", "Test").is_ok());
+        assert!(validate_on_connect("echo hello | grep h", "Test").is_ok());
+        assert!(validate_on_connect("uptime; df -h", "Test").is_ok());
+    }
+
+    #[test]
+    fn test_validate_on_connect_rejects_escape_sequences() {
+        let cmd = "echo \x1b[31mred\x1b[0m";
+        let err = validate_on_connect(cmd, "Test").unwrap_err();
+        assert!(
+            err.to_string().contains("escape sequences"),
+            "expected escape sequence error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_validate_on_connect_rejects_over_max_length() {
+        let cmd = "a".repeat(MAX_ON_CONNECT_LEN + 1);
+        let err = validate_on_connect(&cmd, "Test").unwrap_err();
+        assert!(
+            err.to_string().contains("exceeds maximum length"),
+            "expected length error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_validate_on_connect_at_max_length_ok() {
+        let cmd = "a".repeat(MAX_ON_CONNECT_LEN);
+        assert!(validate_on_connect(&cmd, "Test").is_ok());
+    }
+
+    #[test]
+    fn test_load_rejects_profile_on_connect_with_escape() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        // TOML \u001b is the ESC character — parsed by serde into \x1b
+        let raw_toml = "[settings]\n\n[[profiles]]\nname = \"ops\"\non_connect = \"echo \\u001b[31mred\"\n\n[[bookmarks]]\nname = \"test\"\nhost = \"10.0.1.5\"\n";
+        std::fs::write(&path, raw_toml).unwrap();
+
+        let result = load_from(&path);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("escape sequences"),
+            "expected escape sequence error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_load_rejects_bookmark_on_connect_with_escape() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let raw_toml = "[settings]\n\n[[bookmarks]]\nname = \"test\"\nhost = \"10.0.1.5\"\non_connect = \"echo \\u001b[31mred\"\n";
+        std::fs::write(&path, raw_toml).unwrap();
+
+        let result = load_from(&path);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("escape sequences"),
+            "expected escape sequence error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_load_rejects_bookmark_on_connect_over_max_length() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let long_cmd = "a".repeat(MAX_ON_CONNECT_LEN + 1);
+        let raw_toml = format!(
+            "[settings]\n\n[[bookmarks]]\nname = \"test\"\nhost = \"10.0.1.5\"\non_connect = \"{}\"\n",
+            long_cmd
+        );
+        std::fs::write(&path, &raw_toml).unwrap();
+
+        let result = load_from(&path);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("exceeds maximum length"),
+            "expected length error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_validate_on_connect_fields_valid_config() {
+        let profiles = vec![model::Profile {
+            name: "ops".into(),
+            on_connect: Some("cd /app".into()),
+            ..Default::default()
+        }];
+        let bookmarks = vec![sample_bookmark("test", "dev", vec![])];
+        assert!(validate_on_connect_fields(&profiles, &bookmarks).is_ok());
+    }
+
+    #[test]
+    fn test_validate_on_connect_fields_none_values_ok() {
+        let profiles = vec![model::Profile {
+            name: "ops".into(),
+            on_connect: None,
+            ..Default::default()
+        }];
+        let bookmarks = vec![Bookmark {
+            on_connect: None,
+            ..sample_bookmark("test", "dev", vec![])
+        }];
+        assert!(validate_on_connect_fields(&profiles, &bookmarks).is_ok());
+    }
+
+    #[test]
+    fn test_validate_profiles_sanitizes_display_output() {
+        // Profile name containing control characters should be sanitized in error message
+        let profiles = vec![model::Profile {
+            name: "bad\x1bname".into(),
+            ..Default::default()
+        }];
+        let err = validate_profiles(&profiles).unwrap_err();
+        let msg = err.to_string();
+        // The ESC character should be replaced with ? in the error message
+        assert!(
+            !msg.contains('\x1b'),
+            "error message should not contain raw ESC"
+        );
+        assert!(
+            msg.contains("bad?name"),
+            "expected sanitized name, got: {msg}"
+        );
     }
 }

@@ -70,8 +70,12 @@ fn default_ssh_config_path() -> PathBuf {
 }
 
 /// Format a bookmark row for the list table.
-fn format_bookmark_row(b: &Bookmark, settings: &config::model::Settings) -> String {
-    let user = b.effective_user(settings);
+fn format_bookmark_row(
+    b: &Bookmark,
+    settings: &config::model::Settings,
+    profiles: &[config::model::Profile],
+) -> String {
+    let user = b.effective_user(settings, profiles);
     let env_display = if b.env.is_empty() { "-" } else { &b.env };
     format!(
         "  {:<20} {:<30} {:<12} {:<6} {}",
@@ -528,7 +532,10 @@ fn cmd_list(env_filter: Option<String>, cfg_override: Option<&str>) -> Result<()
     println!("  {}", "-".repeat(76));
 
     for b in &bookmarks {
-        println!("{}", format_bookmark_row(b, &app_config.settings));
+        println!(
+            "{}",
+            format_bookmark_row(b, &app_config.settings, &app_config.profiles)
+        );
     }
 
     println!("\n  {} bookmark(s)", bookmarks.len());
@@ -600,7 +607,7 @@ async fn cmd_browse(
 
     let index = find_bookmark_index(&config, bookmark_name)?;
     let bookmark = &config.bookmarks[index];
-    ssh::print_production_banner(bookmark, &config.settings, "SFTP browser");
+    ssh::print_production_banner(bookmark, &config.settings, &config.profiles, "SFTP browser");
 
     // Apply terminal theming
     ssh::terminal_theme::apply_theme(bookmark, &config.settings);

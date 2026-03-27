@@ -68,11 +68,12 @@ const SSH_CHANNEL_BUFFER_SIZE: usize = 16;
 pub fn print_production_banner(
     bookmark: &Bookmark,
     settings: &crate::config::model::Settings,
+    profiles: &[crate::config::model::Profile],
     context: &str,
 ) {
     if bookmark.env.eq_ignore_ascii_case("production") {
         let user: String = bookmark
-            .effective_user(settings)
+            .effective_user(settings, profiles)
             .chars()
             .filter(|c| !c.is_ascii_control())
             .collect();
@@ -111,11 +112,14 @@ fn print_escape_hints(
 }
 
 /// Resolve the effective connection timeout for a bookmark.
-/// Priority: bookmark.connect_timeout_secs → settings.connect_timeout_secs → default (15s).
-fn effective_timeout(bookmark: &Bookmark, settings: &crate::config::model::Settings) -> u64 {
+/// Priority: bookmark → profile → settings → default (15s).
+fn effective_timeout(
+    bookmark: &Bookmark,
+    settings: &crate::config::model::Settings,
+    profiles: &[crate::config::model::Profile],
+) -> u64 {
     bookmark
-        .connect_timeout_secs
-        .or(settings.connect_timeout_secs)
+        .effective_connect_timeout(settings, profiles)
         .unwrap_or(DEFAULT_CONNECT_TIMEOUT_SECS)
 }
 
@@ -265,16 +269,17 @@ pub async fn establish_session(
 ) -> Result<russh::client::Handle<SshoreHandler>> {
     let bookmark = &config.bookmarks[bookmark_index];
     let settings = &config.settings;
+    let profiles = &config.profiles;
 
-    let user = bookmark.effective_user(settings);
+    let user = bookmark.effective_user(settings, profiles);
     let host = &bookmark.host;
     let port = bookmark.port;
 
     eprintln!("Connecting to {user}@{host}:{port}...");
     tracing::debug!(host, port, user, "establishing SSH session");
 
-    // Load SSH keys
-    let keys = load_keys(bookmark)?;
+    // Load SSH keys (using profile-aware identity file resolution)
+    let keys = load_keys(bookmark, profiles)?;
     tracing::debug!(key_count = keys.len(), "loaded SSH keys");
 
     // Build handler with host key checking
@@ -282,7 +287,7 @@ pub async fn establish_session(
     let handler = SshoreHandler::for_host(host, port, check_mode);
 
     // Configurable connection timeout
-    let timeout_secs = effective_timeout(bookmark, settings);
+    let timeout_secs = effective_timeout(bookmark, settings, profiles);
 
     // Connect to SSH server with timeout.
     // No inactivity_timeout — interactive sessions must never be killed due to
@@ -350,7 +355,7 @@ pub async fn establish_session(
     let ctx = AuthContext {
         bookmark_name: Some(&bookmark.name),
         env: Some(&bookmark.env),
-        has_identity_file: bookmark.identity_file.is_some(),
+        has_identity_file: bookmark.effective_identity_file(profiles).is_some(),
     };
     let authenticated = authenticate(&mut session, &user, &keys, &ctx).await?;
     if !authenticated {
@@ -373,14 +378,15 @@ pub async fn establish_tunnel_session(
 )> {
     let bookmark = &config.bookmarks[bookmark_index];
     let settings = &config.settings;
+    let profiles = &config.profiles;
 
-    let user = bookmark.effective_user(settings);
+    let user = bookmark.effective_user(settings, profiles);
     let host = &bookmark.host;
     let port = bookmark.port;
 
     eprintln!("Connecting tunnel to {user}@{host}:{port}...");
 
-    let keys = load_keys(bookmark)?;
+    let keys = load_keys(bookmark, profiles)?;
 
     let check_mode = HostKeyCheckMode::from_str_setting(&settings.host_key_checking);
     let handler = SshoreHandler::for_host(host, port, check_mode);
@@ -399,7 +405,7 @@ pub async fn establish_tunnel_session(
         ..<_>::default()
     };
 
-    let timeout_secs = effective_timeout(bookmark, settings);
+    let timeout_secs = effective_timeout(bookmark, settings, profiles);
     let connect_future =
         russh::client::connect(Arc::new(ssh_config), (host.as_str(), port), handler);
 
@@ -416,7 +422,7 @@ pub async fn establish_tunnel_session(
     let ctx = AuthContext {
         bookmark_name: Some(&bookmark.name),
         env: Some(&bookmark.env),
-        has_identity_file: bookmark.identity_file.is_some(),
+        has_identity_file: bookmark.effective_identity_file(profiles).is_some(),
     };
     let authenticated = authenticate(&mut session, &user, &keys, &ctx).await?;
     if !authenticated {
@@ -440,6 +446,7 @@ pub async fn connect(
     print_production_banner(
         &config.bookmarks[bookmark_index],
         &config.settings,
+        &config.profiles,
         "SSH session",
     );
 
@@ -476,9 +483,9 @@ pub async fn connect(
         .map(Zeroizing::new);
     let detector = PasswordDetector::new(true);
 
-    // Send on_connect command if configured
+    // Send on_connect command if configured (profile-aware resolution)
     let bookmark = &config.bookmarks[bookmark_index];
-    if let Some(ref on_connect) = bookmark.on_connect {
+    if let Some(ref on_connect) = bookmark.effective_on_connect(&config.profiles) {
         let delay = config.settings.on_connect_delay_ms;
         tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
         channel
@@ -505,13 +512,13 @@ pub async fn connect(
         !bookmark_snippets.is_empty() || !config.settings.snippets.is_empty(),
     );
 
-    // Build session info for save-as-bookmark
+    // Build session info for save-as-bookmark (profile-aware resolution)
     let session_info = SessionInfo {
         host: bookmark.host.clone(),
-        user: bookmark.effective_user(&config.settings),
+        user: bookmark.effective_user(&config.settings, &config.profiles),
         port: bookmark.port,
-        identity_file: bookmark.identity_file.clone(),
-        proxy_jump: bookmark.proxy_jump.clone(),
+        identity_file: bookmark.effective_identity_file(&config.profiles),
+        proxy_jump: bookmark.effective_proxy_jump(&config.profiles),
         bookmark_name: Some(bookmark.name.clone()),
     };
 
@@ -720,13 +727,16 @@ async fn exec_command_quiet(
 }
 
 /// Load SSH private keys for authentication.
-/// If bookmark has identity_file, load that (with env var expansion). Otherwise try default keys.
-/// Prompts for passphrase when an encrypted key is encountered.
-fn load_keys(bookmark: &Bookmark) -> Result<Vec<PrivateKeyWithHashAlg>> {
+/// If bookmark (or its profile) has identity_file, load that (with env var expansion).
+/// Otherwise try default keys. Prompts for passphrase when an encrypted key is encountered.
+fn load_keys(
+    bookmark: &Bookmark,
+    profiles: &[crate::config::model::Profile],
+) -> Result<Vec<PrivateKeyWithHashAlg>> {
     let mut keys = Vec::new();
 
-    if bookmark.identity_file.is_some() {
-        match bookmark.resolved_identity_file() {
+    if bookmark.effective_identity_file(profiles).is_some() {
+        match bookmark.resolved_effective_identity_file(profiles) {
             Some(Ok(path)) => {
                 let expanded = PathBuf::from(&path);
                 if expanded.exists() {
@@ -746,7 +756,10 @@ fn load_keys(bookmark: &Bookmark) -> Result<Vec<PrivateKeyWithHashAlg>> {
                     eprintln!(
                         "Warning: identity file not found: {} (expanded from {:?})",
                         path,
-                        bookmark.identity_file.as_deref().unwrap_or("")
+                        bookmark
+                            .effective_identity_file(profiles)
+                            .as_deref()
+                            .unwrap_or("")
                     );
                 }
             }
@@ -1732,7 +1745,7 @@ mod tests {
         let bookmark = sample_bookmark();
         let settings = crate::config::model::Settings::default();
         assert_eq!(
-            effective_timeout(&bookmark, &settings),
+            effective_timeout(&bookmark, &settings, &[]),
             DEFAULT_CONNECT_TIMEOUT_SECS
         );
     }
@@ -1744,7 +1757,7 @@ mod tests {
             connect_timeout_secs: Some(30),
             ..Default::default()
         };
-        assert_eq!(effective_timeout(&bookmark, &settings), 30);
+        assert_eq!(effective_timeout(&bookmark, &settings, &[]), 30);
     }
 
     #[test]
@@ -1757,7 +1770,7 @@ mod tests {
             connect_timeout_secs: Some(30),
             ..Default::default()
         };
-        assert_eq!(effective_timeout(&bookmark, &settings), 5);
+        assert_eq!(effective_timeout(&bookmark, &settings, &[]), 5);
     }
 
     #[test]
@@ -1767,7 +1780,7 @@ mod tests {
             ..sample_bookmark()
         };
         let settings = crate::config::model::Settings::default();
-        assert_eq!(effective_timeout(&bookmark, &settings), 60);
+        assert_eq!(effective_timeout(&bookmark, &settings, &[]), 60);
     }
 
     // --- parse_connection_string edge cases ---

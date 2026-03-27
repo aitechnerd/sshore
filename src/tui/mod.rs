@@ -301,7 +301,7 @@ async fn launch_browse(config: &AppConfig, bookmark_index: usize) -> Result<()> 
     use crate::storage;
 
     let bookmark = &config.bookmarks[bookmark_index];
-    ssh::print_production_banner(bookmark, &config.settings, "SFTP browser");
+    ssh::print_production_banner(bookmark, &config.settings, &config.profiles, "SFTP browser");
     ssh::terminal_theme::apply_theme(bookmark, &config.settings);
 
     let theme = resolve_theme(&config.settings.theme);

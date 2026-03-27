@@ -25,7 +25,7 @@ pub async fn open_session(config: &AppConfig, bookmark_index: usize) -> Result<(
         terminal_theme::render_tab_title(&settings.tab_title_template, bookmark, settings)
     );
     terminal_theme::apply_theme_with_title(bookmark, settings, &title);
-    ssh::print_production_banner(bookmark, settings, "SFTP session");
+    ssh::print_production_banner(bookmark, settings, &config.profiles, "SFTP session");
     let is_production = bookmark.env.eq_ignore_ascii_case("production");
 
     // Open a session channel and request SFTP subsystem

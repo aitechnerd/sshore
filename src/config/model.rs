@@ -244,20 +244,95 @@ impl Default for Settings {
 }
 
 impl Bookmark {
-    /// Resolve the effective username: bookmark -> settings default -> OS user.
-    pub fn effective_user(&self, settings: &Settings) -> String {
+    /// Look up this bookmark's assigned profile from the profiles list.
+    /// Returns `None` if no profile is assigned or the referenced profile doesn't exist
+    /// (dangling reference — graceful fallback per SOW AC-7).
+    pub fn resolve_profile<'a>(&self, profiles: &'a [Profile]) -> Option<&'a Profile> {
+        self.profile
+            .as_ref()
+            .and_then(|name| profiles.iter().find(|p| p.name == *name))
+    }
+
+    /// Resolve the effective username: bookmark -> profile -> settings default -> OS user.
+    pub fn effective_user(&self, settings: &Settings, profiles: &[Profile]) -> String {
+        let profile = self.resolve_profile(profiles);
         self.user
             .clone()
+            .or_else(|| profile.and_then(|p| p.user.clone()))
             .or_else(|| settings.default_user.clone())
             .unwrap_or_else(|| whoami::username().to_string())
+    }
+
+    /// Resolve the effective identity file path: bookmark -> profile.
+    /// Returns `None` if neither bookmark nor profile specifies an identity file.
+    pub fn effective_identity_file(&self, profiles: &[Profile]) -> Option<String> {
+        let profile = self.resolve_profile(profiles);
+        self.identity_file
+            .clone()
+            .or_else(|| profile.and_then(|p| p.identity_file.clone()))
+    }
+
+    /// Resolve the effective proxy jump host: bookmark -> profile.
+    /// Returns `None` if neither bookmark nor profile specifies a proxy jump.
+    pub fn effective_proxy_jump(&self, profiles: &[Profile]) -> Option<String> {
+        let profile = self.resolve_profile(profiles);
+        self.proxy_jump
+            .clone()
+            .or_else(|| profile.and_then(|p| p.proxy_jump.clone()))
+    }
+
+    /// Resolve the effective on_connect command: bookmark -> profile.
+    /// Returns `None` if neither bookmark nor profile specifies an on_connect command.
+    pub fn effective_on_connect(&self, profiles: &[Profile]) -> Option<String> {
+        let profile = self.resolve_profile(profiles);
+        self.on_connect
+            .clone()
+            .or_else(|| profile.and_then(|p| p.on_connect.clone()))
+    }
+
+    /// Resolve the effective connection timeout: bookmark -> profile -> settings -> default.
+    /// Returns `None` only when no layer specifies a timeout (caller applies hardcoded default).
+    pub fn effective_connect_timeout(
+        &self,
+        settings: &Settings,
+        profiles: &[Profile],
+    ) -> Option<u64> {
+        let profile = self.resolve_profile(profiles);
+        self.connect_timeout_secs
+            .or_else(|| profile.and_then(|p| p.connect_timeout_secs))
+            .or(settings.connect_timeout_secs)
+    }
+
+    /// Resolve effective SSH options by merging profile and bookmark options.
+    /// Merge semantics: start with profile's options, overlay bookmark's options.
+    /// Bookmark keys win on collision.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn effective_ssh_options(&self, profiles: &[Profile]) -> HashMap<String, String> {
+        let profile = self.resolve_profile(profiles);
+        let mut merged = profile.map(|p| p.ssh_options.clone()).unwrap_or_default();
+        merged.extend(self.ssh_options.clone());
+        merged
     }
 
     /// Resolve identity file path with tilde AND environment variable expansion.
     /// Supports: ~/path, $HOME/path, ${SSHKEY}, $VAR/subpath
     /// Returns None if the field is not set.
     /// Returns Err if env var expansion fails (undefined variable).
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn resolved_identity_file(&self) -> Option<Result<String>> {
         self.identity_file.as_ref().map(|p| {
+            shellexpand::full(p)
+                .map(|expanded| expanded.to_string())
+                .map_err(|e| anyhow!("Failed to expand identity file path '{}': {}", p, e))
+        })
+    }
+
+    /// Resolve identity file path from the effective identity file (bookmark -> profile),
+    /// with tilde and environment variable expansion.
+    /// Returns None if neither bookmark nor profile specifies an identity file.
+    /// Returns Err if env var expansion fails.
+    pub fn resolved_effective_identity_file(&self, profiles: &[Profile]) -> Option<Result<String>> {
+        self.effective_identity_file(profiles).as_ref().map(|p| {
             shellexpand::full(p)
                 .map(|expanded| expanded.to_string())
                 .map_err(|e| anyhow!("Failed to expand identity file path '{}': {}", p, e))
@@ -526,7 +601,7 @@ mod tests {
             default_user: Some("admin".into()),
             ..Settings::default()
         };
-        assert_eq!(bookmark.effective_user(&settings), "deploy");
+        assert_eq!(bookmark.effective_user(&settings, &[]), "deploy");
     }
 
     #[test]
@@ -539,7 +614,7 @@ mod tests {
             default_user: Some("admin".into()),
             ..Settings::default()
         };
-        assert_eq!(bookmark.effective_user(&settings), "admin");
+        assert_eq!(bookmark.effective_user(&settings, &[]), "admin");
     }
 
     #[test]
@@ -552,7 +627,7 @@ mod tests {
             default_user: None,
             ..Settings::default()
         };
-        let result = bookmark.effective_user(&settings);
+        let result = bookmark.effective_user(&settings, &[]);
         // Should return the OS username — just verify it's non-empty
         assert!(!result.is_empty());
     }
@@ -806,5 +881,491 @@ mod tests {
         );
         assert_eq!(sanitize_bookmark_name(""), "");
         assert_eq!(sanitize_bookmark_name("---"), "");
+    }
+
+    // --- Profile resolution tests (Phase 4) ---
+
+    #[test]
+    fn test_resolve_profile_found() {
+        let profiles = vec![sample_profile()];
+        let bookmark = Bookmark {
+            profile: Some("corp-bastion".into()),
+            ..sample_bookmark()
+        };
+        let resolved = bookmark.resolve_profile(&profiles);
+        assert!(resolved.is_some());
+        assert_eq!(resolved.unwrap().name, "corp-bastion");
+    }
+
+    #[test]
+    fn test_resolve_profile_not_found_dangling() {
+        let profiles = vec![sample_profile()];
+        let bookmark = Bookmark {
+            profile: Some("nonexistent".into()),
+            ..sample_bookmark()
+        };
+        assert!(bookmark.resolve_profile(&profiles).is_none());
+    }
+
+    #[test]
+    fn test_resolve_profile_none() {
+        let profiles = vec![sample_profile()];
+        let bookmark = Bookmark {
+            profile: None,
+            ..sample_bookmark()
+        };
+        assert!(bookmark.resolve_profile(&profiles).is_none());
+    }
+
+    #[test]
+    fn test_effective_user_from_profile() {
+        let profiles = vec![Profile {
+            name: "ops".into(),
+            user: Some("deploy".into()),
+            ..Profile::default()
+        }];
+        let bookmark = Bookmark {
+            user: None,
+            profile: Some("ops".into()),
+            ..sample_bookmark()
+        };
+        let settings = Settings {
+            default_user: Some("fallback".into()),
+            ..Settings::default()
+        };
+        assert_eq!(bookmark.effective_user(&settings, &profiles), "deploy");
+    }
+
+    #[test]
+    fn test_effective_user_bookmark_overrides_profile() {
+        let profiles = vec![Profile {
+            name: "ops".into(),
+            user: Some("deploy".into()),
+            ..Profile::default()
+        }];
+        let bookmark = Bookmark {
+            user: Some("admin".into()),
+            profile: Some("ops".into()),
+            ..sample_bookmark()
+        };
+        let settings = Settings::default();
+        assert_eq!(bookmark.effective_user(&settings, &profiles), "admin");
+    }
+
+    #[test]
+    fn test_effective_user_full_chain_to_settings() {
+        let profiles = vec![Profile {
+            name: "ops".into(),
+            user: None,
+            ..Profile::default()
+        }];
+        let bookmark = Bookmark {
+            user: None,
+            profile: Some("ops".into()),
+            ..sample_bookmark()
+        };
+        let settings = Settings {
+            default_user: Some("fallback".into()),
+            ..Settings::default()
+        };
+        assert_eq!(bookmark.effective_user(&settings, &profiles), "fallback");
+    }
+
+    #[test]
+    fn test_effective_user_dangling_profile_skips_profile_layer() {
+        let profiles = vec![Profile {
+            name: "ops".into(),
+            user: Some("deploy".into()),
+            ..Profile::default()
+        }];
+        let bookmark = Bookmark {
+            user: None,
+            profile: Some("nonexistent".into()),
+            ..sample_bookmark()
+        };
+        let settings = Settings {
+            default_user: Some("fallback".into()),
+            ..Settings::default()
+        };
+        // Dangling profile reference — skips profile layer, falls to settings
+        assert_eq!(bookmark.effective_user(&settings, &profiles), "fallback");
+    }
+
+    #[test]
+    fn test_effective_identity_file_from_profile() {
+        let profiles = vec![Profile {
+            name: "ops".into(),
+            identity_file: Some("~/.ssh/ops_key".into()),
+            ..Profile::default()
+        }];
+        let bookmark = Bookmark {
+            identity_file: None,
+            profile: Some("ops".into()),
+            ..sample_bookmark()
+        };
+        assert_eq!(
+            bookmark.effective_identity_file(&profiles),
+            Some("~/.ssh/ops_key".into())
+        );
+    }
+
+    #[test]
+    fn test_effective_identity_file_bookmark_overrides_profile() {
+        let profiles = vec![Profile {
+            name: "ops".into(),
+            identity_file: Some("~/.ssh/ops_key".into()),
+            ..Profile::default()
+        }];
+        let bookmark = Bookmark {
+            identity_file: Some("~/.ssh/my_key".into()),
+            profile: Some("ops".into()),
+            ..sample_bookmark()
+        };
+        assert_eq!(
+            bookmark.effective_identity_file(&profiles),
+            Some("~/.ssh/my_key".into())
+        );
+    }
+
+    #[test]
+    fn test_effective_identity_file_both_none() {
+        let profiles = vec![Profile {
+            name: "ops".into(),
+            identity_file: None,
+            ..Profile::default()
+        }];
+        let bookmark = Bookmark {
+            identity_file: None,
+            profile: Some("ops".into()),
+            ..sample_bookmark()
+        };
+        assert!(bookmark.effective_identity_file(&profiles).is_none());
+    }
+
+    #[test]
+    fn test_effective_proxy_jump_from_profile() {
+        let profiles = vec![Profile {
+            name: "ops".into(),
+            proxy_jump: Some("bastion.corp.com".into()),
+            ..Profile::default()
+        }];
+        let bookmark = Bookmark {
+            proxy_jump: None,
+            profile: Some("ops".into()),
+            ..sample_bookmark()
+        };
+        assert_eq!(
+            bookmark.effective_proxy_jump(&profiles),
+            Some("bastion.corp.com".into())
+        );
+    }
+
+    #[test]
+    fn test_effective_proxy_jump_bookmark_overrides_profile() {
+        let profiles = vec![Profile {
+            name: "ops".into(),
+            proxy_jump: Some("bastion.corp.com".into()),
+            ..Profile::default()
+        }];
+        let bookmark = Bookmark {
+            proxy_jump: Some("my-bastion.local".into()),
+            profile: Some("ops".into()),
+            ..sample_bookmark()
+        };
+        assert_eq!(
+            bookmark.effective_proxy_jump(&profiles),
+            Some("my-bastion.local".into())
+        );
+    }
+
+    #[test]
+    fn test_effective_on_connect_from_profile() {
+        let profiles = vec![Profile {
+            name: "ops".into(),
+            on_connect: Some("cd /app".into()),
+            ..Profile::default()
+        }];
+        let bookmark = Bookmark {
+            on_connect: None,
+            profile: Some("ops".into()),
+            ..sample_bookmark()
+        };
+        assert_eq!(
+            bookmark.effective_on_connect(&profiles),
+            Some("cd /app".into())
+        );
+    }
+
+    #[test]
+    fn test_effective_on_connect_bookmark_overrides_profile() {
+        let profiles = vec![Profile {
+            name: "ops".into(),
+            on_connect: Some("cd /app".into()),
+            ..Profile::default()
+        }];
+        let bookmark = Bookmark {
+            on_connect: Some("cd /home".into()),
+            profile: Some("ops".into()),
+            ..sample_bookmark()
+        };
+        assert_eq!(
+            bookmark.effective_on_connect(&profiles),
+            Some("cd /home".into())
+        );
+    }
+
+    #[test]
+    fn test_effective_timeout_from_profile() {
+        let profiles = vec![Profile {
+            name: "ops".into(),
+            connect_timeout_secs: Some(30),
+            ..Profile::default()
+        }];
+        let bookmark = Bookmark {
+            connect_timeout_secs: None,
+            profile: Some("ops".into()),
+            ..sample_bookmark()
+        };
+        let settings = Settings {
+            connect_timeout_secs: Some(60),
+            ..Settings::default()
+        };
+        // Profile wins over settings
+        assert_eq!(
+            bookmark.effective_connect_timeout(&settings, &profiles),
+            Some(30)
+        );
+    }
+
+    #[test]
+    fn test_effective_timeout_bookmark_overrides_profile() {
+        let profiles = vec![Profile {
+            name: "ops".into(),
+            connect_timeout_secs: Some(30),
+            ..Profile::default()
+        }];
+        let bookmark = Bookmark {
+            connect_timeout_secs: Some(5),
+            profile: Some("ops".into()),
+            ..sample_bookmark()
+        };
+        let settings = Settings::default();
+        assert_eq!(
+            bookmark.effective_connect_timeout(&settings, &profiles),
+            Some(5)
+        );
+    }
+
+    #[test]
+    fn test_effective_timeout_full_chain_to_settings() {
+        let profiles = vec![Profile {
+            name: "ops".into(),
+            connect_timeout_secs: None,
+            ..Profile::default()
+        }];
+        let bookmark = Bookmark {
+            connect_timeout_secs: None,
+            profile: Some("ops".into()),
+            ..sample_bookmark()
+        };
+        let settings = Settings {
+            connect_timeout_secs: Some(45),
+            ..Settings::default()
+        };
+        assert_eq!(
+            bookmark.effective_connect_timeout(&settings, &profiles),
+            Some(45)
+        );
+    }
+
+    #[test]
+    fn test_effective_timeout_all_none() {
+        let profiles = vec![Profile {
+            name: "ops".into(),
+            ..Profile::default()
+        }];
+        let bookmark = Bookmark {
+            connect_timeout_secs: None,
+            profile: Some("ops".into()),
+            ..sample_bookmark()
+        };
+        let settings = Settings {
+            connect_timeout_secs: None,
+            ..Settings::default()
+        };
+        assert!(
+            bookmark
+                .effective_connect_timeout(&settings, &profiles)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn test_effective_ssh_options_merge() {
+        let profiles = vec![Profile {
+            name: "ops".into(),
+            ssh_options: {
+                let mut m = HashMap::new();
+                m.insert("ServerAliveInterval".into(), "60".into());
+                m.insert("Compression".into(), "yes".into());
+                m
+            },
+            ..Profile::default()
+        }];
+        let bookmark = Bookmark {
+            ssh_options: {
+                let mut m = HashMap::new();
+                m.insert("Compression".into(), "no".into()); // overrides profile
+                m.insert("TCPKeepAlive".into(), "yes".into()); // new key
+                m
+            },
+            profile: Some("ops".into()),
+            ..sample_bookmark()
+        };
+        let merged = bookmark.effective_ssh_options(&profiles);
+        // Profile key A (ServerAliveInterval) present
+        assert_eq!(merged.get("ServerAliveInterval").unwrap(), "60");
+        // Bookmark overrides profile key B (Compression)
+        assert_eq!(merged.get("Compression").unwrap(), "no");
+        // Bookmark-only key C (TCPKeepAlive) present
+        assert_eq!(merged.get("TCPKeepAlive").unwrap(), "yes");
+        assert_eq!(merged.len(), 3);
+    }
+
+    #[test]
+    fn test_effective_ssh_options_empty_bookmark() {
+        let profiles = vec![Profile {
+            name: "ops".into(),
+            ssh_options: {
+                let mut m = HashMap::new();
+                m.insert("ServerAliveInterval".into(), "60".into());
+                m
+            },
+            ..Profile::default()
+        }];
+        let bookmark = Bookmark {
+            ssh_options: HashMap::new(),
+            profile: Some("ops".into()),
+            ..sample_bookmark()
+        };
+        let merged = bookmark.effective_ssh_options(&profiles);
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged.get("ServerAliveInterval").unwrap(), "60");
+    }
+
+    #[test]
+    fn test_effective_ssh_options_empty_profile() {
+        let profiles = vec![Profile {
+            name: "ops".into(),
+            ssh_options: HashMap::new(),
+            ..Profile::default()
+        }];
+        let bookmark = Bookmark {
+            ssh_options: {
+                let mut m = HashMap::new();
+                m.insert("TCPKeepAlive".into(), "yes".into());
+                m
+            },
+            profile: Some("ops".into()),
+            ..sample_bookmark()
+        };
+        let merged = bookmark.effective_ssh_options(&profiles);
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged.get("TCPKeepAlive").unwrap(), "yes");
+    }
+
+    #[test]
+    fn test_effective_ssh_options_no_profile() {
+        let bookmark = Bookmark {
+            ssh_options: {
+                let mut m = HashMap::new();
+                m.insert("TCPKeepAlive".into(), "yes".into());
+                m
+            },
+            profile: None,
+            ..sample_bookmark()
+        };
+        let merged = bookmark.effective_ssh_options(&[]);
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged.get("TCPKeepAlive").unwrap(), "yes");
+    }
+
+    #[test]
+    fn test_dangling_profile_connects_gracefully() {
+        // AC-7: dangling profile reference — all fields fall through to bookmark/settings
+        let profiles = vec![Profile {
+            name: "ops".into(),
+            user: Some("deploy".into()),
+            identity_file: Some("~/.ssh/ops_key".into()),
+            proxy_jump: Some("bastion.corp.com".into()),
+            on_connect: Some("cd /app".into()),
+            connect_timeout_secs: Some(30),
+            ..Profile::default()
+        }];
+        let bookmark = Bookmark {
+            user: Some("my-user".into()),
+            identity_file: Some("~/.ssh/my_key".into()),
+            proxy_jump: None,
+            on_connect: None,
+            connect_timeout_secs: None,
+            profile: Some("deleted-profile".into()), // dangling!
+            ..sample_bookmark()
+        };
+        let settings = Settings {
+            default_user: Some("fallback".into()),
+            connect_timeout_secs: Some(60),
+            ..Settings::default()
+        };
+
+        // Profile layer is skipped entirely due to dangling reference
+        assert_eq!(bookmark.effective_user(&settings, &profiles), "my-user");
+        assert_eq!(
+            bookmark.effective_identity_file(&profiles),
+            Some("~/.ssh/my_key".into())
+        );
+        assert!(bookmark.effective_proxy_jump(&profiles).is_none());
+        assert!(bookmark.effective_on_connect(&profiles).is_none());
+        assert_eq!(
+            bookmark.effective_connect_timeout(&settings, &profiles),
+            Some(60) // falls through to settings
+        );
+    }
+
+    #[test]
+    fn test_resolved_effective_identity_file_from_profile() {
+        let profiles = vec![Profile {
+            name: "ops".into(),
+            identity_file: Some("~/.ssh/ops_key".into()),
+            ..Profile::default()
+        }];
+        let bookmark = Bookmark {
+            identity_file: None,
+            profile: Some("ops".into()),
+            ..sample_bookmark()
+        };
+        let resolved = bookmark.resolved_effective_identity_file(&profiles);
+        assert!(resolved.is_some());
+        let path = resolved.unwrap().unwrap();
+        assert!(!path.starts_with('~'));
+        assert!(path.ends_with("/.ssh/ops_key"));
+    }
+
+    #[test]
+    fn test_resolved_effective_identity_file_none() {
+        let profiles = vec![Profile {
+            name: "ops".into(),
+            identity_file: None,
+            ..Profile::default()
+        }];
+        let bookmark = Bookmark {
+            identity_file: None,
+            profile: Some("ops".into()),
+            ..sample_bookmark()
+        };
+        assert!(
+            bookmark
+                .resolved_effective_identity_file(&profiles)
+                .is_none()
+        );
     }
 }

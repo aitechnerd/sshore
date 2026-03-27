@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 
 use anyhow::Result;
 
@@ -239,7 +239,7 @@ fn session_to_bookmark(
         connect_count: 0,
         on_connect: None,
         snippets: vec![],
-        ssh_options: HashMap::new(),
+        ssh_options: BTreeMap::new(),
         connect_timeout_secs: None,
         profile: None,
     }

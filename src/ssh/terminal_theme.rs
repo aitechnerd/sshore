@@ -412,7 +412,7 @@ mod tests {
             on_connect: None,
             snippets: vec![],
             connect_timeout_secs: None,
-            ssh_options: std::collections::HashMap::new(),
+            ssh_options: std::collections::BTreeMap::new(),
             profile: None,
         }
     }
@@ -493,7 +493,7 @@ mod tests {
             on_connect: None,
             snippets: vec![],
             connect_timeout_secs: None,
-            ssh_options: std::collections::HashMap::new(),
+            ssh_options: std::collections::BTreeMap::new(),
             profile: None,
         };
         let result = render_tab_title("{name}", &bookmark, &settings);

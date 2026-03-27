@@ -234,7 +234,7 @@ fn test_import_skip_existing() {
         connect_count: 5,
         on_connect: None,
         snippets: vec![],
-        ssh_options: std::collections::HashMap::new(),
+        ssh_options: std::collections::BTreeMap::new(),
         connect_timeout_secs: None,
         profile: None,
     }];
@@ -267,7 +267,7 @@ fn test_import_overwrite_existing() {
         connect_count: 5,
         on_connect: None,
         snippets: vec![],
-        ssh_options: std::collections::HashMap::new(),
+        ssh_options: std::collections::BTreeMap::new(),
         connect_timeout_secs: None,
         profile: None,
     }];

@@ -214,7 +214,7 @@ fn profile_to_bookmark(
         connect_count: 0,
         on_connect: None,
         snippets: vec![],
-        ssh_options: HashMap::new(),
+        ssh_options: std::collections::BTreeMap::new(),
         connect_timeout_secs: None,
         profile: None,
     }

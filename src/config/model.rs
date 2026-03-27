@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 
 use anyhow::{Result, anyhow, bail};
 use chrono::{DateTime, Utc};
@@ -28,7 +28,7 @@ const SHELL_METACHARACTERS: &[char] = &[
 const BOOKMARK_NAME_EXTRA_CHARS: &[char] = &['-', '_', '.'];
 
 /// Map of environment name to color configuration.
-pub type EnvColorMap = HashMap<String, EnvColor>;
+pub type EnvColorMap = BTreeMap<String, EnvColor>;
 
 /// A reusable set of SSH connection settings that can be shared across bookmarks.
 ///
@@ -57,7 +57,7 @@ pub struct Profile {
 
     /// Additional SSH options as key-value pairs.
     #[serde(default)]
-    pub ssh_options: HashMap<String, String>,
+    pub ssh_options: BTreeMap<String, String>,
 
     /// Connection timeout in seconds.
     #[serde(default)]
@@ -214,7 +214,7 @@ pub struct Bookmark {
     /// Additional SSH options parsed from ssh_config but not modeled as
     /// dedicated fields. Applied at connection time.
     #[serde(default)]
-    pub ssh_options: HashMap<String, String>,
+    pub ssh_options: BTreeMap<String, String>,
 
     /// Name of the connection profile to inherit settings from.
     /// References a `Profile.name` in `AppConfig.profiles`.
@@ -313,7 +313,7 @@ impl Bookmark {
     /// Merge semantics: start with profile's options, overlay bookmark's options.
     /// Bookmark keys win on collision.
     #[cfg_attr(not(test), allow(dead_code))]
-    pub fn effective_ssh_options(&self, profiles: &[Profile]) -> HashMap<String, String> {
+    pub fn effective_ssh_options(&self, profiles: &[Profile]) -> BTreeMap<String, String> {
         let profile = self.resolve_profile(profiles);
         let mut merged = profile.map(|p| p.ssh_options.clone()).unwrap_or_default();
         merged.extend(self.ssh_options.clone());
@@ -533,7 +533,7 @@ mod tests {
             on_connect: None,
             snippets: vec![],
             connect_timeout_secs: None,
-            ssh_options: std::collections::HashMap::new(),
+            ssh_options: std::collections::BTreeMap::new(),
             profile: None,
         }
     }
@@ -546,7 +546,7 @@ mod tests {
             proxy_jump: Some("bastion.corp.com".into()),
             on_connect: Some("cd /app".into()),
             ssh_options: {
-                let mut m = HashMap::new();
+                let mut m = BTreeMap::new();
                 m.insert("ServerAliveInterval".into(), "60".into());
                 m
             },
@@ -1211,7 +1211,7 @@ mod tests {
         let profiles = vec![Profile {
             name: "ops".into(),
             ssh_options: {
-                let mut m = HashMap::new();
+                let mut m = BTreeMap::new();
                 m.insert("ServerAliveInterval".into(), "60".into());
                 m.insert("Compression".into(), "yes".into());
                 m
@@ -1220,7 +1220,7 @@ mod tests {
         }];
         let bookmark = Bookmark {
             ssh_options: {
-                let mut m = HashMap::new();
+                let mut m = BTreeMap::new();
                 m.insert("Compression".into(), "no".into()); // overrides profile
                 m.insert("TCPKeepAlive".into(), "yes".into()); // new key
                 m
@@ -1243,14 +1243,14 @@ mod tests {
         let profiles = vec![Profile {
             name: "ops".into(),
             ssh_options: {
-                let mut m = HashMap::new();
+                let mut m = BTreeMap::new();
                 m.insert("ServerAliveInterval".into(), "60".into());
                 m
             },
             ..Profile::default()
         }];
         let bookmark = Bookmark {
-            ssh_options: HashMap::new(),
+            ssh_options: BTreeMap::new(),
             profile: Some("ops".into()),
             ..sample_bookmark()
         };
@@ -1263,12 +1263,12 @@ mod tests {
     fn test_effective_ssh_options_empty_profile() {
         let profiles = vec![Profile {
             name: "ops".into(),
-            ssh_options: HashMap::new(),
+            ssh_options: BTreeMap::new(),
             ..Profile::default()
         }];
         let bookmark = Bookmark {
             ssh_options: {
-                let mut m = HashMap::new();
+                let mut m = BTreeMap::new();
                 m.insert("TCPKeepAlive".into(), "yes".into());
                 m
             },
@@ -1284,7 +1284,7 @@ mod tests {
     fn test_effective_ssh_options_no_profile() {
         let bookmark = Bookmark {
             ssh_options: {
-                let mut m = HashMap::new();
+                let mut m = BTreeMap::new();
                 m.insert("TCPKeepAlive".into(), "yes".into());
                 m
             },

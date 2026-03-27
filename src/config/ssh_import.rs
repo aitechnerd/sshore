@@ -31,7 +31,7 @@ struct HostBlock {
     proxy_jump: Option<String>,
     on_connect: Option<String>,
     connect_timeout_secs: Option<u64>,
-    ssh_options: std::collections::HashMap<String, String>,
+    ssh_options: std::collections::BTreeMap<String, String>,
 }
 
 impl HostBlock {
@@ -731,7 +731,7 @@ Host relative-host
             on_connect: None,
             snippets: vec![],
             connect_timeout_secs: None,
-            ssh_options: std::collections::HashMap::new(),
+            ssh_options: std::collections::BTreeMap::new(),
             profile: None,
         }];
 
@@ -751,7 +751,7 @@ Host relative-host
                 on_connect: None,
                 snippets: vec![],
                 connect_timeout_secs: None,
-                ssh_options: std::collections::HashMap::new(),
+                ssh_options: std::collections::BTreeMap::new(),
                 profile: None,
             },
             Bookmark {
@@ -769,7 +769,7 @@ Host relative-host
                 on_connect: None,
                 snippets: vec![],
                 connect_timeout_secs: None,
-                ssh_options: std::collections::HashMap::new(),
+                ssh_options: std::collections::BTreeMap::new(),
                 profile: None,
             },
         ];
@@ -799,7 +799,7 @@ Host relative-host
             on_connect: None,
             snippets: vec![],
             connect_timeout_secs: None,
-            ssh_options: std::collections::HashMap::new(),
+            ssh_options: std::collections::BTreeMap::new(),
             profile: None,
         }];
 
@@ -818,7 +818,7 @@ Host relative-host
             on_connect: None,
             snippets: vec![],
             connect_timeout_secs: None,
-            ssh_options: std::collections::HashMap::new(),
+            ssh_options: std::collections::BTreeMap::new(),
             profile: None,
         }];
 

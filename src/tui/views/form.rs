@@ -315,7 +315,7 @@ impl FormState {
             on_connect,
             snippets: vec![],
             connect_timeout_secs: None,
-            ssh_options: std::collections::HashMap::new(),
+            ssh_options: std::collections::BTreeMap::new(),
             profile,
         })
     }
@@ -676,7 +676,7 @@ mod tests {
             on_connect: None,
             snippets: vec![],
             connect_timeout_secs: None,
-            ssh_options: std::collections::HashMap::new(),
+            ssh_options: std::collections::BTreeMap::new(),
             profile: None,
         }
     }

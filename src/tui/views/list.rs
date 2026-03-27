@@ -62,11 +62,11 @@ pub fn render_list(frame: &mut Frame, area: Rect, app: &App) {
             } else {
                 Style::default().fg(tc.fg)
             };
-            let name_display = if bookmark.snippets.is_empty() {
-                bookmark.name.clone()
-            } else {
-                format!("{} ({}S)", bookmark.name, bookmark.snippets.len())
-            };
+            let name_display = format_name_display(
+                &bookmark.name,
+                bookmark.profile.as_deref(),
+                bookmark.snippets.len(),
+            );
             let name_cell = Cell::from(name_display).style(name_style);
 
             let host_style = if is_selected {
@@ -171,6 +171,21 @@ fn render_no_matches(frame: &mut Frame, area: Rect, theme: &ThemeColors) {
     frame.render_widget(paragraph, area);
 }
 
+/// Build the display string for a bookmark name in the list view.
+///
+/// Appends a `[profile-name]` indicator when a profile is assigned,
+/// and a `(NS)` snippet count when snippets exist.
+fn format_name_display(name: &str, profile: Option<&str>, snippet_count: usize) -> String {
+    let mut display = name.to_owned();
+    if let Some(profile_name) = profile {
+        display = format!("{display} [{profile_name}]");
+    }
+    if snippet_count > 0 {
+        display = format!("{display} ({snippet_count}S)");
+    }
+    display
+}
+
 /// Render the environment filter indicator when active.
 pub fn render_env_filter_indicator(
     frame: &mut Frame,
@@ -190,4 +205,51 @@ pub fn render_env_filter_indicator(
 
     let widget = Paragraph::new(line);
     frame.render_widget(widget, area);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_format_name_display_plain() {
+        let result = format_name_display("prod-web-01", None, 0);
+        assert_eq!(result, "prod-web-01");
+    }
+
+    #[test]
+    fn test_format_name_display_with_profile() {
+        let result = format_name_display("prod-web-01", Some("corp-bastion"), 0);
+        assert_eq!(result, "prod-web-01 [corp-bastion]");
+    }
+
+    #[test]
+    fn test_format_name_display_without_profile_no_indicator() {
+        let result = format_name_display("staging-api", None, 0);
+        assert!(!result.contains('['));
+        assert!(!result.contains(']'));
+    }
+
+    #[test]
+    fn test_format_name_display_with_snippets_only() {
+        let result = format_name_display("prod-web-01", None, 3);
+        assert_eq!(result, "prod-web-01 (3S)");
+    }
+
+    #[test]
+    fn test_format_name_display_with_profile_and_snippets() {
+        let result = format_name_display("server-01", Some("corp-bastion"), 2);
+        assert_eq!(result, "server-01 [corp-bastion] (2S)");
+    }
+
+    #[test]
+    fn test_format_name_display_profile_appears_before_snippets() {
+        let result = format_name_display("srv", Some("ops"), 1);
+        let bracket_pos = result.find('[').unwrap();
+        let paren_pos = result.find('(').unwrap();
+        assert!(
+            bracket_pos < paren_pos,
+            "profile indicator should appear before snippet count"
+        );
+    }
 }

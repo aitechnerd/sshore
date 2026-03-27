@@ -122,6 +122,7 @@ fn json_to_bookmark(
         last_connected: None,
         connect_count: 0,
         on_connect: None,
+        on_connect_prompt_pattern: None,
         snippets: vec![],
         ssh_options: BTreeMap::new(),
         connect_timeout_secs: None,

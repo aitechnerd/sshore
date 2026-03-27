@@ -560,6 +560,7 @@ pub fn show_save_bookmark_form(
                         last_connected: Some(chrono::Utc::now()),
                         connect_count: 1,
                         on_connect: None,
+                        on_connect_prompt_pattern: None,
                         snippets: vec![],
                         connect_timeout_secs: None,
                         ssh_options: std::collections::BTreeMap::new(),

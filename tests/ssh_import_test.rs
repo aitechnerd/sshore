@@ -148,6 +148,7 @@ Host server-b
         last_connected: None,
         connect_count: 10,
         on_connect: None,
+        on_connect_prompt_pattern: None,
         snippets: vec![],
         connect_timeout_secs: None,
         ssh_options: std::collections::BTreeMap::new(),

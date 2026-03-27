@@ -543,6 +543,7 @@ mod tests {
             last_connected: None,
             connect_count: 0,
             on_connect: None,
+            on_connect_prompt_pattern: None,
             snippets: vec![],
             connect_timeout_secs: None,
             ssh_options: std::collections::BTreeMap::new(),
@@ -586,6 +587,7 @@ mod tests {
             last_connected: Some(Utc::now()),
             connect_count: 5,
             on_connect: None,
+            on_connect_prompt_pattern: None,
             snippets: vec![],
             connect_timeout_secs: None,
             ssh_options: std::collections::BTreeMap::new(),
@@ -1261,6 +1263,7 @@ profile = "corp-bastion"
         }];
         let bookmarks = vec![Bookmark {
             on_connect: None,
+            on_connect_prompt_pattern: None,
             ..sample_bookmark("test", "dev", vec![])
         }];
         assert!(validate_on_connect_fields(&profiles, &bookmarks).is_ok());

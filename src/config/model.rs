@@ -203,6 +203,12 @@ pub struct Bookmark {
     /// Example: "cd /var/www/app && exec $SHELL"
     pub on_connect: Option<String>,
 
+    /// Regex pattern to detect shell prompt readiness before injecting on_connect.
+    /// When set, on_connect waits for this pattern in remote output (or falls back
+    /// to on_connect_delay_ms timeout). Example: "\\$\\s*$"
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub on_connect_prompt_pattern: Option<String>,
+
     /// Named command shortcuts for this bookmark.
     #[serde(default)]
     pub snippets: Vec<Snippet>,
@@ -279,6 +285,14 @@ impl Bookmark {
     /// Returns `None` if neither bookmark nor profile specifies an on_connect command.
     pub fn effective_on_connect(&self, profiles: &[Profile]) -> Option<String> {
         self.profile_field(profiles, |p| p.on_connect.clone(), &self.on_connect)
+    }
+
+    /// Resolve the effective on_connect_prompt_pattern: bookmark-level only (no profile support).
+    /// Returns `None` if the bookmark does not specify a prompt pattern.
+    /// Will be wired into ssh/mod.rs prompt-wait logic.
+    #[allow(dead_code)]
+    pub fn effective_on_connect_prompt_pattern(&self) -> Option<String> {
+        self.on_connect_prompt_pattern.clone()
     }
 
     /// Resolve a two-layer optional field: bookmark value wins, profile value is fallback.
@@ -531,6 +545,7 @@ mod tests {
             last_connected: None,
             connect_count: 0,
             on_connect: None,
+            on_connect_prompt_pattern: None,
             snippets: vec![],
             connect_timeout_secs: None,
             ssh_options: std::collections::BTreeMap::new(),

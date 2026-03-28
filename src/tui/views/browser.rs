@@ -78,6 +78,8 @@ pub enum SortField {
 /// State for one pane of the browser.
 pub struct PaneState {
     pub entries: Vec<FileEntry>,
+    /// Full unfiltered entry list for live search filtering.
+    pub all_entries: Vec<FileEntry>,
     pub selected: usize,
     pub cwd: String,
     pub marked: HashSet<usize>,
@@ -90,6 +92,7 @@ impl PaneState {
         list_state.select(Some(0));
         Self {
             entries: Vec::new(),
+            all_entries: Vec::new(),
             selected: 0,
             cwd,
             marked: HashSet::new(),
@@ -956,6 +959,11 @@ async fn handle_key(
                     t.cancel.store(true, Ordering::Relaxed);
                 }
                 state.status_message = Some("Cancelling transfers...".to_string());
+            } else if state.filter.is_some() {
+                // Clear active filter before quitting
+                state.filter = None;
+                let pane = active_pane_mut(left_pane, right_pane, state);
+                refilter_pane(pane, &None);
             } else {
                 return Ok(BrowserAction::Quit);
             }
@@ -1364,6 +1372,34 @@ fn select_entry_by_name(pane: &mut PaneState, name: &str) {
     }
 }
 
+/// Re-filter pane entries from cached all_entries (no backend round-trip).
+/// Used for live search-as-you-type filtering.
+fn refilter_pane(pane: &mut PaneState, filter: &Option<String>) {
+    let mut entries = pane.all_entries.clone();
+    if let Some(query) = filter {
+        let q = query.to_lowercase();
+        entries.retain(|e| e.name == ".." || e.name.to_lowercase().contains(&q));
+    }
+    // Always include ".." at the top
+    if !entries.iter().any(|e| e.name == "..") {
+        entries.insert(
+            0,
+            FileEntry {
+                name: "..".to_string(),
+                path: "..".to_string(),
+                is_dir: true,
+                size: 0,
+                modified: None,
+                permissions: None,
+            },
+        );
+    }
+    pane.entries = entries;
+    pane.selected = pane.selected.min(pane.entries.len().saturating_sub(1));
+    pane.list_state.select(Some(pane.selected));
+    pane.marked.clear();
+}
+
 /// Refresh a pane's file listing from its backend.
 async fn refresh_pane(
     pane: &mut PaneState,
@@ -1381,9 +1417,14 @@ async fn refresh_pane(
         entries.retain(|e| !e.name.starts_with('.'));
     }
 
-    // Apply glob filter
+    // Sort before storing (all_entries is pre-filter, post-sort)
+    sort_entries(&mut entries, state.sort_by, state.sort_asc);
+    pane.all_entries = entries.clone();
+
+    // Apply live substring filter (case-insensitive)
     if let Some(ref filter) = state.filter {
-        entries.retain(|e| e.is_dir || glob_match(filter, &e.name));
+        let query = filter.to_lowercase();
+        entries.retain(|e| e.name == ".." || e.name.to_lowercase().contains(&query));
     }
 
     // Sort
@@ -1434,7 +1475,8 @@ fn sort_entries(entries: &mut [FileEntry], sort_by: SortField, ascending: bool) 
     });
 }
 
-/// Simple glob matching (reused from config module).
+/// Simple glob matching — used by SelectPattern and tests.
+#[cfg(test)]
 fn glob_match(pattern: &str, text: &str) -> bool {
     glob_match_opts(pattern, text, true)
 }
@@ -1552,15 +1594,12 @@ fn draw(
         right_ctx,
     );
 
-    // Filter bar
-    if has_filter {
-        let filter_text = if let InputMode::Filter(ref input) = state.input_mode {
-            format!(" Filter: {}_ ", input)
-        } else if let Some(ref filter) = state.filter {
-            format!(" Filter: {} ", filter)
-        } else {
-            String::new()
-        };
+    // Active filter indicator (shown when filter is committed, not during typing)
+    if has_filter
+        && !matches!(state.input_mode, InputMode::Filter(_))
+        && let Some(ref filter) = state.filter
+    {
+        let filter_text = format!(" Filter: {filter} (/ to edit, Esc to clear) ");
         frame.render_widget(
             Paragraph::new(filter_text).style(Style::default().fg(Color::Yellow)),
             main_chunks[2],
@@ -1586,6 +1625,24 @@ fn draw(
 
     // Popup overlays (rendered on top of everything)
     match &state.input_mode {
+        InputMode::Filter(input) => {
+            let pane = if state.active_pane == Side::Left {
+                &*left_pane
+            } else {
+                &*right_pane
+            };
+            let match_count = pane.entries.len().saturating_sub(1); // exclude ".."
+            let label = format!("Search ({match_count} matches)");
+            draw_input_popup(
+                frame,
+                size,
+                "Search Files",
+                &label,
+                input,
+                &["Enter", "Esc"],
+                0,
+            );
+        }
         InputMode::MkdirPrompt(input) => {
             draw_mkdir_popup(frame, size, input, state.popup_focus);
         }
@@ -4624,11 +4681,34 @@ async fn handle_input_mode(
         return Ok(());
     }
 
+    // Handle char/backspace for live filter — re-filter on every keystroke
+    if matches!(key.code, KeyCode::Char(_) | KeyCode::Backspace)
+        && matches!(state.input_mode, InputMode::Filter(_))
+    {
+        if let InputMode::Filter(ref mut input) = state.input_mode {
+            match key.code {
+                KeyCode::Char(c) => input.push(c),
+                KeyCode::Backspace => {
+                    input.pop();
+                }
+                _ => {}
+            }
+            let filter = if input.is_empty() {
+                None
+            } else {
+                Some(input.clone())
+            };
+            state.filter = filter.clone();
+            let pane = active_pane_mut(left_pane, right_pane, state);
+            refilter_pane(pane, &filter);
+        }
+        return Ok(());
+    }
+
     // Handle char/backspace editing for text input modes
     if matches!(key.code, KeyCode::Char(_) | KeyCode::Backspace) {
         let input_ref = match &mut state.input_mode {
-            InputMode::Filter(input)
-            | InputMode::MkdirPrompt(input)
+            InputMode::MkdirPrompt(input)
             | InputMode::GotoPrompt(input)
             | InputMode::SelectPattern { input, .. } => Some(input),
             InputMode::RenamePrompt { input, .. } => Some(input),
@@ -4719,8 +4799,7 @@ async fn handle_input_mode(
             state.filter = None;
             state.input_mode = InputMode::Normal;
             let pane = active_pane_mut(left_pane, right_pane, state);
-            let backend = active_backend_mut(left, right, state);
-            refresh_pane(pane, backend, state).await?;
+            refilter_pane(pane, &None);
         } else {
             state.input_mode = InputMode::Normal;
         }
@@ -4732,11 +4811,9 @@ async fn handle_input_mode(
         // Take ownership of input_mode so we can freely use state
         let mode = std::mem::replace(&mut state.input_mode, InputMode::Normal);
         match mode {
-            InputMode::Filter(input) => {
-                state.filter = if input.is_empty() { None } else { Some(input) };
-                let pane = active_pane_mut(left_pane, right_pane, state);
-                let backend = active_backend_mut(left, right, state);
-                refresh_pane(pane, backend, state).await?;
+            InputMode::Filter(_input) => {
+                // Filter is already applied live — just dismiss the popup.
+                // state.filter remains set from live keystrokes.
             }
             InputMode::MkdirPrompt(input) => {
                 if state.popup_focus == 0 {

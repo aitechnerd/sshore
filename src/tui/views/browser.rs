@@ -1499,6 +1499,13 @@ fn draw(
 ) {
     let size = frame.area();
 
+    // Fill entire screen with a solid dark background so the SSH session's
+    // terminal content (e.g., remote MC) doesn't bleed through anywhere.
+    frame.render_widget(
+        Block::default().style(Style::default().bg(Color::Rgb(20, 20, 25))),
+        size,
+    );
+
     // Layout: header, panes, filter bar (0-1), prompt bar (0-1), status message (0-1), F-key bar
     let has_filter = matches!(state.input_mode, InputMode::Filter(_)) || state.filter.is_some();
     let has_status = state.status_message.is_some();
@@ -2858,9 +2865,13 @@ fn draw_pane(
                 Style::default()
             };
 
-            // Apply subtle background tint for remote pane
+            // Apply background: env tint for remote, solid dark for local.
+            // Must be explicit (not Color::Reset) to prevent the SSH session's
+            // terminal content from bleeding through.
             if let Some(tint) = bg_tint {
                 style = style.bg(tint);
+            } else {
+                style = style.bg(Color::Rgb(20, 20, 25));
             }
 
             ListItem::new(text).style(style)
@@ -2888,6 +2899,11 @@ fn draw_pane(
     } else {
         Modifier::empty()
     };
+
+    // Fill entire pane area with background color so the SSH session's
+    // terminal content doesn't bleed through below the file list.
+    let pane_bg = bg_tint.unwrap_or(Color::Rgb(20, 20, 25));
+    frame.render_widget(Block::default().style(Style::default().bg(pane_bg)), area);
 
     let list = List::new(items).block(block).highlight_style(
         Style::default()

@@ -1551,6 +1551,14 @@ async fn run_proxy_loop(
                     }
                 }
 
+                // Clear the screen so the browser's painted content doesn't
+                // linger under the remote app's next redraw.
+                let _ = crossterm::execute!(
+                    stdout,
+                    crossterm::terminal::Clear(crossterm::terminal::ClearType::All),
+                    crossterm::cursor::MoveTo(0, 0)
+                );
+
                 // Re-apply SSH session theming (BrowserGuard resets it on drop)
                 if let Ok(cfg) = config::load_with_override(cfg_override) {
                     let bm_name = session_info.bookmark_name.as_deref();
@@ -1567,8 +1575,13 @@ async fn run_proxy_loop(
                 crossterm::terminal::enable_raw_mode()
                     .context("Failed to re-enable raw mode after browser")?;
 
-                // Sync terminal size with remote PTY
+                // Force remote PTY to redraw by sending a fake resize (off by 1)
+                // followed by the real size. This generates a SIGWINCH in the
+                // remote shell, which makes fullscreen apps like MC redraw.
                 let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
+                let _ = channel_tx
+                    .window_change(cols.saturating_sub(1) as u32, rows as u32, 0, 0)
+                    .await;
                 let _ = channel_tx
                     .window_change(cols as u32, rows as u32, 0, 0)
                     .await;

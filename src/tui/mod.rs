@@ -90,6 +90,8 @@ pub struct App {
     browse_request: Option<usize>,
     /// Scroll offset for the help overlay.
     help_scroll: u16,
+    /// Which screen the user was on when they opened help (for context-aware content).
+    help_source: Option<Screen>,
     /// Config file path override (from --config flag or SSHORE_CONFIG env var).
     config_path_override: Option<String>,
     matcher: SkimMatcherV2,
@@ -120,6 +122,7 @@ impl App {
             connect_request: None,
             browse_request: None,
             help_scroll: 0,
+            help_source: None,
             config_path_override: None,
             matcher,
         }
@@ -481,7 +484,25 @@ fn draw(frame: &mut ratatui::Frame, app: &App) {
     // Overlays on top of everything
     match app.screen {
         Screen::Help => {
-            help::render_help(frame, frame.area(), theme, app.help_scroll);
+            let source = app.help_source.as_ref().unwrap_or(&Screen::List);
+            let is_production_delete = match source {
+                Screen::DeleteConfirm(_) => Some(
+                    app.confirm_state
+                        .as_ref()
+                        .map(|s| s.is_production)
+                        .unwrap_or(false),
+                ),
+                _ => None,
+            };
+            help::render_help(
+                frame,
+                frame.area(),
+                source,
+                app.search_active,
+                is_production_delete,
+                theme,
+                app.help_scroll,
+            );
         }
         Screen::AddForm | Screen::EditForm(_) => {
             if let Some(ref state) = app.form_state {
@@ -593,6 +614,7 @@ fn handle_list_key(app: &mut App, key: KeyEvent) {
         // Help
         KeyCode::Char('?') => {
             app.help_scroll = 0;
+            app.help_source = Some(Screen::List);
             app.screen = Screen::Help;
         }
 
@@ -622,6 +644,11 @@ fn handle_form_key(app: &mut App, key: KeyEvent) {
         KeyCode::Enter => {
             // Attempt to save
             try_save_form(app);
+        }
+        KeyCode::Char('?') => {
+            app.help_scroll = 0;
+            app.help_source = Some(app.screen.clone());
+            app.screen = Screen::Help;
         }
         KeyCode::Char(c) => form.insert_char(c),
         _ => {}
@@ -752,6 +779,11 @@ fn handle_confirm_key(app: &mut App, key: KeyEvent) {
                 app.refilter();
             }
         }
+        KeyCode::Char('?') => {
+            app.help_scroll = 0;
+            app.help_source = Some(app.screen.clone());
+            app.screen = Screen::Help;
+        }
         KeyCode::Backspace if state.is_production => {
             state.delete_char();
         }
@@ -779,6 +811,12 @@ fn handle_search_key(app: &mut App, key: KeyEvent) {
             app.search_query.pop();
             app.refilter();
         }
+        // Help (before Char catch-all — intercepts ? from search input)
+        KeyCode::Char('?') => {
+            app.help_scroll = 0;
+            app.help_source = Some(Screen::List);
+            app.screen = Screen::Help;
+        }
         // Allow arrow navigation while searching (before Char catch-all)
         KeyCode::Up => move_selection(app, -1),
         KeyCode::Down => move_selection(app, 1),
@@ -794,7 +832,7 @@ fn handle_search_key(app: &mut App, key: KeyEvent) {
 fn handle_help_key(app: &mut App, key: KeyEvent) {
     match key.code {
         KeyCode::Esc | KeyCode::Char('?') | KeyCode::Char('q') => {
-            app.screen = Screen::List;
+            app.screen = app.help_source.take().unwrap_or(Screen::List);
             app.help_scroll = 0;
         }
         KeyCode::Down | KeyCode::Char('j') => {
@@ -1111,5 +1149,121 @@ mod tests {
 
         assert_eq!(app.config.bookmarks.len(), initial_count + 1);
         assert!(app.config.bookmarks.iter().any(|b| b.name == "new-server"));
+    }
+
+    #[test]
+    fn test_help_source_set_from_list() {
+        let mut app = sample_app();
+        let key = KeyEvent::new(KeyCode::Char('?'), KeyModifiers::NONE);
+        handle_key_event(&mut app, key);
+        assert_eq!(app.screen, Screen::Help);
+        assert_eq!(app.help_source, Some(Screen::List));
+    }
+
+    #[test]
+    fn test_help_close_returns_to_origin_screen() {
+        let mut app = sample_app();
+        // Open form, then open help from form
+        let profile_names: Vec<String> =
+            app.config.profiles.iter().map(|p| p.name.clone()).collect();
+        app.form_state = Some(FormState::new_add(&app.config.settings, &profile_names));
+        app.screen = Screen::AddForm;
+
+        let key = KeyEvent::new(KeyCode::Char('?'), KeyModifiers::NONE);
+        handle_key_event(&mut app, key);
+        assert_eq!(app.screen, Screen::Help);
+        assert_eq!(app.help_source, Some(Screen::AddForm));
+
+        // Close help — should return to AddForm, not List
+        let esc = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
+        handle_key_event(&mut app, esc);
+        assert_eq!(app.screen, Screen::AddForm);
+    }
+
+    #[test]
+    fn test_help_close_returns_to_delete_confirm() {
+        let mut app = sample_app();
+        let bookmark = &app.config.bookmarks[0];
+        app.confirm_state = Some(ConfirmState::new(bookmark));
+        app.screen = Screen::DeleteConfirm(0);
+
+        let key = KeyEvent::new(KeyCode::Char('?'), KeyModifiers::NONE);
+        handle_key_event(&mut app, key);
+        assert_eq!(app.screen, Screen::Help);
+        assert_eq!(app.help_source, Some(Screen::DeleteConfirm(0)));
+
+        let esc = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
+        handle_key_event(&mut app, esc);
+        assert_eq!(app.screen, Screen::DeleteConfirm(0));
+    }
+
+    #[test]
+    fn test_help_scroll_resets_on_context_switch() {
+        let mut app = sample_app();
+        // Open help from list
+        let key = KeyEvent::new(KeyCode::Char('?'), KeyModifiers::NONE);
+        handle_key_event(&mut app, key);
+        assert_eq!(app.help_scroll, 0);
+
+        // Scroll down
+        let down = KeyEvent::new(KeyCode::Down, KeyModifiers::NONE);
+        handle_key_event(&mut app, down);
+        handle_key_event(&mut app, down);
+        assert!(app.help_scroll > 0);
+
+        // Close help
+        let esc = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
+        handle_key_event(&mut app, esc);
+
+        // Open help from form — scroll should reset to 0
+        let profile_names: Vec<String> =
+            app.config.profiles.iter().map(|p| p.name.clone()).collect();
+        app.form_state = Some(FormState::new_add(&app.config.settings, &profile_names));
+        app.screen = Screen::AddForm;
+        handle_key_event(&mut app, key);
+        assert_eq!(
+            app.help_scroll, 0,
+            "scroll should reset when opening help from a different screen"
+        );
+    }
+
+    #[test]
+    fn test_help_from_search_mode() {
+        let mut app = sample_app();
+        app.search_active = true;
+        app.screen = Screen::List;
+
+        let key = KeyEvent::new(KeyCode::Char('?'), KeyModifiers::NONE);
+        handle_key_event(&mut app, key);
+        assert_eq!(app.screen, Screen::Help);
+        assert_eq!(app.help_source, Some(Screen::List));
+        // search_active should still be true so help content shows search context
+        assert!(app.search_active);
+
+        // Close help — return to list with search still active
+        let esc = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
+        handle_key_event(&mut app, esc);
+        assert_eq!(app.screen, Screen::List);
+        assert!(app.search_active);
+    }
+
+    #[test]
+    fn test_delete_confirm_invalid_index_help_no_panic() {
+        let mut app = sample_app();
+        // Set up confirm state for a stale/invalid index
+        app.screen = Screen::DeleteConfirm(9999);
+        app.confirm_state = None; // Stale state — confirm_state gone
+
+        // This should not panic when help is rendered; help_source is set
+        // and render_help uses confirm_state.is_production which defaults to false.
+        // We can only test the state transitions here (rendering needs a terminal).
+        app.help_scroll = 0;
+        app.help_source = Some(Screen::DeleteConfirm(9999));
+        app.screen = Screen::Help;
+
+        // Close help — returns to delete confirm screen
+        let esc = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
+        handle_key_event(&mut app, esc);
+        assert_eq!(app.screen, Screen::DeleteConfirm(9999));
     }
 }

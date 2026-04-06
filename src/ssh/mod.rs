@@ -1623,13 +1623,9 @@ async fn run_proxy_loop(
                     }
                 }
 
-                // Clear the screen so the browser's painted content doesn't
-                // linger under the remote app's next redraw.
-                let _ = crossterm::execute!(
-                    stdout,
-                    crossterm::terminal::Clear(crossterm::terminal::ClearType::All),
-                    crossterm::cursor::MoveTo(0, 0)
-                );
+                // BrowserGuard already called LeaveAlternateScreen, which
+                // restores the primary screen content (SSH session output).
+                // No clear needed — alternate screen isolation handles it.
 
                 // Re-apply SSH session theming (BrowserGuard resets it on drop)
                 if let Ok(cfg) = config::load_with_override(cfg_override) {

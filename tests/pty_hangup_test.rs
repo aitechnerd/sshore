@@ -24,7 +24,7 @@ mod unix_only {
         if pid == 0 {
             let bin = CString::new(env!("CARGO_BIN_EXE_sshore")).expect("valid binary path");
             let arg0 = CString::new("sshore").expect("valid argv[0]");
-            let arg1 = CString::new("__test-pty-hangup").expect("valid test subcommand");
+            let arg1 = CString::new("_test-pty-hangup").expect("valid test subcommand");
             unsafe {
                 libc::execl(
                     bin.as_ptr(),

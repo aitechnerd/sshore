@@ -172,7 +172,7 @@ pub enum Commands {
     },
 
     /// Internal: PTY hangup probe for integration tests.
-    #[command(name = "__test-pty-hangup", hide = true)]
+    #[command(name = "_test-pty-hangup", hide = true)]
     TestPtyHangup,
 }
 

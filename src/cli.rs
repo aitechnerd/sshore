@@ -170,6 +170,10 @@ pub enum Commands {
         #[arg(long)]
         include_settings: bool,
     },
+
+    /// Internal: PTY hangup probe for integration tests.
+    #[command(name = "__test-pty-hangup", hide = true)]
+    TestPtyHangup,
 }
 
 #[derive(Subcommand, Debug)]

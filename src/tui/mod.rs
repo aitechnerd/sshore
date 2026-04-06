@@ -5,6 +5,8 @@ pub mod widgets;
 use std::collections::HashSet;
 use std::time::{Duration, Instant};
 
+use std::sync::atomic::Ordering;
+
 use anyhow::{Context, Result};
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
 use crossterm::execute;
@@ -37,6 +39,18 @@ const TICK_RATE_ACTIVE: Duration = Duration::from_millis(100);
 /// Poll timeout when idle (no timed state changes pending).
 /// User input is detected instantly regardless of this value.
 const TICK_RATE_IDLE: Duration = Duration::from_secs(1);
+
+/// If `event::poll()` returns this many times in a row faster than the requested
+/// timeout (i.e. the fd is in a POLLHUP/error state), assume the terminal is gone.
+const RAPID_POLL_LIMIT: u32 = 10;
+
+/// Threshold: if a poll that requested ≥100ms returns in under this duration,
+/// it counts as suspiciously fast (broken fd returning immediately).
+const RAPID_POLL_THRESHOLD: Duration = Duration::from_millis(10);
+
+/// Maximum number of zero-timeout events to drain when re-entering the TUI.
+/// Prevents a dead terminal fd from spinning forever in `drain_events()`.
+const DRAIN_EVENTS_LIMIT: usize = 64;
 
 /// Number of items to jump with Page Up/Down.
 const PAGE_JUMP: usize = 10;
@@ -194,8 +208,15 @@ fn enter_tui() -> Result<Terminal<CrosstermBackend<std::io::Stdout>>> {
 /// Called after re-entering raw mode (e.g. returning from SSH) to prevent
 /// leftover key-release or resize events from swallowing the first real keypress.
 fn drain_events() {
-    while event::poll(Duration::ZERO).unwrap_or(false) {
-        let _ = event::read();
+    let mut drained = 0usize;
+    while drained < DRAIN_EVENTS_LIMIT
+        && !crate::SHUTDOWN_REQUESTED.load(Ordering::Relaxed)
+        && event::poll(Duration::ZERO).unwrap_or(false)
+    {
+        if event::read().is_err() {
+            break;
+        }
+        drained += 1;
     }
 }
 
@@ -242,6 +263,15 @@ pub async fn run(config: &mut AppConfig, cfg_override: Option<&str>) -> Result<(
     let mut app = App::new(config.clone()).with_config_override(cfg_override);
 
     loop {
+        if crate::SHUTDOWN_REQUESTED.load(Ordering::Relaxed) {
+            tracing::debug!("shutdown requested before entering TUI");
+            break;
+        }
+
+        // Re-install signal handlers before each TUI iteration because
+        // tokio::signal (used during SSH sessions) replaces our libc handlers.
+        crate::install_signal_handlers();
+
         let mut terminal = enter_tui()?;
         let action = event_loop(&mut terminal, &mut app)?;
         leave_tui(&mut terminal)?;
@@ -340,6 +370,8 @@ fn event_loop(
 
     // Always draw the first frame
     let mut needs_redraw = true;
+    // Consecutive suspiciously-fast poll returns (detects broken/closed terminal fd).
+    let mut rapid_polls: u32 = 0;
 
     loop {
         if needs_redraw {
@@ -356,19 +388,38 @@ fn event_loop(
             TICK_RATE_IDLE
         };
 
+        let before_poll = Instant::now();
         if event::poll(poll_timeout).context("Failed to poll events")? {
             match event::read().context("Failed to read event")? {
                 Event::Key(key) => {
                     handle_key_event(app, key);
                     needs_redraw = true;
+                    rapid_polls = 0;
                 }
                 Event::Resize(_, _) => {
                     needs_redraw = true;
+                    rapid_polls = 0;
                 }
                 other => {
                     tracing::trace!(?other, "TUI: ignoring event");
                 }
             }
+        }
+
+        // Detect broken terminal: when the fd is in POLLHUP/error state,
+        // poll() returns immediately regardless of the requested timeout.
+        // A legitimate key/resize event resets the counter above.
+        if poll_timeout >= TICK_RATE_ACTIVE && before_poll.elapsed() < RAPID_POLL_THRESHOLD {
+            rapid_polls += 1;
+            if rapid_polls >= RAPID_POLL_LIMIT {
+                tracing::debug!(
+                    rapid_polls,
+                    "terminal fd appears dead (poll returning instantly), exiting"
+                );
+                return Ok(LoopAction::Quit);
+            }
+        } else {
+            rapid_polls = 0;
         }
 
         // Check if status message expired (only source of timed state change)
@@ -378,7 +429,7 @@ fn event_loop(
             needs_redraw = true;
         }
 
-        if app.should_quit {
+        if app.should_quit || crate::SHUTDOWN_REQUESTED.load(Ordering::Relaxed) {
             return Ok(LoopAction::Quit);
         }
 
@@ -1033,6 +1084,11 @@ mod tests {
         let mut app = App::new(config);
         move_selection(&mut app, 1);
         assert_eq!(app.selected_index, 0);
+    }
+
+    #[test]
+    fn test_drain_events_limit_is_positive() {
+        assert!(DRAIN_EVENTS_LIMIT > 0);
     }
 
     #[test]

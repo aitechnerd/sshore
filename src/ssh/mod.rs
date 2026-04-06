@@ -1040,6 +1040,8 @@ impl Drop for SshSignalHandlers {
 /// Set up signal handlers for graceful SSH session shutdown.
 #[cfg(unix)]
 async fn setup_ssh_signal_handlers() -> Result<SshSignalHandlers> {
+    use std::sync::atomic::Ordering;
+
     use tokio::signal::unix::{SignalKind, signal};
 
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
@@ -1050,6 +1052,7 @@ async fn setup_ssh_signal_handlers() -> Result<SshSignalHandlers> {
     tasks.push(tokio::spawn(async move {
         if let Ok(mut sig) = signal(SignalKind::terminate()) {
             sig.recv().await;
+            crate::SHUTDOWN_REQUESTED.store(true, Ordering::Relaxed);
             let _ = tx.send(true);
         }
     }));
@@ -1059,6 +1062,7 @@ async fn setup_ssh_signal_handlers() -> Result<SshSignalHandlers> {
     tasks.push(tokio::spawn(async move {
         if let Ok(mut sig) = signal(SignalKind::hangup()) {
             sig.recv().await;
+            crate::SHUTDOWN_REQUESTED.store(true, Ordering::Relaxed);
             let _ = tx.send(true);
         }
     }));
@@ -1079,6 +1083,74 @@ async fn setup_ssh_signal_handlers() -> Result<SshSignalHandlers> {
 enum ProxyAction {
     Exit,
     Browser,
+}
+
+/// Stdin state observed by the proxy loop.
+#[derive(Debug, PartialEq, Eq)]
+enum StdinEvent {
+    Data(Vec<u8>),
+    Closed,
+}
+
+fn classify_stdin_event(event: Option<Vec<u8>>) -> StdinEvent {
+    match event {
+        Some(bytes) => StdinEvent::Data(bytes),
+        None => StdinEvent::Closed,
+    }
+}
+
+async fn disconnect_session_best_effort(
+    session: &Arc<russh::client::Handle<SshoreHandler>>,
+    reason: &str,
+) {
+    let _ = session
+        .disconnect(russh::Disconnect::ByApplication, reason, "")
+        .await;
+}
+
+/// Internal helper for PTY hangup integration tests.
+/// Mirrors the stdin/signal shutdown paths used by interactive SSH sessions
+/// without requiring a live SSH server.
+#[cfg(unix)]
+pub async fn run_test_pty_hangup_probe() -> Result<()> {
+    use std::io::Write;
+
+    let was_raw = crossterm::terminal::is_raw_mode_enabled().unwrap_or(false);
+    crossterm::terminal::enable_raw_mode().context("Failed to enable raw mode")?;
+    let _guard = TerminalGuard { was_raw };
+
+    let signal_handlers = setup_ssh_signal_handlers().await?;
+    let mut shutdown_rx = signal_handlers.shutdown_rx.clone();
+    let (stdin_tx, mut stdin_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(8);
+    let mut stdin_reader = stdin_reader::StdinReader::spawn(stdin_tx);
+
+    println!("READY");
+    std::io::stdout().flush().ok();
+
+    loop {
+        tokio::select! {
+            _ = shutdown_rx.changed() => {
+                if *shutdown_rx.borrow() {
+                    break;
+                }
+            }
+            stdin = stdin_rx.recv() => {
+                match classify_stdin_event(stdin) {
+                    StdinEvent::Data(_) => {}
+                    StdinEvent::Closed => break,
+                }
+            }
+        }
+    }
+
+    drop(stdin_rx);
+    stdin_reader.stop();
+    Ok(())
+}
+
+#[cfg(not(unix))]
+pub async fn run_test_pty_hangup_probe() -> Result<()> {
+    anyhow::bail!("PTY hangup probe is only supported on Unix");
 }
 
 /// Run the interactive terminal proxy loop.
@@ -1322,17 +1394,6 @@ async fn run_proxy_loop(
                         }
                         None => {
                             tracing::debug!("channel stream ended (connection lost)");
-                            // Explicitly disconnect the session to avoid russh
-                            // internal task leaks when the connection drops
-                            // unexpectedly. Best-effort — ignore errors since
-                            // the connection is already lost.
-                            let _ = session
-                                .disconnect(
-                                    russh::Disconnect::ByApplication,
-                                    "connection lost",
-                                    "",
-                                )
-                                .await;
                             break 'proxy ProxyAction::Exit;
                         }
                     }
@@ -1343,7 +1404,15 @@ async fn run_proxy_loop(
                     let _ = stdout.flush();
                 }
 
-                Some(bytes) = stdin_rx.recv() => {
+                stdin = stdin_rx.recv() => {
+                    let bytes = match classify_stdin_event(stdin) {
+                        StdinEvent::Data(bytes) => bytes,
+                        StdinEvent::Closed => {
+                            tracing::debug!("stdin closed");
+                            break 'proxy ProxyAction::Exit;
+                        }
+                    };
+
                     if awaiting_confirm {
                         if bytes.first() == Some(&0x0d)
                             && let Some(ref pw) = stored_password
@@ -1531,7 +1600,10 @@ async fn run_proxy_loop(
         }
 
         match action {
-            ProxyAction::Exit => break,
+            ProxyAction::Exit => {
+                disconnect_session_best_effort(&session, "session ended").await;
+                break;
+            }
             ProxyAction::Browser => {
                 // Launch in-session SFTP file browser
                 match launch_browser(
@@ -1866,5 +1938,18 @@ mod tests {
         // (because it was already on before we started). Verify no panic.
         let guard = TerminalGuard { was_raw: true };
         drop(guard);
+    }
+
+    #[test]
+    fn test_classify_stdin_event_with_data() {
+        assert_eq!(
+            classify_stdin_event(Some(vec![b'a', b'b'])),
+            StdinEvent::Data(vec![b'a', b'b'])
+        );
+    }
+
+    #[test]
+    fn test_classify_stdin_event_with_closed_stdin() {
+        assert_eq!(classify_stdin_event(None), StdinEvent::Closed);
     }
 }

@@ -630,6 +630,8 @@ pub async fn run(
     // How often to auto-refresh the local pane during active transfers.
     const LOCAL_REFRESH_INTERVAL: Duration = Duration::from_secs(2);
     let mut last_local_refresh = std::time::Instant::now();
+    // Consecutive suspiciously-fast poll returns (detects broken/closed terminal fd).
+    let mut rapid_polls: u32 = 0;
 
     loop {
         // Auto-refresh local pane during transfers so .part files appear/update.
@@ -828,9 +830,11 @@ pub async fn run(
         } else {
             PROGRESS_POLL_RATE
         };
+        let before_poll = std::time::Instant::now();
         if event::poll(poll_timeout)? {
             match event::read()? {
                 Event::Key(key) => {
+                    rapid_polls = 0;
                     // Handle input modes (filter, mkdir, rename, confirm, pattern select)
                     if !matches!(state.input_mode, InputMode::Normal) {
                         handle_input_mode(
@@ -863,12 +867,29 @@ pub async fn run(
                     }
                 }
                 Event::Resize(_, _) => {
+                    rapid_polls = 0;
                     needs_redraw = true;
                 }
                 other => {
                     tracing::trace!(?other, "browser: ignoring event");
                 }
             }
+        }
+
+        // Detect broken terminal: poll() returns instantly on a dead fd.
+        if poll_timeout >= PROGRESS_POLL_RATE && before_poll.elapsed() < Duration::from_millis(10) {
+            rapid_polls += 1;
+            if rapid_polls >= 10 {
+                tracing::debug!("browser: terminal fd appears dead, exiting");
+                break;
+            }
+        } else {
+            rapid_polls = 0;
+        }
+
+        // Exit if the terminal was closed (SIGHUP/SIGTERM sets the flag).
+        if crate::SHUTDOWN_REQUESTED.load(std::sync::atomic::Ordering::Relaxed) {
+            break;
         }
     }
 

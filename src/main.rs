@@ -20,18 +20,13 @@ static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 pub static malloc_conf: &[u8] = b"dirty_decay_ms:0,muzzy_decay_ms:0,retain:false\0";
 
 mod cli;
-mod config;
-mod keychain;
-mod sftp;
-mod ssh;
-mod storage;
-mod tui;
 
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 use clap::{CommandFactory, Parser};
+use sshore::{config, keychain, sftp, ssh, storage, tui};
 use zeroize::Zeroizing;
 
 use cli::{Cli, Commands, ImportSource, PasswordAction, TunnelAction};
@@ -138,6 +133,7 @@ fn setup_panic_hook() {
 #[tokio::main]
 async fn main() -> Result<()> {
     setup_panic_hook();
+    sshore::install_signal_handlers();
     let cli = Cli::parse();
 
     // Initialize debug logging if --debug is passed.
@@ -218,6 +214,9 @@ async fn main() -> Result<()> {
         Some(Commands::ResetTab) => {
             ssh::terminal_theme::reset_theme();
         }
+        Some(Commands::TestPtyHangup) => {
+            ssh::run_test_pty_hangup_probe().await?;
+        }
         None => {
             if let Some(name) = cli.connect {
                 cmd_connect(&name, cfg_override).await?;
@@ -248,6 +247,7 @@ fn check_bookmark_subcommand_collision(cmd: &Commands, cfg_override: Option<&str
         Commands::Password { .. } => "password",
         Commands::Completions { .. } => "completions",
         Commands::ResetTab => "reset-tab",
+        Commands::TestPtyHangup => return,
     };
 
     if let Ok(app_config) = config::load_with_override(cfg_override)

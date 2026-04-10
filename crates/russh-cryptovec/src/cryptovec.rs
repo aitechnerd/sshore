@@ -17,6 +17,11 @@ pub struct CryptoVec {
     p: *mut u8, // `pub(crate)` allows access from platform modules
     size: usize,
     capacity: usize,
+    /// Whether this allocation was made via `mmap` (true) or the global
+    /// allocator fallback (false). Must match between alloc and dealloc
+    /// to avoid calling `munmap` on allocator-owned memory (segfault).
+    #[cfg(not(any(windows, target_arch = "wasm32")))]
+    mmap_backed: bool,
 }
 
 impl Debug for CryptoVec {
@@ -157,6 +162,8 @@ impl Default for CryptoVec {
             p: std::ptr::NonNull::dangling().as_ptr(),
             size: 0,
             capacity: 0,
+            #[cfg(not(any(windows, target_arch = "wasm32")))]
+            mmap_backed: false,
         }
     }
 }
@@ -170,18 +177,30 @@ impl CryptoVec {
     /// Creates a new `CryptoVec` with `n` zeros.
     pub fn new_zeroed(size: usize) -> CryptoVec {
         let capacity = size.next_power_of_two();
-        let p = alloc_zeroed_locked(capacity);
-        CryptoVec { p, capacity, size }
+        #[cfg(not(any(windows, target_arch = "wasm32")))]
+        {
+            let (p, mmap_backed) = alloc_zeroed_locked(capacity);
+            CryptoVec { p, capacity, size, mmap_backed }
+        }
+        #[cfg(any(windows, target_arch = "wasm32"))]
+        {
+            let p = alloc_zeroed_locked(capacity);
+            CryptoVec { p, capacity, size }
+        }
     }
 
     /// Creates a new `CryptoVec` with capacity `capacity`.
     pub fn with_capacity(capacity: usize) -> CryptoVec {
         let capacity = capacity.next_power_of_two();
-        let p = alloc_zeroed_locked(capacity);
-        CryptoVec {
-            p,
-            capacity,
-            size: 0,
+        #[cfg(not(any(windows, target_arch = "wasm32")))]
+        {
+            let (p, mmap_backed) = alloc_zeroed_locked(capacity);
+            CryptoVec { p, capacity, size: 0, mmap_backed }
+        }
+        #[cfg(any(windows, target_arch = "wasm32"))]
+        {
+            let p = alloc_zeroed_locked(capacity);
+            CryptoVec { p, capacity, size: 0 }
         }
     }
 
@@ -219,11 +238,18 @@ impl CryptoVec {
         } else {
             // realloc ! and erase the previous memory.
             let next_capacity = size.next_power_of_two();
+
+            #[cfg(not(any(windows, target_arch = "wasm32")))]
+            let (new_p, new_mmap_backed) = alloc_zeroed_locked(next_capacity);
+            #[cfg(any(windows, target_arch = "wasm32"))]
             let new_p = alloc_zeroed_locked(next_capacity);
 
             unsafe {
                 if self.capacity > 0 {
                     std::ptr::copy_nonoverlapping(self.p, new_p, self.size);
+                    #[cfg(not(any(windows, target_arch = "wasm32")))]
+                    dealloc_locked(self.p, self.capacity, self.mmap_backed);
+                    #[cfg(any(windows, target_arch = "wasm32"))]
                     dealloc_locked(self.p, self.capacity);
                 }
             }
@@ -237,6 +263,10 @@ impl CryptoVec {
             } else {
                 self.capacity = next_capacity;
                 self.size = size;
+                #[cfg(not(any(windows, target_arch = "wasm32")))]
+                {
+                    self.mmap_backed = new_mmap_backed;
+                }
             }
         }
     }
@@ -359,6 +389,9 @@ impl Drop for CryptoVec {
     fn drop(&mut self) {
         if self.capacity > 0 {
             unsafe {
+                #[cfg(not(any(windows, target_arch = "wasm32")))]
+                dealloc_locked(self.p, self.capacity, self.mmap_backed);
+                #[cfg(any(windows, target_arch = "wasm32"))]
                 dealloc_locked(self.p, self.capacity);
             }
         }
@@ -372,63 +405,68 @@ impl Drop for CryptoVec {
 /// `munmap`. This prevents RSS inflation from jemalloc caching freed pages.
 ///
 /// On other platforms, falls back to the global allocator + mlock.
-fn alloc_zeroed_locked(capacity: usize) -> *mut u8 {
-    #[cfg(not(any(windows, target_arch = "wasm32")))]
-    {
-        match platform::mmap_alloc(capacity) {
-            Ok(nn) => nn.as_ptr(),
-            Err(_) => {
-                // Fallback to global allocator if mmap fails.
-                unsafe {
-                    let layout = std::alloc::Layout::from_size_align_unchecked(capacity, 1);
-                    let p = std::alloc::alloc_zeroed(layout);
-                    let _ = mlock(p, capacity);
-                    p
-                }
+///
+/// Returns `(pointer, is_mmap_backed)` on Unix so `dealloc_locked` can
+/// use the correct free path. Calling `munmap` on allocator-owned memory
+/// (or vice versa) corrupts the heap.
+#[cfg(not(any(windows, target_arch = "wasm32")))]
+fn alloc_zeroed_locked(capacity: usize) -> (*mut u8, bool) {
+    match platform::mmap_alloc(capacity) {
+        Ok(nn) => (nn.as_ptr(), true),
+        Err(_) => {
+            // Fallback to global allocator if mmap/mlock fails.
+            unsafe {
+                let layout = std::alloc::Layout::from_size_align_unchecked(capacity, 1);
+                let p = std::alloc::alloc_zeroed(layout);
+                let _ = mlock(p, capacity);
+                (p, false)
             }
         }
     }
-    #[cfg(any(windows, target_arch = "wasm32"))]
-    {
-        unsafe {
-            let layout = std::alloc::Layout::from_size_align_unchecked(capacity, 1);
-            let p = std::alloc::alloc_zeroed(layout);
-            let _ = mlock(p, capacity);
-            p
-        }
+}
+
+#[cfg(any(windows, target_arch = "wasm32"))]
+fn alloc_zeroed_locked(capacity: usize) -> *mut u8 {
+    unsafe {
+        let layout = std::alloc::Layout::from_size_align_unchecked(capacity, 1);
+        let p = std::alloc::alloc_zeroed(layout);
+        let _ = mlock(p, capacity);
+        p
     }
 }
 
 /// Free memory allocated by `alloc_zeroed_locked`.
 ///
-/// On Unix, uses `munmap` for immediate page return.
-/// On other platforms, uses the global allocator's dealloc.
+/// On Unix, `mmap_backed` selects the correct free path:
+/// - `true`: `munmap` (allocated via `mmap_alloc`)
+/// - `false`: global allocator dealloc (fallback path)
+///
+/// Mismatching the flag corrupts the heap — calling `munmap` on
+/// allocator-owned memory causes a segfault under memory pressure.
 ///
 /// # Safety
 /// `ptr` must have been returned by `alloc_zeroed_locked` with the same `capacity`.
-unsafe fn dealloc_locked(ptr: *mut u8, capacity: usize) {
-    #[cfg(not(any(windows, target_arch = "wasm32")))]
-    {
-        // We don't track whether this allocation came from mmap or the global
-        // allocator fallback. Since we only fall back on mmap failure (rare),
-        // we always try munmap. If it was from the global allocator, munmap
-        // would fail silently and we'd leak — but in practice mmap_alloc
-        // only fails under extreme conditions (no address space).
-        //
-        // A more robust approach would track the allocation source, but
-        // the fallback path is essentially never hit on modern systems.
-        unsafe {
+#[cfg(not(any(windows, target_arch = "wasm32")))]
+unsafe fn dealloc_locked(ptr: *mut u8, capacity: usize, mmap_backed: bool) {
+    unsafe {
+        if mmap_backed {
             platform::mmap_dealloc(NonNull::new_unchecked(ptr), capacity);
-        }
-    }
-    #[cfg(any(windows, target_arch = "wasm32"))]
-    {
-        unsafe {
+        } else {
             zeroize(ptr, capacity);
-            let _ = munlock(ptr, capacity);
+            let _ = platform::munlock(ptr, capacity);
             let layout = std::alloc::Layout::from_size_align_unchecked(capacity, 1);
             std::alloc::dealloc(ptr, layout);
         }
+    }
+}
+
+#[cfg(any(windows, target_arch = "wasm32"))]
+unsafe fn dealloc_locked(ptr: *mut u8, capacity: usize) {
+    unsafe {
+        zeroize(ptr, capacity);
+        let _ = munlock(ptr, capacity);
+        let layout = std::alloc::Layout::from_size_align_unchecked(capacity, 1);
+        std::alloc::dealloc(ptr, layout);
     }
 }
 

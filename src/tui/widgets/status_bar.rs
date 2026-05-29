@@ -53,6 +53,7 @@ fn list_hints(theme: &ThemeColors) -> Line<'static> {
     spans.extend(hint_pair("f", "SFTP", theme));
     spans.extend(hint_pair("/", "Search", theme));
     spans.extend(hint_pair("a", "Add", theme));
+    spans.extend(hint_pair("e", "Edit", theme));
     spans.extend(hint_pair("d", "Delete", theme));
     spans.extend(hint_pair("1-5", "Filter Env", theme));
     spans.extend(hint_pair("?", "Help", theme));

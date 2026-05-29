@@ -1022,61 +1022,10 @@ fn prompt_password(user: &str) -> Result<Zeroizing<String>> {
 /// auth succeeded and the password is saved to the keychain.
 const SUDO_SAVE_GRACE: std::time::Duration = std::time::Duration::from_millis(1500);
 
-/// Owns SSH signal watcher tasks for the lifetime of one proxy session.
-/// Tasks are aborted on drop so repeated sessions don't leak detached listeners.
-struct SshSignalHandlers {
-    shutdown_rx: tokio::sync::watch::Receiver<bool>,
-    tasks: Vec<tokio::task::JoinHandle<()>>,
-}
-
-impl Drop for SshSignalHandlers {
-    fn drop(&mut self) {
-        for task in &self.tasks {
-            task.abort();
-        }
-    }
-}
-
-/// Set up signal handlers for graceful SSH session shutdown.
-#[cfg(unix)]
-async fn setup_ssh_signal_handlers() -> Result<SshSignalHandlers> {
-    use std::sync::atomic::Ordering;
-
-    use tokio::signal::unix::{SignalKind, signal};
-
-    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-    let mut tasks = Vec::new();
-
-    // SIGTERM — kill <pid>
-    let tx = shutdown_tx.clone();
-    tasks.push(tokio::spawn(async move {
-        if let Ok(mut sig) = signal(SignalKind::terminate()) {
-            sig.recv().await;
-            crate::SHUTDOWN_REQUESTED.store(true, Ordering::Relaxed);
-            let _ = tx.send(true);
-        }
-    }));
-
-    // SIGHUP — terminal closed
-    let tx = shutdown_tx.clone();
-    tasks.push(tokio::spawn(async move {
-        if let Ok(mut sig) = signal(SignalKind::hangup()) {
-            sig.recv().await;
-            crate::SHUTDOWN_REQUESTED.store(true, Ordering::Relaxed);
-            let _ = tx.send(true);
-        }
-    }));
-
-    Ok(SshSignalHandlers { shutdown_rx, tasks })
-}
-
-#[cfg(not(unix))]
-async fn setup_ssh_signal_handlers() -> Result<SshSignalHandlers> {
-    let (_tx, rx) = tokio::sync::watch::channel(false);
-    Ok(SshSignalHandlers {
-        shutdown_rx: rx,
-        tasks: Vec::new(),
-    })
+/// Subscribe to the global shutdown signal channel.
+/// Returns a watch receiver that is notified on SIGHUP/SIGTERM.
+fn subscribe_shutdown() -> tokio::sync::watch::Receiver<bool> {
+    crate::subscribe_shutdown()
 }
 
 /// Whether the inner proxy loop should exit entirely or switch to browser mode.
@@ -1119,8 +1068,7 @@ pub async fn run_test_pty_hangup_probe() -> Result<()> {
     crossterm::terminal::enable_raw_mode().context("Failed to enable raw mode")?;
     let _guard = TerminalGuard { was_raw };
 
-    let signal_handlers = setup_ssh_signal_handlers().await?;
-    let mut shutdown_rx = signal_handlers.shutdown_rx.clone();
+    let mut shutdown_rx = subscribe_shutdown();
     let (stdin_tx, mut stdin_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(8);
     let mut stdin_reader = stdin_reader::StdinReader::spawn(stdin_tx);
 
@@ -1214,9 +1162,7 @@ async fn run_proxy_loop(
     let has_escape_triggers =
         has_snippets || !bookmark_trigger.is_empty() || !browser_trigger.is_empty();
 
-    // Signal handlers for graceful shutdown
-    let signal_handlers = setup_ssh_signal_handlers().await?;
-    let mut shutdown_rx = signal_handlers.shutdown_rx.clone();
+    let mut shutdown_rx = subscribe_shutdown();
 
     // SIGWINCH listener — inlined so channel_tx stays available after browser exits
     #[cfg(unix)]

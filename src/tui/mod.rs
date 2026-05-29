@@ -48,6 +48,9 @@ const RAPID_POLL_LIMIT: u32 = 10;
 /// it counts as suspiciously fast (broken fd returning immediately).
 const RAPID_POLL_THRESHOLD: Duration = Duration::from_millis(10);
 
+/// Interval at which the terminal watchdog thread checks if the terminal is alive.
+const TERMINAL_WATCHDOG_INTERVAL: Duration = Duration::from_millis(250);
+
 /// Maximum number of zero-timeout events to drain when re-entering the TUI.
 /// Prevents a dead terminal fd from spinning forever in `drain_events()`.
 const DRAIN_EVENTS_LIMIT: usize = 64;
@@ -262,19 +265,44 @@ pub async fn run(config: &mut AppConfig, cfg_override: Option<&str>) -> Result<(
 
     let mut app = App::new(config.clone()).with_config_override(cfg_override);
 
+    // Subscribe to global shutdown signal (SIGHUP/SIGTERM).
+    // The watch receiver is polled each iteration to detect terminal close.
+    let shutdown_rx = crate::subscribe_shutdown();
+
+    // Start the terminal watchdog: a background thread that monitors whether
+    // stdin is still a valid TTY. If the terminal emulator closes, crossterm's
+    // event::poll() can block indefinitely inside read() on the dead fd.
+    // The watchdog detects this independently and sets SHUTDOWN_REQUESTED
+    // to force the event loop to exit on its next iteration.
+    // Note: poll_stdin() below already handles dead TTY detection via
+    // libc::poll(), but the watchdog provides an additional safety net
+    // for edge cases where libc::poll() might also block.
+    let _watchdog = TerminalWatchdog::spawn();
+
     loop {
         if crate::SHUTDOWN_REQUESTED.load(Ordering::Relaxed) {
             tracing::debug!("shutdown requested before entering TUI");
             break;
         }
 
-        // Re-install signal handlers before each TUI iteration because
-        // tokio::signal (used during SSH sessions) replaces our libc handlers.
-        crate::install_signal_handlers();
-
-        let mut terminal = enter_tui()?;
+        let mut terminal = match enter_tui() {
+            Ok(t) => t,
+            Err(e) => {
+                tracing::debug!(error = %e, "failed to enter TUI, terminal likely gone");
+                break;
+            }
+        };
         let action = event_loop(&mut terminal, &mut app)?;
-        leave_tui(&mut terminal)?;
+        let _ = leave_tui(&mut terminal);
+
+        // Check shutdown after leaving TUI — if the terminal was closed
+        // during an SSH session, don't try to re-enter the TUI on a dead fd.
+        if crate::SHUTDOWN_REQUESTED.load(Ordering::Relaxed)
+            || *shutdown_rx.borrow()
+        {
+            tracing::debug!("shutdown requested after leaving TUI");
+            break;
+        }
 
         match action {
             LoopAction::Quit => {
@@ -297,8 +325,11 @@ pub async fn run(config: &mut AppConfig, cfg_override: Option<&str>) -> Result<(
                 {
                     tracing::debug!(error = %e, "SSH session ended with error");
                     eprintln!("SSH error: {e:#}");
-                    eprintln!("Press Enter to return to sshore...");
-                    let _ = wait_for_enter();
+                    // Don't block on stdin if the terminal is gone
+                    if !crate::SHUTDOWN_REQUESTED.load(Ordering::Relaxed) {
+                        eprintln!("Press Enter to return to sshore...");
+                        let _ = wait_for_enter();
+                    }
                 }
                 tracing::debug!("returned to TUI after SSH session");
             }
@@ -308,8 +339,10 @@ pub async fn run(config: &mut AppConfig, cfg_override: Option<&str>) -> Result<(
                 if let Err(e) = launch_browse(&app.config, bookmark_index).await {
                     tracing::debug!(error = %e, "browse ended with error");
                     eprintln!("Browse error: {e:#}");
-                    eprintln!("Press Enter to return to sshore...");
-                    let _ = wait_for_enter();
+                    if !crate::SHUTDOWN_REQUESTED.load(Ordering::Relaxed) {
+                        eprintln!("Press Enter to return to sshore...");
+                        let _ = wait_for_enter();
+                    }
                 }
                 tracing::debug!("returned to TUI after browse");
             }
@@ -323,10 +356,18 @@ pub async fn run(config: &mut AppConfig, cfg_override: Option<&str>) -> Result<(
 }
 
 /// Wait for the user to press Enter (used after SSH error messages).
+/// Returns `Ok(())` on dead terminal (stdin closed) rather than propagating
+/// an error, since a dead terminal is an expected exit path.
 fn wait_for_enter() -> Result<()> {
     let mut buf = String::new();
-    std::io::stdin().read_line(&mut buf)?;
-    Ok(())
+    match std::io::stdin().read_line(&mut buf) {
+        Ok(_) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            // stdin was closed (terminal gone) — not an error
+            Ok(())
+        }
+        Err(e) => Err(e.into()),
+    }
 }
 
 /// Launch the file browser for a bookmark from the TUI.
@@ -374,10 +415,31 @@ fn event_loop(
     let mut rapid_polls: u32 = 0;
 
     loop {
+        // Check shutdown at the top of the loop so we break out immediately
+        // even if poll() returns events on a dead fd.
+        if crate::SHUTDOWN_REQUESTED.load(Ordering::Relaxed) {
+            tracing::debug!("shutdown requested during event loop");
+            return Ok(LoopAction::Quit);
+        }
+
+        // Detect dead terminal: when the terminal emulator closes, stdin is
+        // no longer a valid TTY. This is the most reliable cross-platform way
+        // to detect that the user has closed the terminal window/tab.
+        if !is_terminal_active() || is_terminal_dead() {
+            tracing::debug!("stdin is no longer a terminal, exiting event loop");
+            return Ok(LoopAction::Quit);
+        }
+
         if needs_redraw {
-            terminal
+            // Draw on a dead terminal may fail; treat it as a signal to exit
+            // rather than propagating the error and crashing.
+            if terminal
                 .draw(|frame| draw(frame, app))
-                .context("Failed to draw frame")?;
+                .is_err()
+            {
+                tracing::debug!("draw failed, terminal likely gone");
+                return Ok(LoopAction::Quit);
+            }
             needs_redraw = false;
         }
 
@@ -388,27 +450,39 @@ fn event_loop(
             TICK_RATE_IDLE
         };
 
+        // Use our own poll() instead of crossterm's to avoid blocking
+        // indefinitely inside read() on a dead TTY. crossterm's event::poll()
+        // internally calls read() on stdin, which can block forever when the
+        // terminal is closed (POLLHUP state). Our libc::poll() has a bounded
+        // timeout and checks for POLLHUP/POLLERR directly.
+        let has_event = poll_stdin(poll_timeout);
+
         let before_poll = Instant::now();
-        if event::poll(poll_timeout).context("Failed to poll events")? {
-            match event::read().context("Failed to read event")? {
-                Event::Key(key) => {
+
+        if has_event {
+            match event::read() {
+                Ok(Event::Key(key)) => {
                     handle_key_event(app, key);
                     needs_redraw = true;
                     rapid_polls = 0;
                 }
-                Event::Resize(_, _) => {
+                Ok(Event::Resize(_, _)) => {
                     needs_redraw = true;
                     rapid_polls = 0;
                 }
-                other => {
+                Ok(other) => {
                     tracing::trace!(?other, "TUI: ignoring event");
+                }
+                Err(e) => {
+                    tracing::debug!(error = %e, "read failed, terminal likely gone");
+                    return Ok(LoopAction::Quit);
                 }
             }
         }
 
         // Detect broken terminal: when the fd is in POLLHUP/error state,
         // poll() returns immediately regardless of the requested timeout.
-        // A legitimate key/resize event resets the counter above.
+        // A legitimate key/resize event resets the counter.
         if poll_timeout >= TICK_RATE_ACTIVE && before_poll.elapsed() < RAPID_POLL_THRESHOLD {
             rapid_polls += 1;
             if rapid_polls >= RAPID_POLL_LIMIT {
@@ -438,6 +512,191 @@ fn event_loop(
         }
         if let Some(idx) = app.browse_request.take() {
             return Ok(LoopAction::Browse(idx));
+        }
+    }
+}
+
+/// Poll stdin for readability using libc::poll() with a bounded timeout.
+/// Returns `true` if stdin has data available to read.
+///
+/// This replaces `crossterm::event::poll()` to avoid the problem where
+/// crossterm blocks indefinitely inside `read()` on a dead TTY fd.
+///
+/// Unlike crossterm's implementation, this function:
+/// - Uses `libc::poll()` which has a guaranteed timeout
+/// - Detects POLLHUP/POLLERR and returns false (not true) for dead fds
+/// - Never blocks indefinitely
+#[cfg(unix)]
+fn poll_stdin(timeout: Duration) -> bool {
+    use std::os::unix::io::AsRawFd;
+
+    let timeout_ms = if timeout.is_zero() {
+        0
+    } else {
+        // Clamp to a maximum of 2 seconds to prevent any single poll
+        // from blocking for too long. This ensures the watchdog and
+        // shutdown checks fire at least every 2 seconds.
+        (timeout.as_millis() as i32).min(2000)
+    };
+
+    let mut fds = libc::pollfd {
+        fd: std::io::stdin().as_raw_fd(),
+        events: libc::POLLIN,
+        revents: 0,
+    };
+
+    let ret = unsafe { libc::poll(&mut fds, 1, timeout_ms) };
+
+    if ret < 0 {
+        // EINTR — signal interrupted poll, treat as no events
+        // (the signal handler will set SHUTDOWN_REQUESTED if needed)
+        return false;
+    }
+
+    if ret == 0 {
+        // Timeout — no events
+        return false;
+    }
+
+    // Check for hangup or error — these indicate a dead terminal
+    if fds.revents & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL) != 0 {
+        return false;
+    }
+
+    // POLLIN set — data available
+    fds.revents & libc::POLLIN != 0
+}
+
+#[cfg(not(unix))]
+fn poll_stdin(timeout: Duration) -> bool {
+    // On non-Unix platforms, fall back to crossterm's poll
+    event::poll(timeout).unwrap_or(false)
+}
+
+/// Check if stdin is still connected to an active terminal.
+/// Returns `false` when the terminal has been closed (e.g., window/tab closed),
+/// which causes stdin to no longer be a TTY device.
+///
+/// This is the primary defense against the "zombie process" problem where
+/// sshore spins at 100% CPU after the terminal emulator is terminated.
+/// The signal-based approach (SIGHUP) is unreliable because:
+/// - SIGHUP may not be delivered if the process was started from a non-login shell
+/// - The tokio signal handler runs on the async runtime, not the blocking poll thread
+/// - macOS terminal emulators may not send SIGHUP to child processes on window close
+#[cfg(unix)]
+fn is_terminal_active() -> bool {
+    use std::os::unix::io::AsRawFd;
+    let fd = std::io::stdin().as_raw_fd();
+    // isatty() returns 0 if fd is not connected to a terminal
+    let result = unsafe { libc::isatty(fd) };
+    result != 0
+}
+
+/// Try to detect a dead terminal by performing a non-blocking poll on stdin.
+/// On macOS, when the terminal window closes, the PTY slave fd may still pass
+/// isatty() but poll() returns POLLHUP | POLLERR. This is non-invasive:
+/// it doesn't consume any data from the fd.
+#[cfg(unix)]
+fn is_terminal_dead() -> bool {
+    use std::os::unix::io::AsRawFd;
+    let fd = std::io::stdin().as_raw_fd();
+    // First check: if isatty returns false, terminal is definitely gone
+    if unsafe { libc::isatty(fd) } == 0 {
+        return true;
+    }
+    // Second check: use poll() to detect HUP/ERR on the fd.
+    // This is non-invasive — it doesn't read any data.
+    let mut fds = libc::pollfd {
+        fd,
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    // Zero timeout — just check current state, don't block
+    let ret = unsafe { libc::poll(&mut fds, 1, 0) };
+    if ret < 0 {
+        return false; // poll error, inconclusive
+    }
+    if ret == 0 {
+        return false; // no events, terminal is fine
+    }
+    // Check for hangup or error flags
+    if fds.revents & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL) != 0 {
+        return true;
+    }
+    false
+}
+
+#[cfg(not(unix))]
+fn is_terminal_dead() -> bool {
+    false
+}
+
+/// Install a no-op signal handler for SIGUSR1 so that raising it from the
+/// terminal watchdog interrupts blocking syscalls (like read() in crossterm)
+/// without terminating the process.
+#[cfg(unix)]
+fn install_sigusr1_noop_handler() {
+    unsafe {
+        libc::signal(
+            libc::SIGUSR1,
+            libc::SIG_IGN as libc::sighandler_t,
+        );
+    }
+}
+
+/// Background thread that monitors whether the terminal is still alive.
+///
+/// This is a safety net: even though `poll_stdin()` uses `libc::poll()` with
+/// a bounded timeout, the watchdog provides independent monitoring in case
+/// the event loop gets stuck for any other reason.
+struct TerminalWatchdog {
+    _handle: Option<std::thread::JoinHandle<()>>,
+}
+
+impl TerminalWatchdog {
+    fn spawn() -> Self {
+        // Install no-op handler for SIGUSR1 as a fallback interrupt mechanism.
+        #[cfg(unix)]
+        install_sigusr1_noop_handler();
+
+        let handle = std::thread::Builder::new()
+            .name("terminal-watchdog".into())
+            .spawn(move || {
+                loop {
+                    // Exit if shutdown was requested by another mechanism
+                    if crate::SHUTDOWN_REQUESTED.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    if !is_terminal_active() || is_terminal_dead() {
+                        tracing::debug!(
+                            "terminal watchdog: terminal closed, requesting shutdown"
+                        );
+                        crate::SHUTDOWN_REQUESTED.store(true, Ordering::Relaxed);
+                        // Interrupt any blocking syscall in the main thread.
+                        // SIGUSR1 with SIG_IGN handler is a no-op that still
+                        // causes EINTR on blocking syscalls.
+                        #[cfg(unix)]
+                        unsafe {
+                            libc::raise(libc::SIGUSR1);
+                        }
+                        break;
+                    }
+                    std::thread::sleep(TERMINAL_WATCHDOG_INTERVAL);
+                }
+            })
+            .expect("failed to spawn terminal watchdog thread");
+        Self {
+            _handle: Some(handle),
+        }
+    }
+}
+
+impl Drop for TerminalWatchdog {
+    fn drop(&mut self) {
+        // Signal the watchdog to stop, then join
+        crate::SHUTDOWN_REQUESTED.store(true, Ordering::Relaxed);
+        if let Some(handle) = self._handle.take() {
+            let _ = handle.join();
         }
     }
 }

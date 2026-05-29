@@ -9,6 +9,11 @@ use std::os::unix::io::RawFd;
 /// Read buffer size for stdin data.
 const READ_BUF_SIZE: usize = 1024;
 
+/// Poll timeout (ms) for the stdin reader thread.
+/// Non-zero so the thread can periodically check SHUTDOWN_REQUESTED
+/// and exit cleanly when the terminal is closed.
+const POLL_TIMEOUT_MS: libc::c_int = 500;
+
 /// A cancellable stdin reader backed by an OS thread.
 ///
 /// On Unix, uses `libc::poll()` on both stdin (fd 0) and a wake pipe.
@@ -99,8 +104,9 @@ impl StdinReader {
                 },
             ];
 
-            // Block until stdin or wake pipe is readable (no timeout)
-            let ret = unsafe { libc::poll(poll_fds.as_mut_ptr(), 2, -1) };
+            // Block until stdin or wake pipe is readable, with a timeout
+            // so we can check SHUTDOWN_REQUESTED and exit cleanly.
+            let ret = unsafe { libc::poll(poll_fds.as_mut_ptr(), 2, POLL_TIMEOUT_MS) };
             if ret < 0 {
                 // EINTR — signal interrupted poll, retry
                 let err = std::io::Error::last_os_error();
@@ -110,10 +116,20 @@ impl StdinReader {
                 break;
             }
 
+            // Check if shutdown was requested while we were blocked.
+            // This handles the case where the terminal was closed and SIGHUP
+            // was delivered but didn't interrupt poll() (e.g., poll returned
+            // 0 on timeout after the signal was already consumed by the global handler).
+            if crate::SHUTDOWN_REQUESTED.load(std::sync::atomic::Ordering::Relaxed) {
+                break;
+            }
+
             // Wake pipe signalled — time to exit
             if poll_fds[1].revents != 0 {
                 break;
             }
+
+            // ret == 0 means timeout with no events — loop back and poll again
 
             // Stdin is readable
             if poll_fds[0].revents & libc::POLLIN != 0 {

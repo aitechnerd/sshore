@@ -45,7 +45,8 @@ pub fn install_signal_handlers() {
     let tx = SIGNAL_TX.clone();
     tokio::spawn(async move {
         let mut sighup = signal(SignalKind::hangup()).expect("failed to install SIGHUP handler");
-        let mut sigterm = signal(SignalKind::terminate()).expect("failed to install SIGTERM handler");
+        let mut sigterm =
+            signal(SignalKind::terminate()).expect("failed to install SIGTERM handler");
 
         loop {
             tokio::select! {

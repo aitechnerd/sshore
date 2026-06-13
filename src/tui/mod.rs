@@ -297,9 +297,7 @@ pub async fn run(config: &mut AppConfig, cfg_override: Option<&str>) -> Result<(
 
         // Check shutdown after leaving TUI — if the terminal was closed
         // during an SSH session, don't try to re-enter the TUI on a dead fd.
-        if crate::SHUTDOWN_REQUESTED.load(Ordering::Relaxed)
-            || *shutdown_rx.borrow()
-        {
+        if crate::SHUTDOWN_REQUESTED.load(Ordering::Relaxed) || *shutdown_rx.borrow() {
             tracing::debug!("shutdown requested after leaving TUI");
             break;
         }
@@ -433,10 +431,7 @@ fn event_loop(
         if needs_redraw {
             // Draw on a dead terminal may fail; treat it as a signal to exit
             // rather than propagating the error and crashing.
-            if terminal
-                .draw(|frame| draw(frame, app))
-                .is_err()
-            {
+            if terminal.draw(|frame| draw(frame, app)).is_err() {
                 tracing::debug!("draw failed, terminal likely gone");
                 return Ok(LoopAction::Quit);
             }
@@ -637,10 +632,7 @@ fn is_terminal_dead() -> bool {
 #[cfg(unix)]
 fn install_sigusr1_noop_handler() {
     unsafe {
-        libc::signal(
-            libc::SIGUSR1,
-            libc::SIG_IGN as libc::sighandler_t,
-        );
+        libc::signal(libc::SIGUSR1, libc::SIG_IGN as libc::sighandler_t);
     }
 }
 
@@ -668,9 +660,7 @@ impl TerminalWatchdog {
                         break;
                     }
                     if !is_terminal_active() || is_terminal_dead() {
-                        tracing::debug!(
-                            "terminal watchdog: terminal closed, requesting shutdown"
-                        );
+                        tracing::debug!("terminal watchdog: terminal closed, requesting shutdown");
                         crate::SHUTDOWN_REQUESTED.store(true, Ordering::Relaxed);
                         // Interrupt any blocking syscall in the main thread.
                         // SIGUSR1 with SIG_IGN handler is a no-op that still

@@ -627,10 +627,7 @@ fn render_proxy_jump_field(
         } else {
             Style::default().fg(tc.fg_muted)
         };
-        Line::from(Span::styled(
-            format!("{prefix}{value}{cursor}"),
-            style,
-        ))
+        Line::from(Span::styled(format!("{prefix}{value}{cursor}"), style))
     };
 
     frame.render_widget(Paragraph::new(line), area);

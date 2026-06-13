@@ -415,12 +415,7 @@ async fn connect_direct(
 
     let connect_future = russh::client::connect(ssh_config, (host, port), handler);
 
-    match tokio::time::timeout(
-        std::time::Duration::from_secs(timeout_secs),
-        connect_future,
-    )
-    .await
-    {
+    match tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), connect_future).await {
         Ok(result) => {
             tracing::debug!("TCP connection established");
             result.with_context(|| format!("Failed to connect to {host}:{port}"))
@@ -477,27 +472,30 @@ async fn connect_through_proxy(
         SshoreHandler::for_host(&jump_target.host, jump_target.port, check_mode.clone());
     let jump_config = build_ssh_config();
 
-    let mut jump_session =
-        match tokio::time::timeout(
-            std::time::Duration::from_secs(timeout_secs),
-            russh::client::connect(jump_config, (jump_target.host.as_str(), jump_target.port), jump_handler),
-        )
-        .await
-        {
-            Ok(result) => result.with_context(|| {
-                format!(
-                    "Failed to connect to jump host {}:{}",
-                    jump_target.host, jump_target.port
-                )
-            })?,
-            Err(_) => {
-                bail!(
-                    "Connection to jump host {}:{} timed out after {timeout_secs}s",
-                    jump_target.host,
-                    jump_target.port
-                )
-            }
-        };
+    let mut jump_session = match tokio::time::timeout(
+        std::time::Duration::from_secs(timeout_secs),
+        russh::client::connect(
+            jump_config,
+            (jump_target.host.as_str(), jump_target.port),
+            jump_handler,
+        ),
+    )
+    .await
+    {
+        Ok(result) => result.with_context(|| {
+            format!(
+                "Failed to connect to jump host {}:{}",
+                jump_target.host, jump_target.port
+            )
+        })?,
+        Err(_) => {
+            bail!(
+                "Connection to jump host {}:{} timed out after {timeout_secs}s",
+                jump_target.host,
+                jump_target.port
+            )
+        }
+    };
 
     // Step 2: Authenticate to the jump host
     // Use default keys (matching native ssh -J behavior) + keychain password
@@ -540,24 +538,21 @@ async fn connect_through_proxy(
     let target_handler = SshoreHandler::for_host(target_host, target_port, target_check_mode);
     let target_config = build_ssh_config();
 
-    let target_session =
-        match tokio::time::timeout(
-            std::time::Duration::from_secs(timeout_secs),
-            russh::client::connect_stream(target_config, stream, target_handler),
-        )
-        .await
-        {
-            Ok(result) => result.with_context(|| {
-                format!(
-                    "Failed to establish SSH through jump to {target_host}:{target_port}"
-                )
-            })?,
-            Err(_) => {
-                bail!(
-                    "SSH connection through jump to {target_host}:{target_port} timed out after {timeout_secs}s"
-                )
-            }
-        };
+    let target_session = match tokio::time::timeout(
+        std::time::Duration::from_secs(timeout_secs),
+        russh::client::connect_stream(target_config, stream, target_handler),
+    )
+    .await
+    {
+        Ok(result) => result.with_context(|| {
+            format!("Failed to establish SSH through jump to {target_host}:{target_port}")
+        })?,
+        Err(_) => {
+            bail!(
+                "SSH connection through jump to {target_host}:{target_port} timed out after {timeout_secs}s"
+            )
+        }
+    };
 
     tracing::debug!(
         jump_host = jump_target.host,
@@ -607,8 +602,7 @@ async fn authenticate_with_jump_keychain(
 
     // 2. Try keychain password keyed by __jump:<host>
     let jump_keychain_name = format!("__jump:{}", jump_host);
-    if let Ok(Some(stored)) = keychain::get_password(&jump_keychain_name)
-    {
+    if let Ok(Some(stored)) = keychain::get_password(&jump_keychain_name) {
         tracing::debug!(jump_host, "trying keychain password for jump host");
         match session.authenticate_password(user, &stored).await {
             Ok(AuthResult::Success) => {
@@ -650,7 +644,10 @@ async fn authenticate_with_jump_keychain(
 /// Offer to save a jump host password to the keychain.
 fn offer_save_jump_password(jump_keychain_name: &str, password: &str) {
     // Check if already stored
-    if keychain::get_password(jump_keychain_name).unwrap_or(None).is_some() {
+    if keychain::get_password(jump_keychain_name)
+        .unwrap_or(None)
+        .is_some()
+    {
         return;
     }
 

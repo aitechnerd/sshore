@@ -396,9 +396,7 @@ fn handle_preview_key(state: &mut WizardState, key: KeyEvent) {
         KeyCode::Up | KeyCode::Char('k') => {
             state.scroll_offset = state.scroll_offset.saturating_sub(1);
         }
-        KeyCode::Down | KeyCode::Char('j')
-            if !state.preview_entries.is_empty() =>
-        {
+        KeyCode::Down | KeyCode::Char('j') if !state.preview_entries.is_empty() => {
             state.scroll_offset = state
                 .scroll_offset
                 .saturating_add(1)

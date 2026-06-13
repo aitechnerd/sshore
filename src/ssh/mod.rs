@@ -198,6 +198,48 @@ pub fn parse_connection_string(target: &str) -> Result<(Option<String>, String, 
     Ok((user_part, host, port))
 }
 
+/// Result of parsing a proxy jump string.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ProxyJumpTarget {
+    /// SSH username for the jump host (defaults to effective user if None).
+    pub user: Option<String>,
+    /// Hostname or IP of the jump host.
+    pub host: String,
+    /// SSH port for the jump host (default 22).
+    pub port: u16,
+}
+
+/// Parse a proxy jump string: `[user@]host[:port]`
+///
+/// Same format as OpenSSH `ProxyJump`. Validates the host portion against
+/// shell metacharacters to prevent injection.
+///
+/// # Examples
+/// ```
+/// # use sshore::ssh::parse_proxy_jump;
+/// let t = parse_proxy_jump("bastion").unwrap();
+/// assert_eq!(t.host, "bastion");
+/// assert_eq!(t.port, 22);
+/// ```
+pub fn parse_proxy_jump(input: &str) -> Result<ProxyJumpTarget> {
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        bail!("Proxy jump string cannot be empty");
+    }
+
+    // Parse using the same logic as connection strings
+    let (user, host, port) = parse_connection_string(trimmed)?;
+
+    // Validate host against shell metacharacters
+    crate::config::model::validate_hostname(&host)?;
+
+    if port == 0 {
+        bail!("Proxy jump port must be between 1 and 65535");
+    }
+
+    Ok(ProxyJumpTarget { user, host, port })
+}
+
 /// Infer a bookmark name from a hostname or IP address.
 pub fn infer_bookmark_name(host: &str) -> String {
     if host.contains('.') && host.chars().all(|c| c.is_ascii_digit() || c == '.') {
@@ -262,8 +304,39 @@ pub async fn connect_adhoc(
     result
 }
 
+/// Build the shared russh client config used for interactive and proxy sessions.
+fn build_ssh_config() -> Arc<russh::client::Config> {
+    let preferred = {
+        use russh::cipher;
+        let mut p = russh::Preferred::DEFAULT;
+        p.cipher = std::borrow::Cow::Borrowed(&[
+            cipher::AES_256_GCM,
+            cipher::AES_128_GCM,
+            cipher::CHACHA20_POLY1305,
+            cipher::AES_256_CTR,
+            cipher::AES_192_CTR,
+            cipher::AES_128_CTR,
+        ]);
+        p
+    };
+    Arc::new(russh::client::Config {
+        inactivity_timeout: None,
+        keepalive_interval: Some(std::time::Duration::from_secs(KEEPALIVE_INTERVAL_SECS)),
+        keepalive_max: KEEPALIVE_MAX,
+        window_size: SSH_WINDOW_SIZE,
+        maximum_packet_size: SSH_MAX_PACKET_SIZE,
+        channel_buffer_size: SSH_CHANNEL_BUFFER_SIZE,
+        nodelay: true,
+        preferred,
+        ..<_>::default()
+    })
+}
+
 /// Establish an authenticated SSH session to a bookmark.
 /// Returns the session handle for opening channels (shell, SFTP, etc.).
+///
+/// If the bookmark has a proxy_jump configured, connects through the jump host
+/// first (ProxyJump / -J semantics), then establishes the SSH session to the target.
 pub async fn establish_session(
     config: &AppConfig,
     bookmark_index: usize,
@@ -283,74 +356,36 @@ pub async fn establish_session(
     let keys = load_keys(bookmark, profiles)?;
     tracing::debug!(key_count = keys.len(), "loaded SSH keys");
 
-    // Build handler with host key checking
-    let check_mode = HostKeyCheckMode::from_str_setting(&settings.host_key_checking);
-    let handler = SshoreHandler::for_host(host, port, check_mode);
-
     // Configurable connection timeout
     let timeout_secs = effective_timeout(bookmark, settings, profiles);
 
-    // Connect to SSH server with timeout.
-    // No inactivity_timeout — interactive sessions must never be killed due to
-    // idle time (e.g. waiting at a `su -` password prompt). Keepalives detect
-    // dead connections without cutting live ones.
-    // Prefer AES-256-GCM over ChaCha20-Poly1305. On Apple Silicon (and
-    // x86 with AES-NI), AES-GCM is hardware-accelerated and 2-4× faster
-    // than ChaCha20 for bulk data. This significantly reduces CPU during
-    // SFTP transfers. ChaCha20 is kept as fallback for servers that only
-    // support it.
-    let preferred = {
-        use russh::cipher;
-        let mut p = russh::Preferred::DEFAULT;
-        p.cipher = std::borrow::Cow::Borrowed(&[
-            cipher::AES_256_GCM,
-            cipher::AES_128_GCM,
-            cipher::CHACHA20_POLY1305,
-            cipher::AES_256_CTR,
-            cipher::AES_192_CTR,
-            cipher::AES_128_CTR,
-        ]);
-        p
+    // Check for proxy jump
+    let proxy_jump = bookmark.effective_proxy_jump(profiles);
+
+    let check_mode = HostKeyCheckMode::from_str_setting(&settings.host_key_checking);
+
+    let mut session = if let Some(ref proxy_jump_str) = proxy_jump {
+        // Connect through proxy jump host
+        connect_through_proxy(
+            proxy_jump_str,
+            host,
+            port,
+            &keys,
+            settings,
+            timeout_secs,
+            check_mode,
+        )
+        .await
+        .with_context(|| {
+            format!(
+                "Failed to connect through proxy jump '{}' to {host}:{port}",
+                proxy_jump_str
+            )
+        })?
+    } else {
+        // Direct connection
+        connect_direct(host, port, timeout_secs, check_mode).await?
     };
-    let ssh_config = russh::client::Config {
-        inactivity_timeout: None,
-        keepalive_interval: Some(std::time::Duration::from_secs(KEEPALIVE_INTERVAL_SECS)),
-        keepalive_max: KEEPALIVE_MAX,
-        window_size: SSH_WINDOW_SIZE,
-        maximum_packet_size: SSH_MAX_PACKET_SIZE,
-        channel_buffer_size: SSH_CHANNEL_BUFFER_SIZE,
-        nodelay: true,
-        preferred,
-        ..<_>::default()
-    };
-
-    tracing::debug!(
-        timeout_secs,
-        keepalive_interval = KEEPALIVE_INTERVAL_SECS,
-        keepalive_max = KEEPALIVE_MAX,
-        window_size = SSH_WINDOW_SIZE,
-        "connecting with timeout"
-    );
-
-    let connect_future =
-        russh::client::connect(Arc::new(ssh_config), (host.as_str(), port), handler);
-
-    let mut session =
-        match tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), connect_future)
-            .await
-        {
-            Ok(result) => {
-                tracing::debug!("TCP connection established");
-                result.with_context(|| format!("Failed to connect to {host}:{port}"))?
-            }
-            Err(_) => {
-                tracing::debug!("connection timed out");
-                bail!(
-                    "Connection to {host}:{port} timed out after {timeout_secs}s. \
-                 Adjust timeout with connect_timeout_secs in config.toml."
-                );
-            }
-        };
 
     // Authenticate
     let ctx = AuthContext {
@@ -366,6 +401,278 @@ pub async fn establish_session(
 
     tracing::debug!("session established and authenticated");
     Ok(session)
+}
+
+/// Connect directly to an SSH host (no proxy).
+async fn connect_direct(
+    host: &str,
+    port: u16,
+    timeout_secs: u64,
+    check_mode: HostKeyCheckMode,
+) -> Result<russh::client::Handle<SshoreHandler>> {
+    let handler = SshoreHandler::for_host(host, port, check_mode);
+    let ssh_config = build_ssh_config();
+
+    let connect_future = russh::client::connect(ssh_config, (host, port), handler);
+
+    match tokio::time::timeout(
+        std::time::Duration::from_secs(timeout_secs),
+        connect_future,
+    )
+    .await
+    {
+        Ok(result) => {
+            tracing::debug!("TCP connection established");
+            result.with_context(|| format!("Failed to connect to {host}:{port}"))
+        }
+        Err(_) => {
+            tracing::debug!("connection timed out");
+            bail!(
+                "Connection to {host}:{port} timed out after {timeout_secs}s. \
+                 Adjust timeout with connect_timeout_secs in config.toml."
+            )
+        }
+    }
+}
+
+/// Connect through a proxy jump host to reach the target.
+///
+/// 1. Parse the proxy jump string (`user@host` or `host`)
+/// 2. Connect to the jump host and authenticate
+/// 3. Open a `direct-tcpip` channel through the jump to the target host:port
+/// 4. Use `russh::client::connect_stream` over that channel to establish SSH to the target
+async fn connect_through_proxy(
+    proxy_jump_str: &str,
+    target_host: &str,
+    target_port: u16,
+    keys: &[PrivateKeyWithHashAlg],
+    settings: &crate::config::model::Settings,
+    timeout_secs: u64,
+    check_mode: HostKeyCheckMode,
+) -> Result<russh::client::Handle<SshoreHandler>> {
+    let jump_target = parse_proxy_jump(proxy_jump_str)
+        .with_context(|| format!("Invalid proxy jump format: {proxy_jump_str}"))?;
+
+    let jump_user = jump_target
+        .user
+        .clone()
+        .or_else(|| settings.default_user.clone())
+        .unwrap_or_else(|| whoami::username().to_string());
+
+    eprintln!(
+        "Connecting through jump host {}@{}:{}...",
+        jump_user, jump_target.host, jump_target.port
+    );
+    tracing::debug!(
+        jump_host = jump_target.host,
+        jump_port = jump_target.port,
+        jump_user,
+        target_host,
+        target_port,
+        "establishing proxy jump connection"
+    );
+
+    // Step 1: Connect to the jump host
+    let jump_handler =
+        SshoreHandler::for_host(&jump_target.host, jump_target.port, check_mode.clone());
+    let jump_config = build_ssh_config();
+
+    let mut jump_session =
+        match tokio::time::timeout(
+            std::time::Duration::from_secs(timeout_secs),
+            russh::client::connect(jump_config, (jump_target.host.as_str(), jump_target.port), jump_handler),
+        )
+        .await
+        {
+            Ok(result) => result.with_context(|| {
+                format!(
+                    "Failed to connect to jump host {}:{}",
+                    jump_target.host, jump_target.port
+                )
+            })?,
+            Err(_) => {
+                bail!(
+                    "Connection to jump host {}:{} timed out after {timeout_secs}s",
+                    jump_target.host,
+                    jump_target.port
+                )
+            }
+        };
+
+    // Step 2: Authenticate to the jump host
+    // Use default keys (matching native ssh -J behavior) + keychain password
+    let jump_ctx = AuthContext {
+        bookmark_name: None, // Don't use bookmark keychain for jump host
+        env: None,
+        has_identity_file: false, // Jump hosts use default keys; always allow password fallback
+    };
+    let jump_authenticated = authenticate_with_jump_keychain(
+        &mut jump_session,
+        &jump_user,
+        &jump_target.host,
+        keys,
+        &jump_ctx,
+    )
+    .await?;
+    if !jump_authenticated {
+        bail!(
+            "Authentication failed for jump host {}@{}:{}",
+            jump_user,
+            jump_target.host,
+            jump_target.port
+        );
+    }
+
+    // Step 3: Open a direct-tcpip channel through the jump to the target
+    let channel = jump_session
+        .channel_open_direct_tcpip(target_host, target_port as u32, "127.0.0.1", 0)
+        .await
+        .with_context(|| {
+            format!(
+                "Failed to open direct-tcpip channel through jump host to {target_host}:{target_port}"
+            )
+        })?;
+
+    let stream = channel.into_stream();
+
+    // Step 4: Connect SSH session over the tunneled stream
+    let target_check_mode = HostKeyCheckMode::from_str_setting(&settings.host_key_checking);
+    let target_handler = SshoreHandler::for_host(target_host, target_port, target_check_mode);
+    let target_config = build_ssh_config();
+
+    let target_session =
+        match tokio::time::timeout(
+            std::time::Duration::from_secs(timeout_secs),
+            russh::client::connect_stream(target_config, stream, target_handler),
+        )
+        .await
+        {
+            Ok(result) => result.with_context(|| {
+                format!(
+                    "Failed to establish SSH through jump to {target_host}:{target_port}"
+                )
+            })?,
+            Err(_) => {
+                bail!(
+                    "SSH connection through jump to {target_host}:{target_port} timed out after {timeout_secs}s"
+                )
+            }
+        };
+
+    tracing::debug!(
+        jump_host = jump_target.host,
+        target_host,
+        target_port,
+        "proxy jump session established"
+    );
+
+    Ok(target_session)
+}
+
+/// Like [`authenticate`] but uses keychain key `__jump:<host>` for password storage
+/// instead of the bookmark name. This allows jump host passwords to be stored
+/// independently and shared across bookmarks that use the same jump host.
+async fn authenticate_with_jump_keychain(
+    session: &mut russh::client::Handle<SshoreHandler>,
+    user: &str,
+    jump_host: &str,
+    keys: &[PrivateKeyWithHashAlg],
+    ctx: &AuthContext<'_>,
+) -> Result<bool> {
+    // 1. Try public key auth with each available key
+    for (i, key) in keys.iter().enumerate() {
+        tracing::debug!(key_index = i, "trying public key auth for jump host");
+        match session.authenticate_publickey(user, key.clone()).await {
+            Ok(AuthResult::Success) => {
+                tracing::debug!(key_index = i, "public key auth succeeded for jump host");
+                return Ok(true);
+            }
+            Ok(AuthResult::Failure { .. }) => {
+                tracing::debug!(key_index = i, "public key rejected for jump host");
+                continue;
+            }
+            Err(e) => {
+                tracing::debug!(key_index = i, error = %e, "public key auth error for jump host");
+                continue;
+            }
+        }
+    }
+
+    if ctx.has_identity_file && !keys.is_empty() {
+        tracing::debug!(
+            "identity_file configured and keys were tried for jump host, skipping password fallback"
+        );
+        return Ok(false);
+    }
+
+    // 2. Try keychain password keyed by __jump:<host>
+    let jump_keychain_name = format!("__jump:{}", jump_host);
+    if let Ok(Some(stored)) = keychain::get_password(&jump_keychain_name)
+    {
+        tracing::debug!(jump_host, "trying keychain password for jump host");
+        match session.authenticate_password(user, &stored).await {
+            Ok(AuthResult::Success) => {
+                tracing::debug!("keychain password accepted for jump host");
+                return Ok(true);
+            }
+            Ok(AuthResult::Failure { .. }) => {
+                tracing::debug!("keychain password rejected for jump host, deleting stale entry");
+                let _ = keychain::delete_password(&jump_keychain_name);
+                eprintln!(
+                    "Stored password rejected for jump host '{jump_keychain_name}', removed from keychain."
+                );
+            }
+            Err(e) => {
+                tracing::debug!(error = %e, "keychain auth error for jump host");
+                eprintln!("Warning: keychain auth error for jump host: {e}");
+            }
+        }
+    }
+
+    // 3. Prompt user for password
+    tracing::debug!("prompting for password for jump host");
+    let password = prompt_password(&format!("{}@{} (jump host)", user, jump_host))?;
+    match session.authenticate_password(user, password.as_str()).await {
+        Ok(AuthResult::Success) => {
+            tracing::debug!("password auth succeeded for jump host");
+            // Offer to save to keychain under __jump:<host>
+            offer_save_jump_password(&jump_keychain_name, &password);
+            Ok(true)
+        }
+        Ok(AuthResult::Failure { .. }) => {
+            tracing::debug!("password auth failed for jump host");
+            Ok(false)
+        }
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// Offer to save a jump host password to the keychain.
+fn offer_save_jump_password(jump_keychain_name: &str, password: &str) {
+    // Check if already stored
+    if keychain::get_password(jump_keychain_name).unwrap_or(None).is_some() {
+        return;
+    }
+
+    eprint!(
+        "Save password to keychain for jump host '{}'? [y/N] ",
+        jump_keychain_name
+    );
+    if std::io::Write::flush(&mut std::io::stderr()).is_err() {
+        return;
+    }
+
+    let mut input = String::new();
+    if std::io::stdin().read_line(&mut input).is_err() {
+        return;
+    }
+
+    if input.trim().eq_ignore_ascii_case("y") {
+        match keychain::set_password(jump_keychain_name, password) {
+            Ok(()) => eprintln!("Password saved for jump host '{}'.", jump_keychain_name),
+            Err(e) => eprintln!("Warning: failed to save jump host password: {e}"),
+        }
+    }
 }
 
 /// Establish an SSH session configured for tunnel keepalives.
@@ -729,7 +1036,8 @@ async fn exec_command_quiet(
 
 /// Load SSH private keys for authentication.
 /// If bookmark (or its profile) has identity_file, load that (with env var expansion).
-/// Otherwise try default keys. Prompts for passphrase when an encrypted key is encountered.
+/// Also always loads default keys (~/.ssh/id_*) so jump hosts can authenticate with
+/// the same keys that native `ssh -J` would use.
 fn load_keys(
     bookmark: &Bookmark,
     profiles: &[crate::config::model::Profile],
@@ -769,24 +1077,36 @@ fn load_keys(
             }
             None => {}
         }
-    } else {
-        // Try default key locations
-        let ssh_dir = dirs::home_dir()
-            .unwrap_or_else(|| PathBuf::from("."))
-            .join(".ssh");
+    }
 
-        for name in DEFAULT_KEY_NAMES {
-            let path = ssh_dir.join(name);
-            if path.exists() {
-                match load_key_from_path(&path.to_string_lossy()) {
-                    Ok(loaded) => keys.extend(loaded),
-                    Err(_) => continue, // Silently skip default keys that fail to load
-                }
+    // Always load default keys as well. This matches native ssh -J behavior:
+    // jump hosts authenticate with default keys, and having extra keys
+    // doesn't hurt the target auth (rejected keys are simply skipped).
+    keys.extend(load_default_keys());
+
+    Ok(keys)
+}
+
+/// Load default SSH keys from ~/.ssh/ (id_ed25519, id_rsa, id_ecdsa).
+/// Used for jump host authentication (matching native ssh -J behavior) and
+/// as a fallback for direct connections.
+fn load_default_keys() -> Vec<PrivateKeyWithHashAlg> {
+    let mut keys = Vec::new();
+    let ssh_dir = dirs::home_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".ssh");
+
+    for name in DEFAULT_KEY_NAMES {
+        let path = ssh_dir.join(name);
+        if path.exists() {
+            match load_key_from_path(&path.to_string_lossy()) {
+                Ok(loaded) => keys.extend(loaded),
+                Err(_) => continue, // Silently skip default keys that fail to load
             }
         }
     }
 
-    Ok(keys)
+    keys
 }
 
 /// Wrap a loaded private key into one or more `PrivateKeyWithHashAlg` entries.
@@ -1893,5 +2213,92 @@ mod tests {
     #[test]
     fn test_classify_stdin_event_with_closed_stdin() {
         assert_eq!(classify_stdin_event(None), StdinEvent::Closed);
+    }
+
+    // --- parse_proxy_jump ---
+
+    #[test]
+    fn test_parse_proxy_jump_host_only() {
+        let target = parse_proxy_jump("bastion").unwrap();
+        assert_eq!(target.user, None);
+        assert_eq!(target.host, "bastion");
+        assert_eq!(target.port, 22);
+    }
+
+    #[test]
+    fn test_parse_proxy_jump_user_host() {
+        let target = parse_proxy_jump("admin@bastion").unwrap();
+        assert_eq!(target.user, Some("admin".to_string()));
+        assert_eq!(target.host, "bastion");
+        assert_eq!(target.port, 22);
+    }
+
+    #[test]
+    fn test_parse_proxy_jump_user_host_port() {
+        let target = parse_proxy_jump("admin@bastion:2222").unwrap();
+        assert_eq!(target.user, Some("admin".to_string()));
+        assert_eq!(target.host, "bastion");
+        assert_eq!(target.port, 2222);
+    }
+
+    #[test]
+    fn test_parse_proxy_jump_host_port() {
+        let target = parse_proxy_jump("bastion.example.com:8022").unwrap();
+        assert_eq!(target.user, None);
+        assert_eq!(target.host, "bastion.example.com");
+        assert_eq!(target.port, 8022);
+    }
+
+    #[test]
+    fn test_parse_proxy_jump_ip_address() {
+        let target = parse_proxy_jump("10.0.0.1:2222").unwrap();
+        assert_eq!(target.user, None);
+        assert_eq!(target.host, "10.0.0.1");
+        assert_eq!(target.port, 2222);
+    }
+
+    #[test]
+    fn test_parse_proxy_jump_empty_string_rejected() {
+        let result = parse_proxy_jump("");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_proxy_jump_whitespace_only_rejected() {
+        let result = parse_proxy_jump("   ");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_proxy_jump_shell_metachar_rejected() {
+        assert!(parse_proxy_jump("host;evil").is_err());
+        assert!(parse_proxy_jump("host|pipe").is_err());
+        assert!(parse_proxy_jump("host&bg").is_err());
+        assert!(parse_proxy_jump("$(cmd)").is_err());
+        assert!(parse_proxy_jump("host`cmd`").is_err());
+    }
+
+    #[test]
+    fn test_parse_proxy_jump_port_zero_rejected() {
+        let result = parse_proxy_jump("bastion:0");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_proxy_jump_invalid_port_rejected() {
+        let result = parse_proxy_jump("bastion:notaport");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_proxy_jump_empty_user_rejected() {
+        let result = parse_proxy_jump("@bastion");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_proxy_jump_empty_host_rejected() {
+        let result = parse_proxy_jump("admin@");
+        assert!(result.is_err());
     }
 }

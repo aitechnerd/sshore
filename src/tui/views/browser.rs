@@ -1228,6 +1228,10 @@ async fn handle_key(
 
         KeyCode::Char('.') => {
             state.show_hidden = !state.show_hidden;
+            state.status_message = Some(format!(
+                "Hidden files: {}",
+                if state.show_hidden { "shown" } else { "hidden" }
+            ));
             refresh_pane(left_pane, left, state).await?;
             refresh_pane(right_pane, right, state).await?;
         }
@@ -1612,6 +1616,7 @@ fn draw(
         state.active_pane == Side::Left,
         state.left_label,
         left_ctx,
+        state.show_hidden,
     );
     draw_pane(
         frame,
@@ -1620,6 +1625,7 @@ fn draw(
         state.active_pane == Side::Right,
         state.right_label,
         right_ctx,
+        state.show_hidden,
     );
 
     // Active filter indicator (shown when filter is committed, not during typing)
@@ -2784,6 +2790,7 @@ fn draw_pane(
     is_active: bool,
     label: PaneLabel,
     remote_ctx: Option<&RemoteContext>,
+    show_hidden: bool,
 ) {
     let is_remote = label == PaneLabel::Remote;
 
@@ -2825,8 +2832,9 @@ fn draw_pane(
         ),
     };
 
-    // Reserve space for badge + padding in the title
-    let badge_len = badge_text.len() + 2;
+    // Reserve space for badge + hidden indicator + padding in the title
+    let hidden_indicator_len = if show_hidden { 10 } else { 0 };
+    let badge_len = badge_text.len() + hidden_indicator_len + 2;
     let max_chars = (area.width as usize).saturating_sub(badge_len + 4);
     let char_count = pane.cwd.chars().count();
     let cwd_display = if char_count > max_chars {
@@ -2837,8 +2845,14 @@ fn draw_pane(
         pane.cwd.clone()
     };
 
+    let hidden_indicator = if show_hidden {
+        Span::raw(" [hidden] ")
+    } else {
+        Span::raw("")
+    };
     let title = Line::from(vec![
         Span::styled(&badge_text, badge_style),
+        hidden_indicator,
         Span::raw(format!(" {} ", cwd_display)),
     ]);
 
@@ -3538,7 +3552,7 @@ async fn run_background_transfer(
 
     // Sort files largest-first so workers stay busy on big files early,
     // avoiding a "long tail" where one worker grinds a large file at the end.
-    file_targets.sort_by(|a, b| b.size.cmp(&a.size));
+    file_targets.sort_by_key(|t| std::cmp::Reverse(t.size));
 
     tracing::debug!(
         "MEM[bg:scan_done]: {:.1} MB RSS — in {scan_ms}ms — {} dirs, {} files",

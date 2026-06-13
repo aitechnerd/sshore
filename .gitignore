@@ -14,3 +14,4 @@ crates/*/Cargo.lock
 .claude/settings.local.json
 .claude/agent-memory/
 .claude/agent-memory-local/
+.pi/

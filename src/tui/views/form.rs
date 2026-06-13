@@ -28,6 +28,9 @@ const ENV_OPTIONS: &[&str] = &[
     "testing",
 ];
 
+/// Placeholder text shown in the Proxy Jump field when empty.
+const PROXY_JUMP_PLACEHOLDER: &str = "(e.g. admin@bastion)";
+
 /// Index of each form field.
 const FIELD_NAME: usize = 0;
 const FIELD_HOST: usize = 1;
@@ -480,13 +483,15 @@ fn render_field(
     let label_line = Line::from(Span::styled(format!("  {label}{marker}"), label_style));
     frame.render_widget(Paragraph::new(label_line), label_area);
 
-    // Input value — special cases for env, password, and profile fields
+    // Input value — special cases for env, password, profile, and proxy jump fields
     if field_idx == FIELD_ENV {
         render_env_selector(frame, input_area, state, settings, is_focused, tc);
     } else if field_idx == FIELD_PASSWORD {
         render_password_field(frame, input_area, state, is_focused, tc);
     } else if field_idx == FIELD_PROFILE {
         render_profile_selector(frame, input_area, state, is_focused, tc);
+    } else if field_idx == FIELD_PROXY {
+        render_proxy_jump_field(frame, input_area, state, is_focused, tc);
     } else {
         let cursor = if is_focused { "_" } else { "" };
         let value = &state.fields[field_idx];
@@ -591,6 +596,43 @@ fn render_profile_selector(
     }
 
     let line = Line::from(spans);
+    frame.render_widget(Paragraph::new(line), area);
+}
+
+/// Render the Proxy Jump field with placeholder text.
+/// - Has content → show value + cursor if focused
+/// - Empty → show placeholder hint in dim text
+fn render_proxy_jump_field(
+    frame: &mut Frame,
+    area: Rect,
+    state: &FormState,
+    is_focused: bool,
+    tc: &ThemeColors,
+) {
+    let prefix = if is_focused { "  > " } else { "    " };
+    let value = &state.fields[FIELD_PROXY];
+    let cursor = if is_focused { "_" } else { "" };
+
+    let line = if value.is_empty() {
+        // Show placeholder hint
+        let style = Style::default().fg(tc.fg_dim);
+        Line::from(Span::styled(
+            format!("{prefix}{PROXY_JUMP_PLACEHOLDER}{cursor}"),
+            style,
+        ))
+    } else {
+        // Show actual value
+        let style = if is_focused {
+            Style::default().fg(tc.fg)
+        } else {
+            Style::default().fg(tc.fg_muted)
+        };
+        Line::from(Span::styled(
+            format!("{prefix}{value}{cursor}"),
+            style,
+        ))
+    };
+
     frame.render_widget(Paragraph::new(line), area);
 }
 
@@ -1085,5 +1127,50 @@ mod tests {
         let names = vec!["alpha".to_string(), "beta".to_string()];
         let options = build_profile_options(&names);
         assert_eq!(options, vec!["(none)", "alpha", "beta"]);
+    }
+
+    #[test]
+    fn test_proxy_jump_placeholder_constant() {
+        assert_eq!(PROXY_JUMP_PLACEHOLDER, "(e.g. admin@bastion)");
+    }
+
+    #[test]
+    fn test_proxy_jump_field_empty_in_add_form() {
+        let settings = Settings::default();
+        let form = FormState::new_add(&settings, &[]);
+        assert_eq!(form.fields[FIELD_PROXY], "");
+    }
+
+    #[test]
+    fn test_proxy_jump_field_populated_in_edit_form() {
+        let bookmark = sample_bookmark();
+        let form = FormState::new_edit(&bookmark, &[]);
+        assert_eq!(form.fields[FIELD_PROXY], "bastion");
+    }
+
+    #[test]
+    fn test_validate_and_build_proxy_jump_included() {
+        let config = AppConfig::default();
+        let settings = Settings::default();
+        let mut form = FormState::new_add(&settings, &[]);
+        form.fields[FIELD_NAME] = "test-server".into();
+        form.fields[FIELD_HOST] = "10.0.1.5".into();
+        form.fields[FIELD_PROXY] = "admin@bastion:2222".into();
+
+        let bookmark = form.validate_and_build(&config).unwrap();
+        assert_eq!(bookmark.proxy_jump, Some("admin@bastion:2222".to_string()));
+    }
+
+    #[test]
+    fn test_validate_and_build_empty_proxy_jump_is_none() {
+        let config = AppConfig::default();
+        let settings = Settings::default();
+        let mut form = FormState::new_add(&settings, &[]);
+        form.fields[FIELD_NAME] = "test-server".into();
+        form.fields[FIELD_HOST] = "10.0.1.5".into();
+        // FIELD_PROXY stays empty
+
+        let bookmark = form.validate_and_build(&config).unwrap();
+        assert!(bookmark.proxy_jump.is_none());
     }
 }

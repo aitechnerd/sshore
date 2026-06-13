@@ -587,6 +587,11 @@ fn is_terminal_active() -> bool {
     result != 0
 }
 
+#[cfg(not(unix))]
+fn is_terminal_active() -> bool {
+    true
+}
+
 /// Try to detect a dead terminal by performing a non-blocking poll on stdin.
 /// On macOS, when the terminal window closes, the PTY slave fd may still pass
 /// isatty() but poll() returns POLLHUP | POLLERR. This is non-invasive:

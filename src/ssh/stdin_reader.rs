@@ -12,6 +12,7 @@ const READ_BUF_SIZE: usize = 1024;
 /// Poll timeout (ms) for the stdin reader thread.
 /// Non-zero so the thread can periodically check SHUTDOWN_REQUESTED
 /// and exit cleanly when the terminal is closed.
+#[cfg(unix)]
 const POLL_TIMEOUT_MS: libc::c_int = 500;
 
 /// A cancellable stdin reader backed by an OS thread.

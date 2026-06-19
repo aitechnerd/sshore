@@ -3251,7 +3251,9 @@ fn spawn_worker(
         let hb_dead = Arc::clone(&pool.session_dead);
         let hb_cancel = Arc::clone(&pool.cancel);
         tokio::spawn(async move {
-            tracing::debug!("worker[{worker_id}] heartbeat started (interval=15s, ping_timeout=5s)");
+            tracing::debug!(
+                "worker[{worker_id}] heartbeat started (interval=15s, ping_timeout=5s)"
+            );
             let mut interval = tokio::time::interval(Duration::from_secs(15));
             interval.tick().await; // skip immediate first tick
             loop {
@@ -3282,9 +3284,7 @@ fn spawn_worker(
                     Err(_) => {
                         // Ping timed out — server is unresponsive.
                         // Close the session so in-flight transfers fail fast.
-                        tracing::warn!(
-                            "worker heartbeat: ping timed out, closing session"
-                        );
+                        tracing::warn!("worker heartbeat: ping timed out, closing session");
                         let _ = hb_raw.close_session();
                         hb_dead.store(true, Ordering::Relaxed);
                         break;
@@ -3344,9 +3344,7 @@ fn spawn_worker(
             // Check if another worker's heartbeat detected a dead session.
             // This propagates the failure across all workers quickly.
             if pool.session_dead.load(Ordering::Relaxed) {
-                tracing::debug!(
-                    "worker[{worker_id}] session_dead flag set by heartbeat, stopping"
-                );
+                tracing::debug!("worker[{worker_id}] session_dead flag set by heartbeat, stopping");
                 if let Some(h) = file_handle {
                     pipeline::close_handle(&raw, &h).await;
                 }
@@ -3358,9 +3356,7 @@ fn spawn_worker(
             if raw.is_closed() {
                 // Signal all other workers to stop.
                 pool.session_dead.store(true, Ordering::Relaxed);
-                tracing::error!(
-                    "worker[{worker_id}] session closed, stopping"
-                );
+                tracing::error!("worker[{worker_id}] session closed, stopping");
                 if let Some(h) = file_handle {
                     pipeline::close_handle(&raw, &h).await;
                 }

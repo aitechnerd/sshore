@@ -17,7 +17,8 @@ use anyhow::{Context, Result};
 use std::collections::HashSet;
 
 use crate::config::model::{
-    AppConfig, Bookmark, Profile, Settings, validate_bookmark_name, validate_hostname,
+    AppConfig, Bookmark, BookmarkGroup, Profile, Settings, validate_bookmark_name,
+    validate_hostname,
 };
 use crate::config::writer::atomic_write;
 
@@ -131,6 +132,7 @@ pub fn load_from(path: &Path) -> Result<AppConfig> {
 
     validate_profiles(&config.profiles)?;
     validate_on_connect_fields(&config.profiles, &config.bookmarks)?;
+    validate_groups(&config.groups, &config.profiles)?;
 
     warn_dangling_profiles(&config.bookmarks, &config.profiles);
     warn_duplicate_names(&config.bookmarks);
@@ -262,6 +264,75 @@ fn validate_on_connect_fields(profiles: &[Profile], bookmarks: &[Bookmark]) -> R
             )?;
         }
     }
+    Ok(())
+}
+
+/// Validate all bookmark groups: reject duplicate group names, duplicate session
+/// names within the same group, and invalid on_connect values.
+///
+/// Warns (soft) on dangling profile references from groups.
+/// Allows session names to be duplicated across different groups.
+fn validate_groups(groups: &[BookmarkGroup], profiles: &[Profile]) -> Result<()> {
+    // Skip validation if no groups defined (backward compatibility)
+    if groups.is_empty() {
+        return Ok(());
+    }
+
+    let profile_names: HashSet<&str> = profiles.iter().map(|p| p.name.as_str()).collect();
+
+    // Check for duplicate group names (hard error)
+    let mut seen_groups = HashSet::new();
+    for g in groups {
+        if !seen_groups.insert(&g.name) {
+            anyhow::bail!("Duplicate group name '{}'", sanitize_for_display(&g.name));
+        }
+
+        // Check for duplicate session names within the same group (hard error)
+        let mut seen_sessions = HashSet::new();
+        for s in &g.sessions {
+            if !seen_sessions.insert(&s.name) {
+                anyhow::bail!(
+                    "Duplicate session name '{}' in group '{}'",
+                    sanitize_for_display(&s.name),
+                    sanitize_for_display(&g.name)
+                );
+            }
+        }
+
+        // Validate group-level on_connect
+        if let Some(ref cmd) = g.on_connect {
+            validate_on_connect(
+                cmd,
+                &format!("Group '{}'", sanitize_for_display(&g.name)),
+            )?;
+        }
+
+        // Validate session-level on_connect
+        for s in &g.sessions {
+            if let Some(ref cmd) = s.on_connect {
+                validate_on_connect(
+                    cmd,
+                    &format!(
+                        "Session '{}' in group '{}'",
+                        sanitize_for_display(&s.name),
+                        sanitize_for_display(&g.name)
+                    ),
+                )?;
+            }
+        }
+
+        // Warn on dangling profile reference (soft warning)
+        if let Some(ref profile_name) = g.profile {
+            if !profile_names.contains(profile_name.as_str()) {
+                eprintln!(
+                    "Warning: group '{}' references profile '{}' which does not exist",
+                    sanitize_for_display(&g.name),
+                    sanitize_for_display(profile_name)
+                );
+            }
+        }
+    }
+
     Ok(())
 }
 
@@ -1370,5 +1441,159 @@ profile = "deleted-profile"
             msg.contains("bad?name"),
             "expected sanitized name, got: {msg}"
         );
+    }
+
+    // --- Group validation tests (Task 002) ---
+
+    fn sample_group() -> model::BookmarkGroup {
+        model::BookmarkGroup {
+            name: "prod-servers".into(),
+            host: "10.0.1.5".into(),
+            user: Some("deploy".into()),
+            port: 22,
+            env: "production".into(),
+            tags: vec![],
+            identity_file: None,
+            proxy_jump: None,
+            notes: None,
+            profile: None,
+            connect_timeout_secs: None,
+            ssh_options: std::collections::BTreeMap::new(),
+            on_connect: None,
+            on_connect_prompt_pattern: None,
+            snippets: vec![],
+            sessions: vec![],
+        }
+    }
+
+    fn sample_session() -> model::Session {
+        model::Session {
+            name: "project-a".into(),
+            on_connect: None,
+            on_connect_prompt_pattern: None,
+            snippets: vec![],
+            connect_timeout_secs: None,
+            ssh_options: std::collections::BTreeMap::new(),
+            user: None,
+            identity_file: None,
+            proxy_jump: None,
+        }
+    }
+
+    #[test]
+    fn test_validate_groups_empty_is_valid() {
+        assert!(validate_groups(&[], &[]).is_ok());
+    }
+
+    #[test]
+    fn test_validate_groups_valid() {
+        let groups = vec![sample_group()];
+        assert!(validate_groups(&groups, &[]).is_ok());
+    }
+
+    #[test]
+    fn test_validate_groups_duplicate_group_names_rejected() {
+        let mut g1 = sample_group();
+        let mut g2 = sample_group();
+        g2.name = "prod-servers".into();
+        let groups = vec![g1, g2];
+        let err = validate_groups(&groups, &[]).unwrap_err();
+        assert!(err.to_string().contains("Duplicate group name"));
+    }
+
+    #[test]
+    fn test_validate_groups_duplicate_session_names_rejected() {
+        let mut g = sample_group();
+        g.sessions = vec![
+            sample_session(),
+            model::Session {
+                name: "project-a".into(),
+                ..sample_session()
+            },
+        ];
+        let groups = vec![g];
+        let err = validate_groups(&groups, &[]).unwrap_err();
+        assert!(err.to_string().contains("Duplicate session name"));
+    }
+
+    #[test]
+    fn test_validate_groups_session_names_across_groups_allowed() {
+        let mut g1 = sample_group();
+        g1.sessions = vec![sample_session()];
+        let mut g2 = sample_group();
+        g2.name = "staging-servers".into();
+        g2.sessions = vec![sample_session()]; // same name "project-a" in different group
+        let groups = vec![g1, g2];
+        assert!(validate_groups(&groups, &[]).is_ok());
+    }
+
+    #[test]
+    fn test_validate_groups_dangling_profile_warning() {
+        let mut g = sample_group();
+        g.profile = Some("nonexistent".into());
+        let groups = vec![g];
+        // Should succeed (soft warning, not hard error)
+        assert!(validate_groups(&groups, &[]).is_ok());
+    }
+
+    #[test]
+    fn test_validate_groups_on_connect_escape_rejected() {
+        let mut g = sample_group();
+        g.on_connect = Some("echo hello\x1b[31mred".into());
+        let groups = vec![g];
+        let err = validate_groups(&groups, &[]).unwrap_err();
+        assert!(err.to_string().contains("escape sequences"));
+    }
+
+    #[test]
+    fn test_validate_groups_on_connect_too_long_rejected() {
+        let mut g = sample_group();
+        g.on_connect = Some("x".repeat(1025));
+        let groups = vec![g];
+        let err = validate_groups(&groups, &[]).unwrap_err();
+        assert!(err.to_string().contains("maximum length"));
+    }
+
+    #[test]
+    fn test_validate_groups_session_on_connect_escape_rejected() {
+        let mut g = sample_group();
+        let mut s = sample_session();
+        s.on_connect = Some("echo hello\x1b[31mred".into());
+        g.sessions = vec![s];
+        let groups = vec![g];
+        let err = validate_groups(&groups, &[]).unwrap_err();
+        assert!(err.to_string().contains("escape sequences"));
+    }
+
+    #[test]
+    fn test_validate_groups_session_on_connect_too_long_rejected() {
+        let mut g = sample_group();
+        let mut s = sample_session();
+        s.on_connect = Some("x".repeat(1025));
+        g.sessions = vec![s];
+        let groups = vec![g];
+        let err = validate_groups(&groups, &[]).unwrap_err();
+        assert!(err.to_string().contains("maximum length"));
+    }
+
+    #[test]
+    fn test_validate_groups_with_bookmarks_coexist() {
+        let groups = vec![sample_group()];
+        let bookmarks = vec![sample_bookmark("prod-web", "production", vec![])];
+        let profiles = vec![];
+        // Both groups and bookmarks should validate without issues
+        assert!(validate_groups(&groups, &profiles).is_ok());
+        // bookmarks also validate independently
+        validate_bookmarks(&bookmarks);
+    }
+
+    #[test]
+    fn test_validate_groups_no_groups_backward_compatible() {
+        let groups: Vec<model::BookmarkGroup> = vec![];
+        let bookmarks = vec![sample_bookmark("prod-web", "production", vec![])];
+        let profiles = vec![];
+        // Empty groups list should not cause any errors
+        assert!(validate_groups(&groups, &profiles).is_ok());
+        validate_bookmarks(&bookmarks);
     }
 }

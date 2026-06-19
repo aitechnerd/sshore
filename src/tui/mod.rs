@@ -322,29 +322,64 @@ pub async fn run(config: &mut AppConfig, cfg_override: Option<&str>) -> Result<(
                 tracing::debug!("user quit TUI");
                 break;
             }
-            LoopAction::Connect(bookmark_index) => {
-                let name = &app.config.bookmarks[bookmark_index].name;
-                tracing::debug!(
-                    bookmark = name,
-                    index = bookmark_index,
-                    "connecting from TUI"
-                );
-                if let Err(e) = ssh::connect(
-                    &mut app.config,
-                    bookmark_index,
-                    app.config_path_override.as_deref(),
-                )
-                .await
-                {
-                    tracing::debug!(error = %e, "SSH session ended with error");
-                    eprintln!("SSH error: {e:#}");
-                    // Don't block on stdin if the terminal is gone
-                    if !crate::SHUTDOWN_REQUESTED.load(Ordering::Relaxed) {
-                        eprintln!("Press Enter to return to sshore...");
-                        let _ = wait_for_enter();
+            LoopAction::Connect(index) => {
+                // Session indices are encoded as: group_idx * 10000 + session_idx
+                // If index >= 10000, it's a session connection
+                if index >= 10000 {
+                    let display_name = if index / 10000 < app.config.groups.len() {
+                        let g = &app.config.groups[index / 10000];
+                        let s_idx = index % 10000;
+                        if s_idx < g.sessions.len() {
+                            g.sessions[s_idx].display_name(g)
+                        } else {
+                            format!("session-{}", s_idx)
+                        }
+                    } else {
+                        format!("session-{}", index)
+                    };
+                    tracing::debug!(
+                        session = display_name.as_str(),
+                        encoded_index = index,
+                        "connecting session from TUI"
+                    );
+                    if let Err(e) = ssh::connect_session(
+                        &mut app.config,
+                        index,
+                        app.config_path_override.as_deref(),
+                    )
+                    .await
+                    {
+                        tracing::debug!(error = %e, "SSH session ended with error");
+                        eprintln!("SSH error: {e:#}");
+                        if !crate::SHUTDOWN_REQUESTED.load(Ordering::Relaxed) {
+                            eprintln!("Press Enter to return to sshore...");
+                            let _ = wait_for_enter();
+                        }
                     }
+                    tracing::debug!("returned to TUI after SSH session");
+                } else {
+                    let name = &app.config.bookmarks[index].name;
+                    tracing::debug!(
+                        bookmark = name,
+                        index,
+                        "connecting from TUI"
+                    );
+                    if let Err(e) = ssh::connect(
+                        &mut app.config,
+                        index,
+                        app.config_path_override.as_deref(),
+                    )
+                    .await
+                    {
+                        tracing::debug!(error = %e, "SSH session ended with error");
+                        eprintln!("SSH error: {e:#}");
+                        if !crate::SHUTDOWN_REQUESTED.load(Ordering::Relaxed) {
+                            eprintln!("Press Enter to return to sshore...");
+                            let _ = wait_for_enter();
+                        }
+                    }
+                    tracing::debug!("returned to TUI after SSH session");
                 }
-                tracing::debug!("returned to TUI after SSH session");
             }
             LoopAction::Browse(bookmark_index) => {
                 let name = &app.config.bookmarks[bookmark_index].name;

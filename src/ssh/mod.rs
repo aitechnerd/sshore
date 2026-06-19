@@ -855,6 +855,79 @@ pub async fn connect(
     Ok(())
 }
 
+/// Connect to a session within a bookmark group.
+///
+/// The session index is encoded as: group_idx * 10000 + session_idx.
+///
+/// Resolves all effective parameters through the five-layer chain and creates
+/// a synthetic bookmark to reuse the existing connection infrastructure.
+pub async fn connect_session(
+    config: &mut AppConfig,
+    encoded_index: usize,
+    cfg_override: Option<&str>,
+) -> Result<()> {
+    let group_idx = encoded_index / 10000;
+    let session_idx = encoded_index % 10000;
+
+    let group = &config.groups[group_idx];
+    let session = &group.sessions[session_idx];
+
+    // Resolve all effective parameters through the five-layer chain
+    let user = session.effective_user(group, &config.settings, &config.profiles);
+    let host = session.effective_host(group);
+    let port = session.effective_port(group);
+    let env = session.effective_env(group);
+    let display_name = session.display_name(group);
+    let identity_file = session.effective_identity_file(group, &config.profiles);
+    let proxy_jump = session.effective_proxy_jump(group, &config.profiles);
+    let on_connect = session.effective_on_connect(group, &config.profiles);
+    let on_connect_prompt_pattern = session.effective_on_connect_prompt_pattern(group);
+    let connect_timeout_secs =
+        session.effective_connect_timeout(group, &config.settings, &config.profiles);
+    let ssh_options = session.effective_ssh_options(group, &config.profiles);
+
+    tracing::debug!(
+        session = display_name.as_str(),
+        group = group.name.as_str(),
+        "connecting session from TUI"
+    );
+
+    // Create a synthetic bookmark to reuse existing connection infrastructure
+    let synthetic_bookmark = Bookmark {
+        name: display_name.clone(),
+        host,
+        user: Some(user),
+        port,
+        env,
+        tags: group.tags.clone(),
+        identity_file,
+        proxy_jump,
+        notes: group.notes.clone(),
+        last_connected: None,
+        connect_count: 0,
+        on_connect,
+        on_connect_prompt_pattern,
+        snippets: session.effective_snippets(group),
+        connect_timeout_secs,
+        ssh_options,
+        profile: group.profile.clone(),
+    };
+
+    // Temporarily add to bookmarks for the existing connect() to work
+    let bookmark_index = config.bookmarks.len();
+    config.bookmarks.push(synthetic_bookmark);
+
+    // Connect using existing infrastructure
+    let result = connect(config, bookmark_index, cfg_override).await;
+
+    // Remove the synthetic bookmark after connection
+    if bookmark_index < config.bookmarks.len() {
+        config.bookmarks.remove(bookmark_index);
+    }
+
+    result
+}
+
 /// Execute a single command on a bookmark and return the result.
 /// Does NOT allocate a PTY — runs as an exec channel.
 pub async fn exec_command(

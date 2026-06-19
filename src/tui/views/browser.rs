@@ -3087,6 +3087,9 @@ struct WorkerPool {
     last_error: Arc<std::sync::Mutex<Option<String>>>,
     overwrite_tx: tokio::sync::mpsc::Sender<OverwriteQuery>,
     overwrite_policy: Arc<AtomicU64>,
+    /// Shared flag set by the heartbeat task when the SFTP session is dead.
+    /// All workers on the same session share this flag to detect failure early.
+    session_dead: Arc<AtomicBool>,
 }
 
 /// Receive the next work item from the shared queue, handling overwrite checks.
@@ -3207,15 +3210,90 @@ async fn recv_next_target(
 /// Spawn a single transfer worker that pulls from the shared work queue.
 /// Prefetches the next file's SFTP handle during the current transfer to
 /// eliminate per-file open/close latency.
+///
+/// Also spawns a heartbeat task that pings the SFTP session every 15 seconds
+/// to detect dead connections early. When the heartbeat detects a dead session,
+/// it sets `pool.session_dead` so all workers break out promptly.
+///
+/// `heartbeat_sessions` tracks which RawSftpSession pointers already have a
+/// heartbeat task, so we only spawn one per unique session (workers on the
+/// same SSH connection share a session).
 fn spawn_worker(
     worker_id: usize,
     worker: PipelinedWorker,
     pool: &Arc<WorkerPool>,
+    heartbeat_sessions: &Arc<std::sync::Mutex<HashSet<usize>>>,
 ) -> tokio::task::JoinHandle<()> {
     let pool = Arc::clone(pool);
     let raw = worker.raw;
     let read_chunk_size = worker.read_chunk_size;
     let write_chunk_size = worker.write_chunk_size;
+
+    // Spawn a heartbeat task per unique session (not per worker).
+    // Workers on the same SSH connection share the same RawSftpSession.
+    // The heartbeat does two things:
+    // 1. Checks is_closed() to detect if the background reader died
+    // 2. Sends a stat("/") ping to detect an unresponsive server
+    // If either check fails, it closes the session so in-flight transfers fail fast.
+    let raw_ptr = Arc::as_ptr(&raw) as usize;
+    let should_spawn_heartbeat = {
+        let mut set = heartbeat_sessions.lock().unwrap();
+        if set.contains(&raw_ptr) {
+            false
+        } else {
+            set.insert(raw_ptr);
+            true
+        }
+    };
+
+    if should_spawn_heartbeat {
+        let hb_raw = Arc::clone(&raw);
+        let hb_dead = Arc::clone(&pool.session_dead);
+        let hb_cancel = Arc::clone(&pool.cancel);
+        tokio::spawn(async move {
+            tracing::debug!("worker[{worker_id}] heartbeat started (interval=15s, ping_timeout=5s)");
+            let mut interval = tokio::time::interval(Duration::from_secs(15));
+            interval.tick().await; // skip immediate first tick
+            loop {
+                interval.tick().await;
+                if hb_cancel.load(Ordering::Relaxed) {
+                    break;
+                }
+                // Fast path: check if the session is already closed (no network I/O).
+                if hb_raw.is_closed() {
+                    tracing::debug!("worker heartbeat: session closed");
+                    hb_dead.store(true, Ordering::Relaxed);
+                    break;
+                }
+                // Active ping: stat the root path with a short timeout.
+                // If the server is unresponsive, this fails and we close the session
+                // so in-flight transfers don't wait for the full request timeout.
+                let ping_result =
+                    tokio::time::timeout(Duration::from_secs(5), hb_raw.stat("/")).await;
+                match ping_result {
+                    Ok(Ok(_)) => {
+                        // Session is alive
+                    }
+                    Ok(Err(_)) => {
+                        // stat("/") failed (e.g., permission denied) — that's fine,
+                        // the session is still responsive. Some servers don't allow
+                        // stat on root.
+                    }
+                    Err(_) => {
+                        // Ping timed out — server is unresponsive.
+                        // Close the session so in-flight transfers fail fast.
+                        tracing::warn!(
+                            "worker heartbeat: ping timed out, closing session"
+                        );
+                        let _ = hb_raw.close_session();
+                        hb_dead.store(true, Ordering::Relaxed);
+                        break;
+                    }
+                }
+            }
+            tracing::debug!("worker heartbeat stopped");
+        });
+    }
 
     tokio::spawn(async move {
         tracing::debug!(
@@ -3263,6 +3341,34 @@ fn spawn_worker(
                 break;
             }
 
+            // Check if another worker's heartbeat detected a dead session.
+            // This propagates the failure across all workers quickly.
+            if pool.session_dead.load(Ordering::Relaxed) {
+                tracing::debug!(
+                    "worker[{worker_id}] session_dead flag set by heartbeat, stopping"
+                );
+                if let Some(h) = file_handle {
+                    pipeline::close_handle(&raw, &h).await;
+                }
+                break;
+            }
+
+            // Check if the SFTP session is dead (server disconnected, channel closed).
+            // This detects dead connections early without waiting for a request timeout.
+            if raw.is_closed() {
+                // Signal all other workers to stop.
+                pool.session_dead.store(true, Ordering::Relaxed);
+                tracing::error!(
+                    "worker[{worker_id}] session closed, stopping"
+                );
+                if let Some(h) = file_handle {
+                    pipeline::close_handle(&raw, &h).await;
+                }
+                let mut err = pool.last_error.lock().unwrap();
+                *err = Some("SFTP session closed (server disconnected)".into());
+                break;
+            }
+
             // Open the SFTP file handle (if not prefetched).
             let open_start = std::time::Instant::now();
             let handle_str = match file_handle {
@@ -3270,6 +3376,17 @@ fn spawn_worker(
                 None => match open_target_handle(&raw, &target, pool.direction).await {
                     Ok(h) => h,
                     Err(e) => {
+                        // If the session is dead, stop the worker entirely.
+                        if raw.is_closed() {
+                            pool.session_dead.store(true, Ordering::Relaxed);
+                            tracing::error!(
+                                "worker[{worker_id}] session closed during open: {}, stopping",
+                                target.name
+                            );
+                            let mut err = pool.last_error.lock().unwrap();
+                            *err = Some("SFTP session closed (server disconnected)".into());
+                            break;
+                        }
                         tracing::error!("worker[{worker_id}] open failed: {}: {e:#}", target.name,);
                         let mut err = pool.last_error.lock().unwrap();
                         *err = Some(format!("{}: open failed: {e}", target.name));
@@ -3438,6 +3555,18 @@ fn spawn_worker(
                     tracing::debug!("worker[{worker_id}] skipped: {}: {e:#}", target.name);
                 }
                 Err(e) => {
+                    // If the session is dead, stop the worker entirely rather than
+                    // cascading through all remaining files with "session closed" errors.
+                    if raw.is_closed() {
+                        pool.session_dead.store(true, Ordering::Relaxed);
+                        tracing::error!(
+                            "worker[{worker_id}] session closed during transfer: {}, stopping",
+                            target.name
+                        );
+                        let mut err = pool.last_error.lock().unwrap();
+                        *err = Some("SFTP session closed (server disconnected)".into());
+                        break;
+                    }
                     tracing::error!(
                         "worker[{worker_id}] transfer failed: {}: {e:#}",
                         target.name,
@@ -3631,7 +3760,12 @@ async fn run_background_transfer(
         last_error: Arc::new(std::sync::Mutex::new(None)),
         overwrite_tx,
         overwrite_policy,
+        session_dead: Arc::new(AtomicBool::new(false)),
     });
+
+    // Track which sessions already have a heartbeat task (one per unique RawSftpSession).
+    let heartbeat_sessions: Arc<std::sync::Mutex<HashSet<usize>>> =
+        Arc::new(std::sync::Mutex::new(HashSet::new()));
 
     // Periodic memory reporter — logs RSS every 2 seconds during transfer.
     let mem_cancel = Arc::clone(&cancel);
@@ -3654,7 +3788,7 @@ async fn run_background_transfer(
     {
         let mut handles = worker_handles.lock().await;
         for (id, worker) in initial_workers.into_iter().enumerate() {
-            handles.push(spawn_worker(id, worker, &pool));
+            handles.push(spawn_worker(id, worker, &pool, &heartbeat_sessions));
         }
     }
 
@@ -3662,6 +3796,7 @@ async fn run_background_transfer(
     let extra_pool = Arc::clone(&pool);
     let extra_handles = Arc::clone(&worker_handles);
     let extra_cancel = Arc::clone(&cancel);
+    let extra_heartbeat = Arc::clone(&heartbeat_sessions);
     let extra_listener = tokio::spawn(async move {
         let mut next_id = WORKERS_PER_CONNECTION; // IDs for extra workers start after initial
         while let Some(worker) = extra_workers_rx.recv().await {
@@ -3673,7 +3808,7 @@ async fn run_background_transfer(
                 rss_mb(),
                 transfer_wall_start.elapsed().as_secs_f64()
             );
-            let handle = spawn_worker(next_id, worker, &extra_pool);
+            let handle = spawn_worker(next_id, worker, &extra_pool, &extra_heartbeat);
             extra_handles.lock().await.push(handle);
             next_id += 1;
         }

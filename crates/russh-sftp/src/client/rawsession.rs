@@ -226,6 +226,12 @@ impl RawSftpSession {
         self.next_req_id.fetch_add(1, Ordering::SeqCst)
     }
 
+    /// Returns `true` if the underlying channel is closed (session is dead).
+    /// Use this to detect a dead session without sending a request.
+    pub fn is_closed(&self) -> bool {
+        self.tx.is_closed()
+    }
+
     /// Closes the inner channel stream. Called by [`Drop`]
     pub fn close_session(&self) -> SftpResult<()> {
         if self.tx.is_closed() {

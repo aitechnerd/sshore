@@ -53,8 +53,9 @@ pub struct PipelinedSession {
 
 /// Create an initialized `RawSftpSession` from an SSH channel.
 ///
-/// Negotiates SFTP version and server limits. Sets a generous timeout
-/// suitable for file transfers (5 minutes per request).
+/// Negotiates SFTP version and server limits. Sets a 60-second timeout
+/// per request — generous enough for slow links but fast enough to detect
+/// a dead server without waiting 5 minutes.
 pub async fn create_raw_session(
     channel: russh::Channel<russh::client::Msg>,
 ) -> Result<PipelinedSession> {
@@ -64,7 +65,7 @@ pub async fn create_raw_session(
         .context("Failed to request SFTP subsystem")?;
 
     let mut raw = RawSftpSession::new(channel.into_stream());
-    raw.set_timeout(300).await;
+    raw.set_timeout(60).await;
 
     let version = raw
         .init()

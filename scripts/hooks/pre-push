@@ -1,0 +1,35 @@
+#!/usr/bin/env bash
+# Pre-push hook: runs CI checks locally before allowing a push.
+#
+# Install (run once after cloning):
+#   git config core.hooksPath scripts/hooks/
+#
+# Verify it's active:
+#   git config core.hooksPath  # should print "scripts/hooks/"
+#
+# Exit 1 (block push) if any check fails.
+
+set -e
+
+echo "Running pre-push checks..."
+
+if ! cargo fmt -- --check 2>&1; then
+    echo "FAIL: cargo fmt -- --check"
+    echo "Run 'cargo fmt' to fix, then retry."
+    exit 1
+fi
+
+if ! cargo clippy -- -D warnings 2>&1; then
+    echo "FAIL: cargo clippy -- -D warnings"
+    echo "Fix clippy warnings, then retry."
+    exit 1
+fi
+
+if ! cargo test 2>&1; then
+    echo "FAIL: cargo test"
+    echo "Fix test failures, then retry."
+    exit 1
+fi
+
+echo "All pre-push checks passed."
+exit 0

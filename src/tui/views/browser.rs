@@ -3894,10 +3894,11 @@ async fn run_background_transfer(
         }
         tracing::debug!("transfer:join awaited {batch_size} worker handles");
     }
-    // Wait for the feed task to finish (ensures tx is dropped and channel closed).
-    let _ = feed_handle.await;
-    // Signal helper tasks to stop, then wait for them to exit gracefully.
+    // Signal all helpers to stop. The feed task may be blocked on send() if
+    // workers stopped receiving (session died) — setting cancel lets it break
+    // out of its loop and drop tx, closing the channel.
     cancel.store(true, Ordering::Relaxed);
+    let _ = feed_handle.await;
     let _ = extra_listener.await;
     let _ = mem_reporter.await;
 

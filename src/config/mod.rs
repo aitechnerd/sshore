@@ -1596,4 +1596,305 @@ profile = "deleted-profile"
         assert!(validate_groups(&groups, &profiles).is_ok());
         validate_bookmarks(&bookmarks);
     }
+
+    // --- Integration tests (Task 005) ---
+
+    #[test]
+    fn test_full_resolution_chain_session_group_profile_settings() {
+        // Full five-layer chain: session -> group -> profile -> settings -> hardcoded
+        let profiles = vec![model::Profile {
+            name: "corp".into(),
+            user: Some("deploy".into()),
+            identity_file: Some("~/.ssh/corp_key".into()),
+            proxy_jump: Some("bastion.corp.com".into()),
+            on_connect: Some("cd /app".into()),
+            connect_timeout_secs: Some(30),
+            ssh_options: {
+                let mut m = std::collections::BTreeMap::new();
+                m.insert("ServerAliveInterval".into(), "60".into());
+                m
+            },
+            ..model::Profile::default()
+        }];
+
+        let group = model::BookmarkGroup {
+            name: "prod-servers".into(),
+            host: "10.0.1.5".into(),
+            user: None, // falls to profile
+            port: 2222,
+            env: "production".into(),
+            tags: vec!["web".into()],
+            identity_file: None, // falls to profile
+            proxy_jump: None, // falls to profile
+            notes: None,
+            profile: Some("corp".into()),
+            connect_timeout_secs: None, // falls to profile
+            ssh_options: {
+                let mut m = std::collections::BTreeMap::new();
+                m.insert("Compression".into(), "yes".into());
+                m
+            },
+            on_connect: None, // falls to profile
+            on_connect_prompt_pattern: Some("\\$\\s*$".into()),
+            snippets: vec![model::Snippet {
+                name: "Uptime".into(),
+                command: "uptime".into(),
+                auto_execute: true,
+            }],
+            sessions: vec![model::Session {
+                name: "project-a".into(),
+                on_connect: Some("tmux attach -t proj-a".into()), // overrides
+                user: Some("admin".into()), // overrides
+                identity_file: None, // falls to group -> profile
+                proxy_jump: None, // falls to group -> profile
+                connect_timeout_secs: Some(10), // overrides
+                ssh_options: {
+                    let mut m = std::collections::BTreeMap::new();
+                    m.insert("Compression".into(), "no".into()); // overrides group
+                    m
+                },
+                on_connect_prompt_pattern: None, // falls to group
+                snippets: vec![],
+            }],
+        };
+
+        let settings = model::Settings {
+            default_user: Some("fallback".into()),
+            connect_timeout_secs: Some(45),
+            ..model::Settings::default()
+        };
+
+        let session = &group.sessions[0];
+
+        // Session overrides
+        assert_eq!(session.effective_user(&group, &settings, &profiles), "admin");
+        assert_eq!(
+            session.effective_on_connect(&group, &profiles),
+            Some("tmux attach -t proj-a".into())
+        );
+        assert_eq!(
+            session.effective_connect_timeout(&group, &settings, &profiles),
+            Some(10)
+        );
+
+        // Group -> Profile fallback
+        assert_eq!(
+            session.effective_identity_file(&group, &profiles),
+            Some("~/.ssh/corp_key".into())
+        );
+        assert_eq!(
+            session.effective_proxy_jump(&group, &profiles),
+            Some("bastion.corp.com".into())
+        );
+
+        // Group-level value
+        assert_eq!(
+            session.effective_on_connect_prompt_pattern(&group),
+            Some("\\$\\s*$".into())
+        );
+
+        // Host/port/env from group
+        assert_eq!(session.effective_host(&group), "10.0.1.5");
+        assert_eq!(session.effective_port(&group), 2222);
+        assert_eq!(session.effective_env(&group), "production");
+
+        // SSH options merge: profile -> group -> session
+        let merged = session.effective_ssh_options(&group, &profiles);
+        assert_eq!(merged.get("ServerAliveInterval").unwrap(), "60"); // from profile
+        assert_eq!(merged.get("Compression").unwrap(), "no"); // session overrides group
+        assert_eq!(merged.len(), 2);
+    }
+
+    #[test]
+    fn test_config_save_load_roundtrip_with_groups() {
+        let config = model::AppConfig {
+            settings: model::Settings {
+                default_user: Some("admin".into()),
+                ..model::Settings::default()
+            },
+            profiles: vec![model::Profile {
+                name: "corp".into(),
+                identity_file: Some("~/.ssh/corp_key".into()),
+                ..model::Profile::default()
+            }],
+            bookmarks: vec![sample_bookmark("prod-web", "production", vec!["web".into()])],
+            groups: vec![model::BookmarkGroup {
+                name: "prod-servers".into(),
+                host: "10.0.1.5".into(),
+                user: Some("deploy".into()),
+                port: 22,
+                env: "production".into(),
+                tags: vec!["web".into()],
+                identity_file: None,
+                proxy_jump: Some("bastion".into()),
+                notes: Some("Production".into()),
+                profile: Some("corp".into()),
+                connect_timeout_secs: Some(30),
+                ssh_options: {
+                    let mut m = std::collections::BTreeMap::new();
+                    m.insert("ServerAliveInterval".into(), "60".into());
+                    m
+                },
+                on_connect: Some("cd /projects".into()),
+                on_connect_prompt_pattern: Some("\\$\\s*$".into()),
+                snippets: vec![],
+                sessions: vec![
+                    model::Session {
+                        name: "project-a".into(),
+                        on_connect: Some("tmux attach -t proj-a".into()),
+                        ..model::Session::default()
+                    },
+                    model::Session {
+                        name: "project-b".into(),
+                        user: Some("admin".into()),
+                        ..model::Session::default()
+                    },
+                ],
+            }],
+        };
+
+        // Serialize to TOML
+        let toml_str = toml::to_string_pretty(&config).expect("serialize");
+
+        // Deserialize back
+        let deserialized: model::AppConfig = toml::from_str(&toml_str).expect("deserialize");
+
+        // Verify roundtrip
+        assert_eq!(config, deserialized);
+        assert_eq!(deserialized.groups.len(), 1);
+        assert_eq!(deserialized.groups[0].name, "prod-servers");
+        assert_eq!(deserialized.groups[0].sessions.len(), 2);
+        assert_eq!(deserialized.groups[0].sessions[0].name, "project-a");
+        assert_eq!(
+            deserialized.groups[0].sessions[0].on_connect,
+            Some("tmux attach -t proj-a".into())
+        );
+        assert_eq!(deserialized.groups[0].sessions[1].name, "project-b");
+        assert_eq!(
+            deserialized.groups[0].sessions[1].user,
+            Some("admin".into())
+        );
+    }
+
+    #[test]
+    fn test_config_no_groups_loads_without_error() {
+        let toml_str = r#"
+            [settings]
+            default_user = "admin"
+
+            [[bookmarks]]
+            name = "prod-web"
+            host = "10.0.1.5"
+            env = "production"
+        "#;
+        let config: model::AppConfig = toml::from_str(toml_str).expect("deserialize");
+        assert!(config.groups.is_empty());
+        assert_eq!(config.bookmarks.len(), 1);
+        assert_eq!(config.bookmarks[0].name, "prod-web");
+    }
+
+    #[test]
+    fn test_config_bookmarks_and_groups_coexist() {
+        let toml_str = r#"
+            [settings]
+
+            [[bookmarks]]
+            name = "standalone-server"
+            host = "10.0.1.1"
+
+            [[groups]]
+            name = "prod-servers"
+            host = "10.0.2.1"
+
+            [[groups.sessions]]
+            name = "project-a"
+        "#;
+        let config: model::AppConfig = toml::from_str(toml_str).expect("deserialize");
+        assert_eq!(config.bookmarks.len(), 1);
+        assert_eq!(config.groups.len(), 1);
+        assert_eq!(config.groups[0].sessions.len(), 1);
+    }
+
+    #[test]
+    fn test_dangling_profile_ref_from_group_is_soft_warning() {
+        let groups = vec![model::BookmarkGroup {
+            name: "prod-servers".into(),
+            host: "10.0.1.5".into(),
+            profile: Some("nonexistent".into()),
+            ..model::BookmarkGroup::default()
+        }];
+        // Should succeed (soft warning, not hard error)
+        assert!(validate_groups(&groups, &[]).is_ok());
+    }
+
+    #[test]
+    fn test_duplicate_session_names_across_groups_allowed() {
+        let g1 = model::BookmarkGroup {
+            name: "prod-servers".into(),
+            host: "10.0.1.5".into(),
+            sessions: vec![model::Session {
+                name: "frontend".into(),
+                ..model::Session::default()
+            }],
+            ..model::BookmarkGroup::default()
+        };
+        let g2 = model::BookmarkGroup {
+            name: "staging-servers".into(),
+            host: "10.0.2.5".into(),
+            sessions: vec![model::Session {
+                name: "frontend".into(), // same name in different group
+                ..model::Session::default()
+            }],
+            ..model::BookmarkGroup::default()
+        };
+        assert!(validate_groups(&vec![g1, g2], &[]).is_ok());
+    }
+
+    #[test]
+    fn test_duplicate_session_names_within_group_rejected() {
+        let g = model::BookmarkGroup {
+            name: "prod-servers".into(),
+            host: "10.0.1.5".into(),
+            sessions: vec![
+                model::Session {
+                    name: "frontend".into(),
+                    ..model::Session::default()
+                },
+                model::Session {
+                    name: "frontend".into(), // duplicate!
+                    ..model::Session::default()
+                },
+            ],
+            ..model::BookmarkGroup::default()
+        };
+        let err = validate_groups(&vec![g], &[]).unwrap_err();
+        assert!(err.to_string().contains("Duplicate session name"));
+    }
+
+    #[test]
+    fn test_on_connect_validation_group_and_session_levels() {
+        // Group-level escape sequence
+        let g1 = model::BookmarkGroup {
+            name: "prod-servers".into(),
+            host: "10.0.1.5".into(),
+            on_connect: Some("echo hello\x1b[31mred".into()),
+            ..model::BookmarkGroup::default()
+        };
+        let err = validate_groups(&vec![g1], &[]).unwrap_err();
+        assert!(err.to_string().contains("escape sequences"));
+
+        // Session-level escape sequence
+        let g2 = model::BookmarkGroup {
+            name: "prod-servers".into(),
+            host: "10.0.1.5".into(),
+            sessions: vec![model::Session {
+                name: "project-a".into(),
+                on_connect: Some("echo hello\x1b[31mred".into()),
+                ..model::Session::default()
+            }],
+            ..model::BookmarkGroup::default()
+        };
+        let err = validate_groups(&vec![g2], &[]).unwrap_err();
+        assert!(err.to_string().contains("escape sequences"));
+    }
 }

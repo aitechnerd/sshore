@@ -720,16 +720,15 @@ pub async fn run(
                             Side::Left => &mut *left,
                             Side::Right => &mut *right,
                         };
-                        // Delete in reverse order so files are removed before their
-                        // parent directories.
+                        // Delete remaining source directories (files are already deleted
+                        // per-file during the transfer). Only directories remain.
                         for (path, is_dir) in sources.iter().rev() {
-                            let del_result = if *is_dir {
-                                src_backend.rmdir(path).await
-                            } else {
-                                src_backend.delete(path).await
-                            };
+                            if !*is_dir {
+                                continue; // file already deleted
+                            }
+                            let del_result = src_backend.rmdir(path).await;
                             if let Err(e) = del_result {
-                                tracing::warn!("move: failed to delete source {path}: {e:#}");
+                                tracing::warn!("move: failed to delete source dir {path}: {e:#}");
                             }
                         }
                     }
@@ -3090,6 +3089,8 @@ struct WorkerPool {
     /// Shared flag set by the heartbeat task when the SFTP session is dead.
     /// All workers on the same session share this flag to detect failure early.
     session_dead: Arc<AtomicBool>,
+    /// If true, delete each source file immediately after successful transfer (move).
+    is_move: bool,
 }
 
 /// Receive the next work item from the shared queue, handling overwrite checks.
@@ -3545,6 +3546,45 @@ fn spawn_worker(
                             xfer_ms as f64 / 1000.0,
                         );
                     }
+                    // For moves, delete the source file immediately after successful transfer.
+                    if pool.is_move {
+                        let src_path = target.src_path.clone();
+                        let is_dir = target.is_dir;
+                        let direction = pool.direction;
+                        // For remote source (download), delete via SFTP.
+                        // For local source (upload), delete via tokio::fs.
+                        if matches!(direction, TransferDirection::RemoteToLocal) {
+                            let raw = Arc::clone(&raw);
+                            tokio::spawn(async move {
+                                let result = if is_dir {
+                                    raw.rmdir(&src_path).await
+                                } else {
+                                    raw.remove(&src_path).await
+                                };
+                                if let Err(e) = result {
+                                    tracing::warn!(
+                                        "move: failed to delete source {}: {:?}",
+                                        src_path,
+                                        e
+                                    );
+                                }
+                            });
+                        } else {
+                            tokio::spawn(async move {
+                                let result = if is_dir {
+                                    tokio::fs::remove_dir_all(&src_path).await
+                                } else {
+                                    tokio::fs::remove_file(&src_path).await
+                                };
+                                if let Err(e) = result {
+                                    tracing::warn!(
+                                        "move: failed to delete source {}: {e}",
+                                        src_path
+                                    );
+                                }
+                            });
+                        }
+                    }
                 }
                 Err(_) if pool.cancel.load(Ordering::Relaxed) => {
                     // Close prefetched handle before exiting.
@@ -3637,6 +3677,7 @@ async fn run_background_transfer(
     direction: TransferDirection,
     overwrite_tx: tokio::sync::mpsc::Sender<OverwriteQuery>,
     overwrite_policy: Arc<AtomicU64>,
+    is_move: bool,
 ) -> TransferResult {
     assert!(
         !initial_workers.is_empty(),
@@ -3765,6 +3806,7 @@ async fn run_background_transfer(
         overwrite_tx,
         overwrite_policy,
         session_dead: Arc::new(AtomicBool::new(false)),
+        is_move,
     });
 
     // Track which sessions already have a heartbeat task (one per unique RawSftpSession).
@@ -4303,6 +4345,7 @@ async fn start_copy_transfer(
                     direction,
                     ow_tx,
                     bg_ow_policy,
+                    is_move,
                 )
                 .await
             });

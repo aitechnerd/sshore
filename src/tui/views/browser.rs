@@ -3860,21 +3860,27 @@ async fn run_background_transfer(
         }
     });
 
-    // Feed work items into the channel.
+    // Feed work items in a background task so the join loop below isn't blocked.
+    // With a small channel buffer the feed would block on send() when workers
+    // are busy with large files, preventing drop(tx) from ever running and
+    // leaving the channel open when the session dies mid-transfer.
     let feed_start = std::time::Instant::now();
-    for target in file_targets {
-        if cancel.load(Ordering::Relaxed) {
-            break;
+    let feed_cancel = Arc::clone(&cancel);
+    let feed_handle = tokio::spawn(async move {
+        for target in file_targets {
+            if feed_cancel.load(Ordering::Relaxed) {
+                break;
+            }
+            if tx.send(target).await.is_err() {
+                break;
+            }
         }
-        if tx.send(target).await.is_err() {
-            break;
-        }
-    }
-    drop(tx); // Close channel so workers exit when done
-    tracing::debug!(
-        "transfer:feed all work items queued in {}ms",
-        feed_start.elapsed().as_millis(),
-    );
+        drop(tx); // Close channel so workers exit when done
+        tracing::debug!(
+            "transfer:feed all work items queued in {}ms",
+            feed_start.elapsed().as_millis(),
+        );
+    });
 
     // Wait for all workers (initial + extra) to finish.
     loop {
@@ -3888,6 +3894,8 @@ async fn run_background_transfer(
         }
         tracing::debug!("transfer:join awaited {batch_size} worker handles");
     }
+    // Wait for the feed task to finish (ensures tx is dropped and channel closed).
+    let _ = feed_handle.await;
     // Signal helper tasks to stop, then wait for them to exit gracefully.
     cancel.store(true, Ordering::Relaxed);
     let _ = extra_listener.await;

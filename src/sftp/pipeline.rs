@@ -524,7 +524,15 @@ pub async fn open_write(raw: &RawSftpSession, path: &str) -> Result<Arc<str>> {
 }
 
 /// Close an SFTP file handle.
+///
+/// Skips the close if the session is already dead — calling `close()` on a
+/// disconnected session can hang indefinitely waiting for a server response
+/// that will never arrive. The server cleans up handles when the session dies,
+/// so there's nothing for us to do.
 pub async fn close_handle(raw: &RawSftpSession, handle: &str) {
+    if raw.is_closed() {
+        return;
+    }
     let _ = raw.close(handle).await;
 }
 

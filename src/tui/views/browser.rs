@@ -3436,6 +3436,14 @@ fn spawn_worker(
                     &mut 0u64,
                 )
                 .await;
+                // Bail early if the session died or transfer was cancelled while we
+                // were waiting for work. This prevents open_target_handle from
+                // hanging on a dead session and blocking tokio::join! below.
+                if prefetch_pool.cancel.load(Ordering::Relaxed)
+                    || prefetch_pool.session_dead.load(Ordering::Relaxed)
+                {
+                    return None;
+                }
                 match next {
                     Some((next_target, true)) => {
                         // Pre-open the handle while current transfer is in progress.

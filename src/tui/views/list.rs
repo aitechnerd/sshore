@@ -9,10 +9,21 @@ use crate::tui::theme;
 use crate::tui::theme::ThemeColors;
 use crate::tui::widgets::env_badge;
 
-/// Render the main bookmark list table.
+/// Width ratio for the left pane (group/session list) in the split layout.
+const LEFT_PANE_WIDTH: u16 = 30;
+
+/// Render the main list area. Decides between split-pane (groups) and
+/// single-pane (bookmarks only) layout.
 pub fn render_list(frame: &mut Frame, area: Rect, app: &App) {
     let tc = &app.theme;
 
+    // If we have groups, use split-pane layout
+    if !app.config.groups.is_empty() {
+        render_split_layout(frame, area, app);
+        return;
+    }
+
+    // No groups — fall back to bookmark-only layout
     if app.config.bookmarks.is_empty() {
         render_empty_state(frame, area, tc);
         return;
@@ -22,6 +33,185 @@ pub fn render_list(frame: &mut Frame, area: Rect, app: &App) {
         render_no_matches(frame, area, tc);
         return;
     }
+
+    render_bookmark_table(frame, area, app);
+}
+
+/// Render the split-pane layout: group/session tree on left, terminal on right.
+fn render_split_layout(frame: &mut Frame, area: Rect, app: &App) {
+
+    let layout = ratatui::layout::Layout::horizontal([
+        Constraint::Percentage(LEFT_PANE_WIDTH),
+        Constraint::Percentage(100 - LEFT_PANE_WIDTH),
+    ])
+    .split(area);
+
+    // Left pane: group/session tree (or bookmarks if no groups)
+    render_group_session_tree(frame, layout[0], app);
+
+    // Right pane: terminal area (placeholder for now)
+    render_terminal_pane(frame, layout[1], app);
+}
+
+/// Render the group/session tree in the left pane.
+///
+/// Shows groups as collapsible headers with sessions nested underneath.
+/// Falls back to bookmark list when no groups exist.
+fn render_group_session_tree(frame: &mut Frame, area: Rect, app: &App) {
+    let tc = &app.theme;
+
+    if app.config.groups.is_empty() {
+        // No groups — show bookmarks in the left pane
+        if app.config.bookmarks.is_empty() {
+            render_empty_state(frame, area, tc);
+            return;
+        }
+        if app.filtered_indices.is_empty() {
+            render_no_matches(frame, area, tc);
+            return;
+        }
+        render_bookmark_table(frame, area, app);
+        return;
+    }
+
+    // Build the tree rows
+    let mut rows: Vec<Row> = Vec::new();
+    let mut display_indices: Vec<usize> = Vec::new();
+
+    for (group_idx, group) in app.config.groups.iter().enumerate() {
+        let is_collapsed = app.collapsed_groups.contains(&group_idx);
+
+        // Group header row
+        let collapse_indicator = if is_collapsed { "+" } else { "-" };
+        let group_label = format!("{} {}", collapse_indicator, group.name);
+
+        let is_group_selected = match app.selected_session {
+            Some((sg, ss)) => sg == group_idx && ss == usize::MAX, // group header selected
+            _ => false,
+        };
+
+        let env_span = env_badge::env_badge_span(&group.env, &app.config.settings);
+        let header_style = if is_group_selected {
+            Style::default()
+                .add_modifier(Modifier::BOLD)
+                .fg(tc.fg)
+                .bg(tc.highlight)
+        } else {
+            Style::default()
+                .fg(tc.accent)
+                .add_modifier(Modifier::BOLD)
+        };
+
+        let header_line = Line::from(vec![
+            env_span,
+            Span::styled(format!("  {}", group_label), header_style),
+        ]);
+
+        rows.push(Row::new(vec![Cell::from(header_line)]));
+        display_indices.push(group_idx * 1000 + 0); // group header marker
+
+        // Session rows (only if not collapsed)
+        if !is_collapsed {
+            for (session_idx, session) in group.sessions.iter().enumerate() {
+                let is_selected =
+                    app.selected_session == Some((group_idx, session_idx));
+
+                let session_style = if is_selected {
+                    Style::default()
+                        .add_modifier(Modifier::BOLD)
+                        .fg(tc.fg)
+                        .bg(tc.highlight)
+                } else {
+                    Style::default().fg(tc.fg)
+                };
+
+                // Session display: "  └─ session-name" with env badge
+                let session_display = format!("  └─ {}", session.name);
+                let session_line = Line::from(vec![Span::styled(
+                    session_display,
+                    session_style,
+                )]);
+
+                rows.push(Row::new(vec![Cell::from(session_line)]));
+                display_indices.push(group_idx * 1000 + 1 + session_idx); // session marker
+            }
+        }
+    }
+
+    if rows.is_empty() {
+        render_empty_state(frame, area, tc);
+        return;
+    }
+
+    let table = Table::new(rows, [Constraint::Min(1)]).row_highlight_style(
+        Style::default(), // We handle highlighting per-cell
+    );
+
+    // Determine selected display index
+    let selected_display = match app.selected_session {
+        Some((g, s)) => g * 1000 + 1 + s,
+        None => 0,
+    };
+
+    // Find the display index position
+    let selected_pos = display_indices
+        .iter()
+        .position(|&idx| idx == selected_display)
+        .unwrap_or(0);
+
+    let mut state = TableState::default();
+    state.select(Some(selected_pos));
+
+    frame.render_stateful_widget(table, area, &mut state);
+}
+
+/// Render the right pane (terminal area).
+///
+/// Shows a placeholder when no session is connected, or the active session info.
+fn render_terminal_pane(frame: &mut Frame, area: Rect, app: &App) {
+    let tc = &app.theme;
+
+    let content = match app.selected_session {
+        Some((group_idx, session_idx)) => {
+            let group = &app.config.groups[group_idx];
+            let session = &group.sessions[session_idx];
+            let display_name = session.display_name(group);
+            Text::from(vec![
+                Line::from(""),
+                Line::from(Span::styled(
+                    display_name,
+                    Style::default().fg(tc.accent).add_modifier(Modifier::BOLD),
+                )),
+                Line::from(""),
+                Line::from(Span::styled(
+                    "Terminal will appear here when connected.",
+                    Style::default().fg(tc.fg_dim),
+                )),
+                Line::from(""),
+                Line::from(Span::styled(
+                    "Press Enter to connect.",
+                    Style::default().fg(tc.fg_muted),
+                )),
+            ])
+        }
+        None => {
+            Text::from(vec![
+                Line::from(""),
+                Line::from(Span::styled(
+                    "Select a session to connect.",
+                    Style::default().fg(tc.fg_dim),
+                )),
+            ])
+        }
+    };
+
+    let paragraph = Paragraph::new(content).alignment(Alignment::Center);
+    frame.render_widget(paragraph, area);
+}
+
+/// Render the bookmark table (used when no groups exist).
+fn render_bookmark_table(frame: &mut Frame, area: Rect, app: &App) {
+    let tc = &app.theme;
 
     let header = Row::new(vec![
         Cell::from("Env").style(Style::default().fg(tc.fg).add_modifier(Modifier::BOLD)),
@@ -210,6 +400,74 @@ pub fn render_env_filter_indicator(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::model::{AppConfig, Bookmark, BookmarkGroup, Session, Settings};
+
+    fn sample_bookmark(name: &str, env: &str) -> Bookmark {
+        Bookmark {
+            name: name.into(),
+            host: format!("10.0.1.{}", name.len()),
+            user: Some("deploy".into()),
+            port: 22,
+            env: env.into(),
+            tags: vec![],
+            identity_file: None,
+            proxy_jump: None,
+            notes: None,
+            last_connected: None,
+            connect_count: 0,
+            on_connect: None,
+            on_connect_prompt_pattern: None,
+            snippets: vec![],
+            connect_timeout_secs: None,
+            ssh_options: std::collections::BTreeMap::new(),
+            profile: None,
+        }
+    }
+
+    fn sample_group(name: &str, env: &str, session_count: usize) -> BookmarkGroup {
+        let sessions: Vec<Session> = (0..session_count)
+            .map(|i| Session {
+                name: format!("session-{}", i),
+                ..Session::default()
+            })
+            .collect();
+        BookmarkGroup {
+            name: name.into(),
+            host: "10.0.1.5".into(),
+            user: Some("deploy".into()),
+            port: 22,
+            env: env.into(),
+            tags: vec![],
+            identity_file: None,
+            proxy_jump: None,
+            notes: None,
+            profile: None,
+            connect_timeout_secs: None,
+            ssh_options: std::collections::BTreeMap::new(),
+            on_connect: None,
+            on_connect_prompt_pattern: None,
+            snippets: vec![],
+            sessions,
+        }
+    }
+
+    fn config_with_groups(groups: Vec<BookmarkGroup>) -> AppConfig {
+        AppConfig {
+            settings: Settings::default(),
+            profiles: vec![],
+            bookmarks: vec![],
+            groups,
+        }
+    }
+
+    fn config_with_bookmarks(bookmarks: Vec<Bookmark>) -> AppConfig {
+        AppConfig {
+            settings: Settings::default(),
+            profiles: vec![],
+            bookmarks,
+            groups: vec![],
+        }
+    }
 
     #[test]
     fn test_format_name_display_plain() {
@@ -251,5 +509,53 @@ mod tests {
             bracket_pos < paren_pos,
             "profile indicator should appear before snippet count"
         );
+    }
+
+    // --- Split-pane tests (Task 003) ---
+
+    #[test]
+    fn test_split_layout_used_when_groups_exist() {
+        let config = config_with_groups(vec![sample_group("prod", "production", 2)]);
+        let app = App::new(config);
+        // App has groups, so render_list should use split layout
+        assert!(!app.config.groups.is_empty());
+    }
+
+    #[test]
+    fn test_bookmark_layout_used_when_no_groups() {
+        let config = config_with_bookmarks(vec![sample_bookmark("prod-web-01", "production")]);
+        let app = App::new(config);
+        // App has no groups, so render_list should use bookmark table
+        assert!(app.config.groups.is_empty());
+        assert!(!app.config.bookmarks.is_empty());
+    }
+
+    #[test]
+    fn test_group_display_name_format() {
+        let group = sample_group("prod-servers", "production", 1);
+        let session = &group.sessions[0];
+        let display = session.display_name(&group);
+        assert_eq!(display, "prod-servers/session-0");
+    }
+
+    #[test]
+    fn test_session_inherits_env_from_group() {
+        let group = sample_group("prod-servers", "production", 1);
+        let session = &group.sessions[0];
+        assert_eq!(session.effective_env(&group), "production");
+    }
+
+    #[test]
+    fn test_session_inherits_host_from_group() {
+        let group = sample_group("prod-servers", "production", 1);
+        let session = &group.sessions[0];
+        assert_eq!(session.effective_host(&group), "10.0.1.5");
+    }
+
+    #[test]
+    fn test_session_inherits_port_from_group() {
+        let group = sample_group("prod-servers", "production", 1);
+        let session = &group.sessions[0];
+        assert_eq!(session.effective_port(&group), 22);
     }
 }

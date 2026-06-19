@@ -111,6 +111,11 @@ pub struct App {
     help_source: Option<Screen>,
     /// Config file path override (from --config flag or SSHORE_CONFIG env var).
     config_path_override: Option<String>,
+    /// Groups with collapsed session lists (set of group indices).
+    pub collapsed_groups: HashSet<usize>,
+    /// Currently selected session as (group_index, session_index) within the group.
+    /// `None` means no session selected (e.g., only bookmarks or empty config).
+    pub selected_session: Option<(usize, usize)>,
     matcher: SkimMatcherV2,
 }
 
@@ -121,6 +126,14 @@ impl App {
         let filtered_indices = search_bar::filter_bookmarks(&matcher, &config.bookmarks, "", None);
         let theme = resolve_theme(&config.settings.theme);
         let tunnel_bookmarks = crate::ssh::tunnel::active_tunnel_bookmarks();
+
+        // Initialize selected_session if groups exist
+        let selected_session = config
+            .groups
+            .iter()
+            .enumerate()
+            .find(|(_, g)| !g.sessions.is_empty())
+            .map(|(group_idx, _)| (group_idx, 0));
 
         Self {
             config,
@@ -141,6 +154,8 @@ impl App {
             help_scroll: 0,
             help_source: None,
             config_path_override: None,
+            collapsed_groups: HashSet::new(),
+            selected_session,
             matcher,
         }
     }
@@ -842,6 +857,13 @@ fn handle_key_event(app: &mut App, key: KeyEvent) {
 
 /// Handle key events in the list view (not searching).
 fn handle_list_key(app: &mut App, key: KeyEvent) {
+    // If we have groups, use session navigation
+    if !app.config.groups.is_empty() {
+        handle_session_list_key(app, key);
+        return;
+    }
+
+    // No groups — use bookmark navigation
     match key.code {
         // Quit
         KeyCode::Char('q') => app.should_quit = true,
@@ -924,6 +946,118 @@ fn handle_list_key(app: &mut App, key: KeyEvent) {
         }
 
         _ => {}
+    }
+}
+
+/// Handle key events in the session list view (when groups exist).
+///
+/// Navigation moves through sessions within groups, skipping group headers.
+/// Space on a group header toggles collapse/expand.
+/// Enter on a session triggers connection.
+fn handle_session_list_key(app: &mut App, key: KeyEvent) {
+    match key.code {
+        // Quit
+        KeyCode::Char('q') => app.should_quit = true,
+
+        // Navigation: move through sessions
+        KeyCode::Up | KeyCode::Char('k') => move_session_selection(app, -1),
+        KeyCode::Down | KeyCode::Char('j') => move_session_selection(app, 1),
+        KeyCode::Home | KeyCode::Char('g') => move_session_to_first(app),
+        KeyCode::End | KeyCode::Char('G') => move_session_to_last(app),
+        KeyCode::PageUp => move_session_selection(app, -(PAGE_JUMP as isize)),
+        KeyCode::PageDown => move_session_selection(app, PAGE_JUMP as isize),
+
+        // Toggle group collapse/expand
+        KeyCode::Char(' ') => toggle_group_collapse(app),
+
+        // Connect to selected session
+        KeyCode::Enter => {
+            if let Some((group_idx, session_idx)) = app.selected_session {
+                // Encode as a single index for the connect_request
+                // group_idx * 10000 + session_idx (assuming < 10000 sessions per group)
+                let encoded = group_idx * 10000 + session_idx;
+                app.connect_request = Some(encoded);
+            }
+        }
+
+        // Search
+        KeyCode::Char('/') => {
+            app.search_active = true;
+        }
+
+        // Help
+        KeyCode::Char('?') => {
+            app.help_scroll = 0;
+            app.help_source = Some(Screen::List);
+            app.screen = Screen::Help;
+        }
+
+        _ => {}
+    }
+}
+
+/// Move session selection by delta (positive = down, negative = up).
+/// Skips group headers and respects collapsed groups.
+fn move_session_selection(app: &mut App, delta: isize) {
+    let sessions = visible_sessions(app);
+    if sessions.is_empty() {
+        return;
+    }
+
+    // Find current position in visible sessions list
+    let current_pos = match app.selected_session {
+        Some((g, s)) => sessions
+            .iter()
+            .position(|&(sg, ss)| sg == g && ss == s)
+            .unwrap_or(0),
+        None => 0,
+    };
+
+    let max = sessions.len() - 1;
+    let new_pos = current_pos as isize + delta;
+    let new_pos = new_pos.clamp(0, max as isize) as usize;
+
+    if let Some(&(g, s)) = sessions.get(new_pos) {
+        app.selected_session = Some((g, s));
+    }
+}
+
+/// Move to the first visible session.
+fn move_session_to_first(app: &mut App) {
+    if let Some(&(g, s)) = visible_sessions(app).first() {
+        app.selected_session = Some((g, s));
+    }
+}
+
+/// Move to the last visible session.
+fn move_session_to_last(app: &mut App) {
+    if let Some(&(g, s)) = visible_sessions(app).last() {
+        app.selected_session = Some((g, s));
+    }
+}
+
+/// Get the list of visible (non-collapsed) sessions as (group_idx, session_idx) pairs.
+fn visible_sessions(app: &App) -> Vec<(usize, usize)> {
+    let mut result = Vec::new();
+    for (group_idx, group) in app.config.groups.iter().enumerate() {
+        if app.collapsed_groups.contains(&group_idx) {
+            continue;
+        }
+        for session_idx in 0..group.sessions.len() {
+            result.push((group_idx, session_idx));
+        }
+    }
+    result
+}
+
+/// Toggle collapse/expand for the group containing the currently selected session.
+fn toggle_group_collapse(app: &mut App) {
+    if let Some((group_idx, _)) = app.selected_session {
+        if app.collapsed_groups.contains(&group_idx) {
+            app.collapsed_groups.remove(&group_idx);
+        } else {
+            app.collapsed_groups.insert(group_idx);
+        }
     }
 }
 
@@ -1171,7 +1305,7 @@ fn jump_to_end(app: &mut App) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::model::{Bookmark, Settings};
+    use crate::config::model::{Bookmark, BookmarkGroup, Session, Settings};
 
     fn sample_bookmark(name: &str, env: &str) -> Bookmark {
         Bookmark {
@@ -1576,5 +1710,239 @@ mod tests {
         let esc = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
         handle_key_event(&mut app, esc);
         assert_eq!(app.screen, Screen::DeleteConfirm(9999));
+    }
+
+    // --- Session navigation tests (Task 003) ---
+
+    fn sample_group() -> BookmarkGroup {
+        BookmarkGroup {
+            name: "prod-servers".into(),
+            host: "10.0.1.5".into(),
+            user: Some("deploy".into()),
+            port: 22,
+            env: "production".into(),
+            tags: vec![],
+            identity_file: None,
+            proxy_jump: None,
+            notes: None,
+            profile: None,
+            connect_timeout_secs: None,
+            ssh_options: std::collections::BTreeMap::new(),
+            on_connect: None,
+            on_connect_prompt_pattern: None,
+            snippets: vec![],
+            sessions: vec![
+                Session {
+                    name: "project-a".into(),
+                    ..Session::default()
+                },
+                Session {
+                    name: "project-b".into(),
+                    ..Session::default()
+                },
+                Session {
+                    name: "project-c".into(),
+                    ..Session::default()
+                },
+            ],
+        }
+    }
+
+    fn sample_group2() -> BookmarkGroup {
+        BookmarkGroup {
+            name: "staging-servers".into(),
+            host: "10.0.2.5".into(),
+            user: Some("deploy".into()),
+            port: 22,
+            env: "staging".into(),
+            tags: vec![],
+            identity_file: None,
+            proxy_jump: None,
+            notes: None,
+            profile: None,
+            connect_timeout_secs: None,
+            ssh_options: std::collections::BTreeMap::new(),
+            on_connect: None,
+            on_connect_prompt_pattern: None,
+            snippets: vec![],
+            sessions: vec![
+                Session {
+                    name: "frontend".into(),
+                    ..Session::default()
+                },
+                Session {
+                    name: "backend".into(),
+                    ..Session::default()
+                },
+            ],
+        }
+    }
+
+    fn app_with_groups(groups: Vec<BookmarkGroup>) -> App {
+        let config = AppConfig {
+            settings: Settings::default(),
+            profiles: vec![],
+            bookmarks: vec![],
+            groups,
+        };
+        App::new(config)
+    }
+
+    #[test]
+    fn test_app_selects_first_session_on_init() {
+        let app = app_with_groups(vec![sample_group()]);
+        assert_eq!(app.selected_session, Some((0, 0)));
+    }
+
+    #[test]
+    fn test_app_no_selected_session_when_no_groups() {
+        let app = sample_app();
+        assert!(app.selected_session.is_none());
+    }
+
+    #[test]
+    fn test_move_session_selection_down() {
+        let mut app = app_with_groups(vec![sample_group()]);
+        // Start at (0, 0)
+        assert_eq!(app.selected_session, Some((0, 0)));
+
+        // Move down
+        let down = KeyEvent::new(KeyCode::Down, KeyModifiers::NONE);
+        handle_key_event(&mut app, down);
+        assert_eq!(app.selected_session, Some((0, 1)));
+
+        // Move down again
+        let down = KeyEvent::new(KeyCode::Down, KeyModifiers::NONE);
+        handle_key_event(&mut app, down);
+        assert_eq!(app.selected_session, Some((0, 2)));
+
+        // At the end — should stay
+        let down = KeyEvent::new(KeyCode::Down, KeyModifiers::NONE);
+        handle_key_event(&mut app, down);
+        assert_eq!(app.selected_session, Some((0, 2)));
+    }
+
+    #[test]
+    fn test_move_session_selection_up() {
+        let mut app = app_with_groups(vec![sample_group()]);
+        // Start at (0, 0) — already at top
+        let up = KeyEvent::new(KeyCode::Up, KeyModifiers::NONE);
+        handle_key_event(&mut app, up);
+        assert_eq!(app.selected_session, Some((0, 0)));
+
+        // Move to (0, 2) first
+        app.selected_session = Some((0, 2));
+        let up = KeyEvent::new(KeyCode::Up, KeyModifiers::NONE);
+        handle_key_event(&mut app, up);
+        assert_eq!(app.selected_session, Some((0, 1)));
+
+        let up = KeyEvent::new(KeyCode::Up, KeyModifiers::NONE);
+        handle_key_event(&mut app, up);
+        assert_eq!(app.selected_session, Some((0, 0)));
+    }
+
+    #[test]
+    fn test_move_session_across_groups() {
+        let mut app = app_with_groups(vec![sample_group(), sample_group2()]);
+        // Start at (0, 0) — first session in first group
+        assert_eq!(app.selected_session, Some((0, 0)));
+
+        // Navigate down: (0,0) -> (0,1) -> (0,2) -> (1,0)
+        for _ in 0..3 {
+            let down = KeyEvent::new(KeyCode::Down, KeyModifiers::NONE);
+            handle_key_event(&mut app, down);
+        }
+        assert_eq!(app.selected_session, Some((1, 0)));
+
+        // One more down: (1,0) -> (1,1)
+        let down = KeyEvent::new(KeyCode::Down, KeyModifiers::NONE);
+        handle_key_event(&mut app, down);
+        assert_eq!(app.selected_session, Some((1, 1)));
+    }
+
+    #[test]
+    fn test_toggle_group_collapse() {
+        let mut app = app_with_groups(vec![sample_group()]);
+        assert_eq!(app.selected_session, Some((0, 0)));
+        assert!(app.collapsed_groups.is_empty());
+
+        // Press space to toggle collapse
+        let space = KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE);
+        handle_key_event(&mut app, space);
+        assert!(app.collapsed_groups.contains(&0));
+
+        // Press space again to expand
+        let space = KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE);
+        handle_key_event(&mut app, space);
+        assert!(!app.collapsed_groups.contains(&0));
+    }
+
+    #[test]
+    fn test_navigation_skips_collapsed_group_sessions() {
+        let mut app = app_with_groups(vec![sample_group(), sample_group2()]);
+        // Collapse group 0
+        app.collapsed_groups.insert(0);
+        // Select first session of group 0 (even though it's collapsed)
+        app.selected_session = Some((0, 0));
+
+        // Move down — (0,0) is not visible, so current_pos falls to 0
+        // which is (1,0). Then down moves to (1,1).
+        let down = KeyEvent::new(KeyCode::Down, KeyModifiers::NONE);
+        handle_key_event(&mut app, down);
+        // Since (0,0) is not in visible list, position defaults to 0 = (1,0)
+        // Then +1 delta goes to (1,1)
+        assert_eq!(app.selected_session, Some((1, 1)));
+    }
+
+    #[test]
+    fn test_enter_triggers_connect_request() {
+        let mut app = app_with_groups(vec![sample_group()]);
+        assert_eq!(app.selected_session, Some((0, 0)));
+
+        let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+        handle_key_event(&mut app, enter);
+        // connect_request is encoded as group_idx * 10000 + session_idx
+        assert_eq!(app.connect_request, Some(0));
+    }
+
+    #[test]
+    fn test_home_moves_to_first_session() {
+        let mut app = app_with_groups(vec![sample_group(), sample_group2()]);
+        // Move to last session
+        app.selected_session = Some((1, 1));
+
+        let g = KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE);
+        handle_key_event(&mut app, g);
+        assert_eq!(app.selected_session, Some((0, 0)));
+    }
+
+    #[test]
+    fn test_end_moves_to_last_session() {
+        let mut app = app_with_groups(vec![sample_group(), sample_group2()]);
+        app.selected_session = Some((0, 0));
+
+        let end = KeyEvent::new(KeyCode::End, KeyModifiers::NONE);
+        handle_key_event(&mut app, end);
+        assert_eq!(app.selected_session, Some((1, 1)));
+    }
+
+    #[test]
+    fn test_visible_sessions_excludes_collapsed() {
+        let mut app = app_with_groups(vec![sample_group(), sample_group2()]);
+        // 3 sessions in group 0 + 2 in group 1 = 5 total
+        let visible = visible_sessions(&app);
+        assert_eq!(visible.len(), 5);
+
+        // Collapse group 0
+        app.collapsed_groups.insert(0);
+        let visible = visible_sessions(&app);
+        assert_eq!(visible.len(), 2); // Only group 1's sessions
+    }
+
+    #[test]
+    fn test_empty_groups_no_crash() {
+        let app = app_with_groups(vec![]);
+        assert!(app.selected_session.is_none());
+        // Should not crash
     }
 }

@@ -454,12 +454,14 @@ pub fn export_bookmarks(
             settings: config.settings.clone(),
             bookmarks: export_bookmarks,
             profiles: config.profiles.clone(),
+            groups: vec![],
         }
     } else {
         AppConfig {
             settings: Settings::default(),
             bookmarks: export_bookmarks,
             profiles: Vec::new(),
+            groups: vec![],
         }
     };
 
@@ -599,6 +601,7 @@ mod tests {
         AppConfig {
             settings: Settings::default(),
             profiles: Vec::new(),
+            groups: vec![],
             bookmarks: vec![
                 sample_bookmark("prod-web-01", "production", vec!["web".into()]),
                 sample_bookmark("prod-db-01", "production", vec!["db".into()]),
@@ -701,6 +704,7 @@ mod tests {
         let config = AppConfig {
             settings: Settings::default(),
             profiles: Vec::new(),
+            groups: vec![],
             bookmarks: vec![sample_bookmark("prod-web-01", "production", vec![])],
         };
         let toml_str = toml::to_string_pretty(&config).unwrap();

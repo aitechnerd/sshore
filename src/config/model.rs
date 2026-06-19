@@ -64,6 +64,261 @@ pub struct Profile {
     pub connect_timeout_secs: Option<u64>,
 }
 
+/// A group of SSH sessions sharing the same server connection.
+///
+/// Sessions inherit all connection settings from their parent Group and can
+/// optionally override individual fields. Groups also inherit from any Profile
+/// referenced by the Group, maintaining the five-layer resolution chain:
+/// Session → Group → Profile → Settings → hardcoded default.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct BookmarkGroup {
+    /// Unique name for this group (e.g. "prod-web-servers").
+    pub name: String,
+
+    /// Hostname or IP address.
+    pub host: String,
+
+    /// SSH username (falls back to profile → settings.default_user → OS user).
+    #[serde(default)]
+    pub user: Option<String>,
+
+    /// SSH port (default 22).
+    #[serde(default = "default_port")]
+    pub port: u16,
+
+    /// Environment tier: "production", "staging", "development", "local", "testing", or custom.
+    #[serde(default)]
+    pub env: String,
+
+    /// Searchable tags.
+    #[serde(default)]
+    pub tags: Vec<String>,
+
+    /// Path to SSH private key file (supports ~ expansion).
+    #[serde(default)]
+    pub identity_file: Option<String>,
+
+    /// ProxyJump host (equivalent to ssh -J).
+    #[serde(default)]
+    pub proxy_jump: Option<String>,
+
+    /// Free-form notes.
+    #[serde(default)]
+    pub notes: Option<String>,
+
+    /// Name of the connection profile to inherit settings from.
+    /// References a `Profile.name` in `AppConfig.profiles`.
+    #[serde(default)]
+    pub profile: Option<String>,
+
+    /// Connection timeout override for this group (seconds).
+    #[serde(default)]
+    pub connect_timeout_secs: Option<u64>,
+
+    /// Additional SSH options as key-value pairs.
+    #[serde(default)]
+    pub ssh_options: BTreeMap<String, String>,
+
+    /// Command to run automatically after SSH session starts (default for sessions).
+    #[serde(default)]
+    pub on_connect: Option<String>,
+
+    /// Regex pattern to detect shell prompt readiness (default for sessions).
+    #[serde(default)]
+    pub on_connect_prompt_pattern: Option<String>,
+
+    /// Named command shortcuts available in all sessions of this group.
+    #[serde(default)]
+    pub snippets: Vec<Snippet>,
+
+    /// Sessions within this group.
+    #[serde(default)]
+    pub sessions: Vec<Session>,
+}
+
+/// A session within a BookmarkGroup, defining a unique on_connect command.
+///
+/// Sessions inherit all connection settings from their parent Group (which in turn
+/// inherits from a Profile). The resolution chain is five layers:
+/// Session → Group → Profile → Settings → hardcoded default.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct Session {
+    /// Unique name within the group (e.g. "project-a").
+    pub name: String,
+
+    /// Command to run automatically after SSH session starts.
+    /// Overrides the group-level on_connect if set.
+    #[serde(default)]
+    pub on_connect: Option<String>,
+
+    /// Regex pattern to detect shell prompt readiness.
+    /// Overrides the group-level pattern if set.
+    #[serde(default)]
+    pub on_connect_prompt_pattern: Option<String>,
+
+    /// Named command shortcuts for this session.
+    #[serde(default)]
+    pub snippets: Vec<Snippet>,
+
+    /// Connection timeout override for this specific session (seconds).
+    #[serde(default)]
+    pub connect_timeout_secs: Option<u64>,
+
+    /// Additional SSH options for this session (merged with group → profile).
+    #[serde(default)]
+    pub ssh_options: BTreeMap<String, String>,
+
+    /// Override the group's SSH username.
+    #[serde(default)]
+    pub user: Option<String>,
+
+    /// Override the group's identity file.
+    #[serde(default)]
+    pub identity_file: Option<String>,
+
+    /// Override the group's proxy jump host.
+    #[serde(default)]
+    pub proxy_jump: Option<String>,
+}
+
+impl BookmarkGroup {
+    /// Look up this group's assigned profile from the profiles list.
+    pub fn resolve_profile<'a>(&self, profiles: &'a [Profile]) -> Option<&'a Profile> {
+        self.profile
+            .as_ref()
+            .and_then(|name| profiles.iter().find(|p| p.name == *name))
+    }
+}
+
+impl Session {
+    /// Resolve the effective username: session → group → profile → settings → OS user.
+    pub fn effective_user(
+        &self,
+        group: &BookmarkGroup,
+        settings: &Settings,
+        profiles: &[Profile],
+    ) -> String {
+        let profile = group.resolve_profile(profiles);
+        self.user
+            .clone()
+            .or_else(|| group.user.clone())
+            .or_else(|| profile.and_then(|p| p.user.clone()))
+            .or_else(|| settings.default_user.clone())
+            .unwrap_or_else(|| whoami::username().to_string())
+    }
+
+    /// Resolve the effective identity file: session → group → profile.
+    pub fn effective_identity_file(
+        &self,
+        group: &BookmarkGroup,
+        profiles: &[Profile],
+    ) -> Option<String> {
+        self.identity_file
+            .clone()
+            .or_else(|| group.identity_file.clone())
+            .or_else(|| {
+                group.resolve_profile(profiles).and_then(|p| p.identity_file.clone())
+            })
+    }
+
+    /// Resolve the effective proxy jump: session → group → profile.
+    pub fn effective_proxy_jump(
+        &self,
+        group: &BookmarkGroup,
+        profiles: &[Profile],
+    ) -> Option<String> {
+        self.proxy_jump
+            .clone()
+            .or_else(|| group.proxy_jump.clone())
+            .or_else(|| {
+                group.resolve_profile(profiles).and_then(|p| p.proxy_jump.clone())
+            })
+    }
+
+    /// Resolve the effective on_connect command: session → group → profile.
+    pub fn effective_on_connect(
+        &self,
+        group: &BookmarkGroup,
+        profiles: &[Profile],
+    ) -> Option<String> {
+        self.on_connect
+            .clone()
+            .or_else(|| group.on_connect.clone())
+            .or_else(|| {
+                group.resolve_profile(profiles).and_then(|p| p.on_connect.clone())
+            })
+    }
+
+    /// Resolve the effective on_connect_prompt_pattern: session → group.
+    pub fn effective_on_connect_prompt_pattern(&self, group: &BookmarkGroup) -> Option<String> {
+        self.on_connect_prompt_pattern
+            .clone()
+            .or_else(|| group.on_connect_prompt_pattern.clone())
+    }
+
+    /// Resolve the effective connection timeout: session → group → profile → settings.
+    pub fn effective_connect_timeout(
+        &self,
+        group: &BookmarkGroup,
+        settings: &Settings,
+        profiles: &[Profile],
+    ) -> Option<u64> {
+        let profile = group.resolve_profile(profiles);
+        self.connect_timeout_secs
+            .or(group.connect_timeout_secs)
+            .or_else(|| profile.and_then(|p| p.connect_timeout_secs))
+            .or(settings.connect_timeout_secs)
+    }
+
+    /// Resolve effective SSH options by merging profile → group → session (session wins).
+    pub fn effective_ssh_options(
+        &self,
+        group: &BookmarkGroup,
+        profiles: &[Profile],
+    ) -> BTreeMap<String, String> {
+        let profile = group.resolve_profile(profiles);
+        let mut merged = profile.map(|p| p.ssh_options.clone()).unwrap_or_default();
+        merged.extend(group.ssh_options.clone());
+        merged.extend(self.ssh_options.clone());
+        merged
+    }
+
+    /// Resolve the effective host (from group only, not overridable by session).
+    pub fn effective_host(&self, group: &BookmarkGroup) -> String {
+        group.host.clone()
+    }
+
+    /// Resolve the effective port (from group only, not overridable by session).
+    pub fn effective_port(&self, group: &BookmarkGroup) -> u16 {
+        group.port
+    }
+
+    /// Resolve the effective env tier (from group only, not overridable by session).
+    pub fn effective_env(&self, group: &BookmarkGroup) -> String {
+        group.env.clone()
+    }
+
+    /// Resolve the effective snippets (session snippets override group snippets by name).
+    pub fn effective_snippets(&self, group: &BookmarkGroup) -> Vec<Snippet> {
+        let mut snippets = group.snippets.clone();
+        // Build a map of session snippet names for override lookup
+        let session_names: std::collections::HashSet<&str> =
+            self.snippets.iter().map(|s| s.name.as_str()).collect();
+        // Remove group snippets that are overridden by session snippets
+        snippets.retain(|s| !session_names.contains(s.name.as_str()));
+        // Append session snippets
+        let mut result = snippets;
+        result.extend(self.snippets.clone());
+        result
+    }
+
+    /// Get the display name for this session in the TUI.
+    /// Returns "group-name / session-name" format.
+    pub fn display_name(&self, group: &BookmarkGroup) -> String {
+        format!("{}/{}", group.name, self.name)
+    }
+}
+
 /// Top-level application configuration.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct AppConfig {
@@ -73,6 +328,8 @@ pub struct AppConfig {
     pub profiles: Vec<Profile>,
     #[serde(default)]
     pub bookmarks: Vec<Bookmark>,
+    #[serde(default)]
+    pub groups: Vec<BookmarkGroup>,
 }
 
 /// Global application settings.
@@ -577,6 +834,7 @@ mod tests {
             },
             profiles: vec![],
             bookmarks: vec![sample_bookmark()],
+            groups: vec![],
         }
     }
 
@@ -1388,5 +1646,564 @@ mod tests {
                 .resolved_effective_identity_file(&profiles)
                 .is_none()
         );
+    }
+
+    // --- BookmarkGroup and Session tests (Task 001) ---
+
+    fn sample_group() -> BookmarkGroup {
+        BookmarkGroup {
+            name: "prod-servers".into(),
+            host: "10.0.1.5".into(),
+            user: Some("deploy".into()),
+            port: 22,
+            env: "production".into(),
+            tags: vec!["web".into()],
+            identity_file: Some("~/.ssh/id_ed25519".into()),
+            proxy_jump: Some("bastion".into()),
+            notes: Some("Production servers".into()),
+            profile: None,
+            connect_timeout_secs: None,
+            ssh_options: BTreeMap::new(),
+            on_connect: None,
+            on_connect_prompt_pattern: None,
+            snippets: vec![],
+            sessions: vec![],
+        }
+    }
+
+    fn sample_session() -> Session {
+        Session {
+            name: "project-a".into(),
+            on_connect: Some("tmux attach -t project-a".into()),
+            on_connect_prompt_pattern: None,
+            snippets: vec![],
+            connect_timeout_secs: None,
+            ssh_options: BTreeMap::new(),
+            user: None,
+            identity_file: None,
+            proxy_jump: None,
+        }
+    }
+
+    #[test]
+    fn test_group_and_session_serde_roundtrip() {
+        let group = BookmarkGroup {
+            name: "prod-servers".into(),
+            host: "10.0.1.5".into(),
+            user: Some("deploy".into()),
+            port: 22,
+            env: "production".into(),
+            tags: vec!["web".into()],
+            identity_file: Some("~/.ssh/id_ed25519".into()),
+            proxy_jump: Some("bastion".into()),
+            notes: Some("Production servers".into()),
+            profile: Some("corp-bastion".into()),
+            connect_timeout_secs: Some(30),
+            ssh_options: {
+                let mut m = BTreeMap::new();
+                m.insert("ServerAliveInterval".into(), "60".into());
+                m
+            },
+            on_connect: Some("cd /projects".into()),
+            on_connect_prompt_pattern: Some("\\$\\s*$".into()),
+            snippets: vec![Snippet {
+                name: "Tail log".into(),
+                command: "tail -f /var/log/app.log".into(),
+                auto_execute: true,
+            }],
+            sessions: vec![
+                Session {
+                    name: "project-a".into(),
+                    on_connect: Some("tmux attach -t project-a".into()),
+                    ..Session::default()
+                },
+                Session {
+                    name: "project-b".into(),
+                    on_connect: None,
+                    user: Some("admin".into()),
+                    ..Session::default()
+                },
+            ],
+        };
+        let toml_str = toml::to_string_pretty(&group).expect("serialize");
+        let deserialized: BookmarkGroup = toml::from_str(&toml_str).expect("deserialize");
+        assert_eq!(group, deserialized);
+    }
+
+    #[test]
+    fn test_app_config_with_groups_roundtrip() {
+        let config = AppConfig {
+            settings: Settings {
+                default_user: Some("admin".into()),
+                ..Settings::default()
+            },
+            profiles: vec![Profile {
+                name: "corp".into(),
+                identity_file: Some("~/.ssh/corp_key".into()),
+                ..Profile::default()
+            }],
+            bookmarks: vec![sample_bookmark()],
+            groups: vec![sample_group()],
+        };
+        let toml_str = toml::to_string_pretty(&config).expect("serialize");
+        let deserialized: AppConfig = toml::from_str(&toml_str).expect("deserialize");
+        assert_eq!(config, deserialized);
+    }
+
+    #[test]
+    fn test_effective_user_session_overrides_group() {
+        let group = BookmarkGroup {
+            user: Some("deploy".into()),
+            ..sample_group()
+        };
+        let session = Session {
+            user: Some("admin".into()),
+            ..sample_session()
+        };
+        let settings = Settings::default();
+        assert_eq!(
+            session.effective_user(&group, &settings, &[]),
+            "admin"
+        );
+    }
+
+    #[test]
+    fn test_effective_user_from_group() {
+        let group = BookmarkGroup {
+            user: Some("deploy".into()),
+            ..sample_group()
+        };
+        let session = sample_session();
+        let settings = Settings::default();
+        assert_eq!(
+            session.effective_user(&group, &settings, &[]),
+            "deploy"
+        );
+    }
+
+    #[test]
+    fn test_effective_user_full_chain_session_group_profile_settings() {
+        let profiles = vec![Profile {
+            name: "corp".into(),
+            user: Some("deploy".into()),
+            ..Profile::default()
+        }];
+        let group = BookmarkGroup {
+            name: "prod-servers".into(),
+            profile: Some("corp".into()),
+            user: None,
+            ..sample_group()
+        };
+        let session = Session {
+            user: None,
+            ..sample_session()
+        };
+        let settings = Settings {
+            default_user: Some("fallback".into()),
+            ..Settings::default()
+        };
+        // Session(None) -> Group(None) -> Profile("deploy") -> Settings(fallback)
+        assert_eq!(
+            session.effective_user(&group, &settings, &profiles),
+            "deploy"
+        );
+    }
+
+    #[test]
+    fn test_effective_user_chain_to_settings() {
+        let profiles = vec![Profile {
+            name: "corp".into(),
+            user: None,
+            ..Profile::default()
+        }];
+        let group = BookmarkGroup {
+            name: "prod-servers".into(),
+            profile: Some("corp".into()),
+            user: None,
+            ..sample_group()
+        };
+        let session = sample_session();
+        let settings = Settings {
+            default_user: Some("fallback".into()),
+            ..Settings::default()
+        };
+        // Session(None) -> Group(None) -> Profile(None) -> Settings("fallback")
+        assert_eq!(
+            session.effective_user(&group, &settings, &profiles),
+            "fallback"
+        );
+    }
+
+    #[test]
+    fn test_effective_user_chain_to_os_user() {
+        let profiles = vec![Profile {
+            name: "corp".into(),
+            user: None,
+            ..Profile::default()
+        }];
+        let group = BookmarkGroup {
+            name: "prod-servers".into(),
+            profile: Some("corp".into()),
+            user: None,
+            ..sample_group()
+        };
+        let session = sample_session();
+        let settings = Settings::default();
+        // All None -> OS user
+        let result = session.effective_user(&group, &settings, &profiles);
+        assert!(!result.is_empty());
+    }
+
+    #[test]
+    fn test_effective_identity_file_session_overrides_group() {
+        let group = BookmarkGroup {
+            identity_file: Some("~/.ssh/group_key".into()),
+            ..sample_group()
+        };
+        let session = Session {
+            identity_file: Some("~/.ssh/session_key".into()),
+            ..sample_session()
+        };
+        assert_eq!(
+            session.effective_identity_file(&group, &[]),
+            Some("~/.ssh/session_key".into())
+        );
+    }
+
+    #[test]
+    fn test_effective_identity_file_from_group() {
+        let group = BookmarkGroup {
+            identity_file: Some("~/.ssh/group_key".into()),
+            ..sample_group()
+        };
+        let session = sample_session();
+        assert_eq!(
+            session.effective_identity_file(&group, &[]),
+            Some("~/.ssh/group_key".into())
+        );
+    }
+
+    #[test]
+    fn test_effective_identity_file_chain_to_profile() {
+        let profiles = vec![Profile {
+            name: "corp".into(),
+            identity_file: Some("~/.ssh/corp_key".into()),
+            ..Profile::default()
+        }];
+        let group = BookmarkGroup {
+            name: "prod-servers".into(),
+            profile: Some("corp".into()),
+            identity_file: None,
+            ..sample_group()
+        };
+        let session = sample_session();
+        assert_eq!(
+            session.effective_identity_file(&group, &profiles),
+            Some("~/.ssh/corp_key".into())
+        );
+    }
+
+    #[test]
+    fn test_effective_proxy_jump_session_overrides_group() {
+        let group = BookmarkGroup {
+            proxy_jump: Some("bastion".into()),
+            ..sample_group()
+        };
+        let session = Session {
+            proxy_jump: Some("jump".into()),
+            ..sample_session()
+        };
+        assert_eq!(
+            session.effective_proxy_jump(&group, &[]),
+            Some("jump".into())
+        );
+    }
+
+    #[test]
+    fn test_effective_proxy_jump_chain_to_profile() {
+        let profiles = vec![Profile {
+            name: "corp".into(),
+            proxy_jump: Some("bastion.corp.com".into()),
+            ..Profile::default()
+        }];
+        let group = BookmarkGroup {
+            name: "prod-servers".into(),
+            profile: Some("corp".into()),
+            proxy_jump: None,
+            ..sample_group()
+        };
+        let session = sample_session();
+        assert_eq!(
+            session.effective_proxy_jump(&group, &profiles),
+            Some("bastion.corp.com".into())
+        );
+    }
+
+    #[test]
+    fn test_effective_on_connect_session_overrides_group() {
+        let group = BookmarkGroup {
+            on_connect: Some("cd /projects".into()),
+            ..sample_group()
+        };
+        let session = Session {
+            on_connect: Some("tmux attach -t proj".into()),
+            ..sample_session()
+        };
+        assert_eq!(
+            session.effective_on_connect(&group, &[]),
+            Some("tmux attach -t proj".into())
+        );
+    }
+
+    #[test]
+    fn test_effective_on_connect_from_group() {
+        let group = BookmarkGroup {
+            on_connect: Some("cd /projects".into()),
+            ..sample_group()
+        };
+        let session = Session {
+            on_connect: None,
+            ..sample_session()
+        };
+        assert_eq!(
+            session.effective_on_connect(&group, &[]),
+            Some("cd /projects".into())
+        );
+    }
+
+    #[test]
+    fn test_effective_on_connect_chain_to_profile() {
+        let profiles = vec![Profile {
+            name: "corp".into(),
+            on_connect: Some("cd /app".into()),
+            ..Profile::default()
+        }];
+        let group = BookmarkGroup {
+            name: "prod-servers".into(),
+            profile: Some("corp".into()),
+            on_connect: None,
+            ..sample_group()
+        };
+        let session = Session {
+            on_connect: None,
+            ..sample_session()
+        };
+        assert_eq!(
+            session.effective_on_connect(&group, &profiles),
+            Some("cd /app".into())
+        );
+    }
+
+    #[test]
+    fn test_effective_connect_timeout_session_overrides_group() {
+        let group = BookmarkGroup {
+            connect_timeout_secs: Some(30),
+            ..sample_group()
+        };
+        let session = Session {
+            connect_timeout_secs: Some(10),
+            ..sample_session()
+        };
+        let settings = Settings::default();
+        assert_eq!(
+            session.effective_connect_timeout(&group, &settings, &[]),
+            Some(10)
+        );
+    }
+
+    #[test]
+    fn test_effective_connect_timeout_chain_to_settings() {
+        let profiles = vec![Profile {
+            name: "corp".into(),
+            connect_timeout_secs: None,
+            ..Profile::default()
+        }];
+        let group = BookmarkGroup {
+            name: "prod-servers".into(),
+            profile: Some("corp".into()),
+            connect_timeout_secs: None,
+            ..sample_group()
+        };
+        let session = sample_session();
+        let settings = Settings {
+            connect_timeout_secs: Some(45),
+            ..Settings::default()
+        };
+        assert_eq!(
+            session.effective_connect_timeout(&group, &settings, &profiles),
+            Some(45)
+        );
+    }
+
+    #[test]
+    fn test_effective_ssh_options_merge_profile_group_session() {
+        let profiles = vec![Profile {
+            name: "corp".into(),
+            ssh_options: {
+                let mut m = BTreeMap::new();
+                m.insert("ServerAliveInterval".into(), "60".into());
+                m.insert("Compression".into(), "yes".into());
+                m
+            },
+            ..Profile::default()
+        }];
+        let group = BookmarkGroup {
+            name: "prod-servers".into(),
+            profile: Some("corp".into()),
+            ssh_options: {
+                let mut m = BTreeMap::new();
+                m.insert("Compression".into(), "no".into()); // overrides profile
+                m.insert("TCPKeepAlive".into(), "yes".into());
+                m
+            },
+            ..sample_group()
+        };
+        let session = Session {
+            ssh_options: {
+                let mut m = BTreeMap::new();
+                m.insert("TCPKeepAlive".into(), "no".into()); // overrides group
+                m.insert("StrictHostKeyChecking".into(), "no".into());
+                m
+            },
+            ..sample_session()
+        };
+        let merged = session.effective_ssh_options(&group, &profiles);
+        // Profile key (ServerAliveInterval) present
+        assert_eq!(merged.get("ServerAliveInterval").unwrap(), "60");
+        // Session overrides group overrides profile (Compression)
+        assert_eq!(merged.get("Compression").unwrap(), "no");
+        // Session overrides group (TCPKeepAlive)
+        assert_eq!(merged.get("TCPKeepAlive").unwrap(), "no");
+        // Session-only key
+        assert_eq!(
+            merged.get("StrictHostKeyChecking").unwrap(),
+            "no"
+        );
+        assert_eq!(merged.len(), 4);
+    }
+
+    #[test]
+    fn test_effective_host_and_port_from_group() {
+        let group = BookmarkGroup {
+            host: "10.0.1.5".into(),
+            port: 2222,
+            ..sample_group()
+        };
+        let session = sample_session();
+        assert_eq!(session.effective_host(&group), "10.0.1.5");
+        assert_eq!(session.effective_port(&group), 2222);
+    }
+
+    #[test]
+    fn test_effective_env_from_group() {
+        let group = BookmarkGroup {
+            env: "production".into(),
+            ..sample_group()
+        };
+        let session = sample_session();
+        assert_eq!(session.effective_env(&group), "production");
+    }
+
+    #[test]
+    fn test_display_name() {
+        let group = BookmarkGroup {
+            name: "prod-servers".into(),
+            ..sample_group()
+        };
+        let session = Session {
+            name: "project-a".into(),
+            ..sample_session()
+        };
+        assert_eq!(session.display_name(&group), "prod-servers/project-a");
+    }
+
+    #[test]
+    fn test_effective_on_connect_prompt_pattern_session_overrides_group() {
+        let group = BookmarkGroup {
+            on_connect_prompt_pattern: Some("\\$\\s*$".into()),
+            ..sample_group()
+        };
+        let session = Session {
+            on_connect_prompt_pattern: Some("%\\s*$".into()),
+            ..sample_session()
+        };
+        assert_eq!(
+            session.effective_on_connect_prompt_pattern(&group),
+            Some("%\\s*$".into())
+        );
+    }
+
+    #[test]
+    fn test_effective_on_connect_prompt_pattern_from_group() {
+        let group = BookmarkGroup {
+            on_connect_prompt_pattern: Some("\\$\\s*$".into()),
+            ..sample_group()
+        };
+        let session = sample_session();
+        assert_eq!(
+            session.effective_on_connect_prompt_pattern(&group),
+            Some("\\$\\s*$".into())
+        );
+    }
+
+    #[test]
+    fn test_effective_snippets_merge() {
+        let group = BookmarkGroup {
+            snippets: vec![
+                Snippet {
+                    name: "Tail log".into(),
+                    command: "tail -f /var/log/app.log".into(),
+                    auto_execute: true,
+                },
+                Snippet {
+                    name: "Uptime".into(),
+                    command: "uptime".into(),
+                    auto_execute: true,
+                },
+            ],
+            ..sample_group()
+        };
+        let session = Session {
+            snippets: vec![Snippet {
+                name: "Tail log".into(), // overrides group snippet
+                command: "tail -f /var/log/session.log".into(),
+                auto_execute: true,
+            }],
+            ..sample_session()
+        };
+        let effective = session.effective_snippets(&group);
+        // Should have 2 snippets: Uptime (from group) + Tail log (overridden)
+        assert_eq!(effective.len(), 2);
+        let tail = effective.iter().find(|s| s.name == "Tail log").unwrap();
+        assert_eq!(tail.command, "tail -f /var/log/session.log");
+    }
+
+    #[test]
+    fn test_group_resolve_profile() {
+        let profiles = vec![Profile {
+            name: "corp".into(),
+            user: Some("deploy".into()),
+            ..Profile::default()
+        }];
+        let group = BookmarkGroup {
+            profile: Some("corp".into()),
+            ..sample_group()
+        };
+        let resolved = group.resolve_profile(&profiles);
+        assert!(resolved.is_some());
+        assert_eq!(resolved.unwrap().name, "corp");
+    }
+
+    #[test]
+    fn test_group_resolve_profile_dangling() {
+        let profiles = vec![Profile {
+            name: "corp".into(),
+            ..Profile::default()
+        }];
+        let group = BookmarkGroup {
+            profile: Some("nonexistent".into()),
+            ..sample_group()
+        };
+        assert!(group.resolve_profile(&profiles).is_none());
     }
 }

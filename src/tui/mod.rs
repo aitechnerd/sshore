@@ -1206,6 +1206,7 @@ mod tests {
                 sample_bookmark("local-docker", "local"),
                 sample_bookmark("test-runner", "testing"),
             ],
+            groups: vec![],
         };
         App::new(config)
     }

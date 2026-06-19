@@ -35,6 +35,7 @@ fn sample_config() -> AppConfig {
             sample_bookmark("staging-api", "staging"),
             sample_bookmark("dev-local", "development"),
         ],
+        groups: vec![],
     }
 }
 

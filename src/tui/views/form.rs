@@ -727,6 +727,7 @@ mod tests {
             settings: Settings::default(),
             profiles: vec![],
             bookmarks: vec![sample_bookmark()],
+            groups: vec![],
         }
     }
 

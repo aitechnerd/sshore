@@ -77,6 +77,10 @@ fn build_help_sections(
             build_form_sections(&mut lines, theme);
             "Form"
         }
+        Screen::GroupAddForm | Screen::GroupEditForm(_) => {
+            build_group_form_sections(&mut lines, theme);
+            "Group Form"
+        }
         Screen::DeleteConfirm(_) => {
             build_delete_sections(&mut lines, is_production_delete, theme);
             "Delete"
@@ -168,6 +172,38 @@ fn build_form_sections(lines: &mut Vec<Line<'static>>, theme: &ThemeColors) {
 
     section_header(lines, "Actions", theme);
     key_hint(lines, "Enter", "Save bookmark", theme);
+    key_hint(lines, "Esc", "Cancel and return to list", theme);
+    lines.push(Line::from(""));
+
+    section_header(lines, "General", theme);
+    key_hint(lines, "?", "Toggle this help", theme);
+}
+
+/// Sections shown on the group add/edit form screen.
+fn build_group_form_sections(lines: &mut Vec<Line<'static>>, theme: &ThemeColors) {
+    section_header(lines, "Form Navigation", theme);
+    key_hint(lines, "Tab / \u{2193}", "Next field", theme);
+    key_hint(lines, "Shift+Tab / \u{2191}", "Previous field", theme);
+    lines.push(Line::from(""));
+
+    section_header(lines, "Field Editing", theme);
+    key_hint(lines, "Type", "Enter text in focused field", theme);
+    key_hint(
+        lines,
+        "\u{2190} / \u{2192}",
+        "Cycle environment / profile",
+        theme,
+    );
+    key_hint(lines, "Backspace", "Delete last character", theme);
+    lines.push(Line::from(""));
+
+    section_header(lines, "Session Management", theme);
+    key_hint(lines, "Ctrl+Enter", "Add new session line", theme);
+    key_hint(lines, "-", "Remove current session line", theme);
+    lines.push(Line::from(""));
+
+    section_header(lines, "Actions", theme);
+    key_hint(lines, "Enter", "Save group", theme);
     key_hint(lines, "Esc", "Cancel and return to list", theme);
     lines.push(Line::from(""));
 

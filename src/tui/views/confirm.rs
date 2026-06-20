@@ -4,18 +4,21 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 
-use crate::config::model::{Bookmark, Settings};
+use crate::config::model::{Bookmark, BookmarkGroup, Settings};
 use crate::tui::theme;
 use crate::tui::theme::ThemeColors;
 use crate::tui::widgets::env_badge;
 
+/// What is being deleted in the confirmation dialog.
+pub enum ConfirmTarget {
+    Bookmark { name: String, host: String, env: String },
+    Group { name: String, host: String, env: String, session_count: usize },
+}
+
 /// State for the delete confirmation dialog.
 pub struct ConfirmState {
-    /// The bookmark being deleted.
-    pub bookmark_name: String,
-    pub bookmark_host: String,
-    pub bookmark_env: String,
-    /// Whether this is a production bookmark (requires typing "yes").
+    pub target: ConfirmTarget,
+    /// Whether this is a production item (requires typing "yes").
     pub is_production: bool,
     /// User's typed confirmation input (only used for production).
     pub input: String,
@@ -26,9 +29,26 @@ impl ConfirmState {
     pub fn new(bookmark: &Bookmark) -> Self {
         let is_production = bookmark.env == "production";
         Self {
-            bookmark_name: bookmark.name.clone(),
-            bookmark_host: bookmark.host.clone(),
-            bookmark_env: bookmark.env.clone(),
+            target: ConfirmTarget::Bookmark {
+                name: bookmark.name.clone(),
+                host: bookmark.host.clone(),
+                env: bookmark.env.clone(),
+            },
+            is_production,
+            input: String::new(),
+        }
+    }
+
+    /// Create a new confirmation state for the given group.
+    pub fn new_group(group: &BookmarkGroup) -> Self {
+        let is_production = group.env == "production";
+        Self {
+            target: ConfirmTarget::Group {
+                name: group.name.clone(),
+                host: group.host.clone(),
+                env: group.env.clone(),
+                session_count: group.sessions.len(),
+            },
             is_production,
             input: String::new(),
         }
@@ -65,11 +85,23 @@ pub fn render_confirm(
     let popup = centered_rect(55, 40, area);
     frame.render_widget(Clear, popup);
 
-    let (border_color, title) = if state.is_production {
-        let (_, bg) = theme::env_style("production", settings);
-        (bg, " \u{26a0}\u{fe0f}  Delete PRODUCTION Bookmark ")
-    } else {
-        (tc.warning, " Delete Bookmark ")
+    let (border_color, title, item_type) = match &state.target {
+        ConfirmTarget::Bookmark { .. } => {
+            if state.is_production {
+                let (_, bg) = theme::env_style("production", settings);
+                (bg, " \u{26a0}\u{fe0f}  Delete PRODUCTION Bookmark ", "bookmark")
+            } else {
+                (tc.warning, " Delete Bookmark ", "bookmark")
+            }
+        }
+        ConfirmTarget::Group { .. } => {
+            if state.is_production {
+                let (_, bg) = theme::env_style("production", settings);
+                (bg, " \u{26a0}\u{fe0f}  Delete PRODUCTION Group ", "group")
+            } else {
+                (tc.warning, " Delete Group ", "group")
+            }
+        }
     };
 
     let block = Block::default()
@@ -85,44 +117,59 @@ pub fn render_confirm(
     let mut lines: Vec<Line> = Vec::new();
     lines.push(Line::from(""));
 
+    // Extract common fields from target
+    let (name, host, env) = match &state.target {
+        ConfirmTarget::Bookmark { name, host, env } => (name, host, env),
+        ConfirmTarget::Group { name, host, env, .. } => (name, host, env),
+    };
+
     if state.is_production {
         lines.push(Line::from(Span::styled(
-            "  You are about to delete a PRODUCTION server:",
+            format!("  You are about to delete a PRODUCTION {}:", item_type),
             Style::default().fg(tc.error).add_modifier(Modifier::BOLD),
         )));
         lines.push(Line::from(""));
 
-        let badge_span = env_badge::env_badge_span(&state.bookmark_env, settings);
+        let badge_span = env_badge::env_badge_span(env, settings);
         lines.push(Line::from(vec![
             Span::raw("  "),
             badge_span,
             Span::raw("  "),
             Span::styled(
-                state.bookmark_name.clone(),
+                name.clone(),
                 Style::default().fg(tc.fg).add_modifier(Modifier::BOLD),
             ),
         ]));
     } else {
-        let badge_span = env_badge::env_badge_span(&state.bookmark_env, settings);
+        let _badge_span = env_badge::env_badge_span(env, settings);
+        let type_label = item_type.to_uppercase();
         lines.push(Line::from(vec![
-            Span::styled("  Delete \"", Style::default().fg(tc.fg)),
+            Span::styled(format!("  Delete \""), Style::default().fg(tc.fg)),
             Span::styled(
-                state.bookmark_name.clone(),
+                name.clone(),
                 Style::default().fg(tc.fg).add_modifier(Modifier::BOLD),
             ),
-            Span::styled("\" (", Style::default().fg(tc.fg)),
-            badge_span,
-            Span::styled(")?", Style::default().fg(tc.fg)),
+            Span::styled(format!("\" ({})?", type_label), Style::default().fg(tc.fg)),
         ]));
     }
 
     lines.push(Line::from(vec![
         Span::styled("  Host: ", Style::default().fg(tc.fg)),
         Span::styled(
-            state.bookmark_host.clone(),
+            host.clone(),
             Style::default().fg(tc.fg_muted),
         ),
     ]));
+
+    // Show session count for groups
+    if let ConfirmTarget::Group { session_count, .. } = &state.target {
+        if *session_count > 0 {
+            lines.push(Line::from(vec![
+                Span::styled(format!("  Sessions: {}", session_count), Style::default().fg(tc.fg_muted)),
+            ]));
+        }
+    }
+
     lines.push(Line::from(""));
 
     if state.is_production {

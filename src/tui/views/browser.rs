@@ -3981,8 +3981,20 @@ async fn run_file_transfer(
 
             // Mark transfer start once before the loop (not per-chunk).
             progress.mark_transfer_start();
+            // Batch active file updates: accumulate locally (atomic, no contention)
+            // and flush every ~1MB to avoid per-chunk mutex locks.
+            let active_acc = std::sync::atomic::AtomicU64::new(0);
+            const ACTIVE_FLUSH_THRESHOLD: u64 = 1_048_576;
             let mut on_bytes = |bytes: u64| {
                 progress.bytes_done_all.fetch_add(bytes, Ordering::Relaxed);
+                let acc = active_acc.fetch_add(bytes, Ordering::Relaxed);
+                if acc + bytes >= ACTIVE_FLUSH_THRESHOLD {
+                    let flush = active_acc.swap(0, Ordering::Relaxed);
+                    let mut active = progress.active_files.lock().unwrap();
+                    if let Some(Some(af)) = active.get_mut(worker_id) {
+                        af.bytes_done += flush;
+                    }
+                }
             };
             let transfer = pipeline::upload_from_handle(
                 raw,
@@ -4050,8 +4062,20 @@ async fn run_file_transfer(
 
             // Mark transfer start once before the loop (not per-chunk).
             progress.mark_transfer_start();
+            // Batch active file updates: accumulate locally (atomic, no contention)
+            // and flush every ~1MB to avoid per-chunk mutex locks.
+            let active_acc = std::sync::atomic::AtomicU64::new(0);
+            const ACTIVE_FLUSH_THRESHOLD: u64 = 1_048_576;
             let mut on_bytes = |bytes: u64| {
                 progress.bytes_done_all.fetch_add(bytes, Ordering::Relaxed);
+                let acc = active_acc.fetch_add(bytes, Ordering::Relaxed);
+                if acc + bytes >= ACTIVE_FLUSH_THRESHOLD {
+                    let flush = active_acc.swap(0, Ordering::Relaxed);
+                    let mut active = progress.active_files.lock().unwrap();
+                    if let Some(Some(af)) = active.get_mut(worker_id) {
+                        af.bytes_done += flush;
+                    }
+                }
             };
             let result: Result<()> = {
                 let transfer = pipeline::download_from_handle(

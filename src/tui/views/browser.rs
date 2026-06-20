@@ -3979,8 +3979,9 @@ async fn run_file_transfer(
             let mut local_file =
                 std::io::BufReader::with_capacity((pipeline::CHUNK_SIZE * 2) as usize, local_file);
 
+            // Mark transfer start once before the loop (not per-chunk).
+            progress.mark_transfer_start();
             let mut on_bytes = |bytes: u64| {
-                progress.mark_transfer_start();
                 progress.bytes_done_all.fetch_add(bytes, Ordering::Relaxed);
             };
             let transfer = pipeline::upload_from_handle(
@@ -4047,8 +4048,9 @@ async fn run_file_transfer(
             let mut local_file =
                 std::io::BufWriter::with_capacity((pipeline::CHUNK_SIZE * 2) as usize, local_file);
 
+            // Mark transfer start once before the loop (not per-chunk).
+            progress.mark_transfer_start();
             let mut on_bytes = |bytes: u64| {
-                progress.mark_transfer_start();
                 progress.bytes_done_all.fetch_add(bytes, Ordering::Relaxed);
             };
             let result: Result<()> = {

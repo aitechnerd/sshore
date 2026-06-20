@@ -29,6 +29,7 @@ use crate::config::writer::atomic_write;
 /// `SSHORE_CONFIG_DIR` environment variable.
 ///
 /// - `SSHORE_CONFIG_DIR` env var: uses that path directly
+/// - Running from `target/` directory: uses `sshore-dev/` (auto-detected dev mode)
 /// - Debug (dev):  `~/.config/sshore-dev/` (Linux) / `~/Library/Application Support/sshore-dev/` (macOS)
 /// - Release:      `~/.config/sshore/` (Linux) / `~/Library/Application Support/sshore/` (macOS)
 /// - Windows:      `%APPDATA%/sshore-dev/` (debug) / `%APPDATA%/sshore/` (release)
@@ -37,8 +38,14 @@ pub fn config_dir() -> PathBuf {
     if let Ok(dir) = std::env::var("SSHORE_CONFIG_DIR") {
         return PathBuf::from(shellexpand::tilde(&dir).to_string());
     }
+    // Auto-detect dev mode: if running from target/, use dev config
+    let is_dev = cfg!(debug_assertions)
+        || std::env::current_exe()
+            .map(|exe| exe.to_string_lossy().contains("/target/"))
+            .unwrap_or(false);
     let base = dirs::config_dir().unwrap_or_else(|| PathBuf::from(".config"));
-    let dir_name = if cfg!(debug_assertions) {
+    // Use a separate directory for dev builds to protect production data
+    let dir_name = if is_dev {
         "sshore-dev"
     } else {
         "sshore"

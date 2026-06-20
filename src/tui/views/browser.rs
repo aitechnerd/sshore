@@ -236,6 +236,7 @@ struct OverwriteQuery {
 }
 
 /// A single file or directory to transfer in a background copy job.
+#[derive(Clone)]
 struct TransferTarget {
     src_path: String,
     dst_path: String,
@@ -3881,8 +3882,22 @@ async fn run_background_transfer(
             if feed_cancel.load(Ordering::Relaxed) {
                 break;
             }
-            if tx.send(target).await.is_err() {
-                break;
+            // Use timeout on send to avoid blocking forever when workers stop
+            // receiving (session died, channel full). Clone before send so we
+            // can retry on timeout.
+            let current = target;
+            loop {
+                if feed_cancel.load(Ordering::Relaxed) {
+                    break;
+                }
+                let to_send = current.clone();
+                match tokio::time::timeout(Duration::from_secs(5), tx.send(to_send)).await {
+                    Ok(Ok(())) => break, // sent successfully
+                    Ok(Err(_)) => break, // channel closed
+                    Err(_) => {
+                        // Timeout — will retry with cloned target
+                    }
+                }
             }
         }
         drop(tx); // Close channel so workers exit when done

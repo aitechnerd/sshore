@@ -892,8 +892,214 @@ pub fn render_form(
             render_bookmark_form(frame, area, f, false, settings, tc);
         }
         FormState::GroupAdd(f) | FormState::GroupEdit(_, f) => {
-            render_bookmark_form(frame, area, f, true, settings, tc);
+            render_group_form(frame, area, f, settings, tc);
         }
+    }
+}
+
+/// Render a group form with fields + session lines section.
+fn render_group_form(
+    frame: &mut Frame,
+    area: Rect,
+    form: &GroupForm,
+    settings: &Settings,
+    tc: &ThemeColors,
+) {
+    let popup = centered_rect(70, 90, area);
+    frame.render_widget(Clear, popup);
+
+    let title = if form.is_edit {
+        " Edit Group "
+    } else {
+        " Add Group "
+    };
+
+    let block = Block::default()
+        .title(title)
+        .title_alignment(Alignment::Center)
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(tc.border))
+        .style(Style::default().bg(tc.surface));
+
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
+
+    // Layout: fields (skip password for groups) + sessions header + session lines + error + spacer + hints
+    // Fields: 11 fields (skip password) * 2 lines = 22 lines
+    // Sessions header: 1 line
+    // Session lines: N * 2 lines (name + on_connect per session)
+    // Error: 1 line (if any)
+    // Spacer: Min(0)
+    // Hints: 1 line
+    let visible_fields = 11; // All except password
+    let session_line_count = form.sessions.len();
+
+    let mut constraints: Vec<Constraint> = Vec::with_capacity(visible_fields + 1 + session_line_count * 2 + 3);
+    // Fields
+    for _ in 0..visible_fields {
+        constraints.push(Constraint::Length(2));
+    }
+    // Sessions header
+    constraints.push(Constraint::Length(1));
+    // Session lines
+    for _ in 0..session_line_count {
+        constraints.push(Constraint::Length(2));
+    }
+    // Error
+    if form.error.is_some() {
+        constraints.push(Constraint::Length(1));
+    }
+    constraints.push(Constraint::Min(0));
+    constraints.push(Constraint::Length(1));
+
+    let chunks = Layout::vertical(constraints).split(inner);
+
+    // Field labels (skip password)
+    let field_labels = [
+        ("Name", FIELD_NAME),
+        ("Host", FIELD_HOST),
+        ("User", FIELD_USER),
+        ("Port", FIELD_PORT),
+        ("Env", FIELD_ENV),
+        ("Tags", FIELD_TAGS),
+        ("Identity File", FIELD_IDENTITY),
+        ("Proxy Jump", FIELD_PROXY),
+        ("Notes", FIELD_NOTES),
+        ("On-Connect", FIELD_ON_CONNECT),
+        ("Profile", FIELD_PROFILE),
+    ];
+
+    let mut chunk_idx = 0;
+    for (label, field_idx) in &field_labels {
+        render_field(frame, chunks[chunk_idx], label, *field_idx, form as &dyn FormFields, true, settings, tc);
+        chunk_idx += 1;
+    }
+
+    // Sessions header: " Sessions (N) "
+    let count = form.sessions.len();
+    let label = if count == 1 {
+        "Session".to_string()
+    } else {
+        "Sessions".to_string()
+    };
+    let line = Line::from(Span::styled(
+        format!(" ── {label} ({count}) ──"),
+        Style::default().fg(tc.accent).add_modifier(Modifier::BOLD),
+    ));
+    frame.render_widget(Paragraph::new(line), chunks[chunk_idx]);
+    chunk_idx += 1;
+
+    // Session lines
+    for (i, session) in form.sessions.iter().enumerate() {
+        let is_current = i == form.session_cursor;
+        let prefix = if is_current { "  > " } else { "    " };
+        let cursor = if is_current { "_" } else { "" };
+
+        let name_style = if is_current {
+            Style::default().fg(tc.accent).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(tc.fg)
+        };
+        let cmd_style = if is_current {
+            Style::default().fg(tc.fg)
+        } else {
+            Style::default().fg(tc.fg_muted)
+        };
+
+        let name_display = if session.name.is_empty() {
+            "(unnamed)".to_string()
+        } else {
+            session.name.clone()
+        };
+
+        let on_connect_display = session.on_connect.as_deref().unwrap_or("(no command)");
+
+        // Name line
+        let name_line = Line::from(vec![
+            Span::raw(format!("{}{}: ", prefix, i + 1)),
+            Span::styled(name_display, name_style),
+            Span::styled(cursor, name_style),
+        ]);
+        frame.render_widget(Paragraph::new(name_line), chunks[chunk_idx]);
+        chunk_idx += 1;
+
+        // Command line
+        let cmd_line = Line::from(vec![
+            Span::raw("     "),
+            Span::styled(format!("cmd: {}", on_connect_display), cmd_style),
+        ]);
+        frame.render_widget(Paragraph::new(cmd_line), chunks[chunk_idx]);
+        chunk_idx += 1;
+    }
+
+    // Error message
+    if let Some(ref err) = form.error {
+        let color = if err.starts_with("Warning:") {
+            tc.warning
+        } else {
+            tc.error
+        };
+        let line = Line::from(Span::styled(format!(" {err}"), Style::default().fg(color)));
+        frame.render_widget(Paragraph::new(line), chunks[chunk_idx]);
+        chunk_idx += 1;
+    }
+
+    // Skip spacer
+    chunk_idx += 1;
+
+    // Hints line (with group-specific hints)
+    let hints = Line::from(vec![
+        Span::styled(
+            " Tab/\u{2193} ",
+            Style::default()
+                .fg(tc.hint_key_fg)
+                .bg(tc.hint_key_bg)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(" Next  ", Style::default().fg(tc.fg_dim)),
+        Span::styled(
+            " S-Tab/\u{2191} ",
+            Style::default()
+                .fg(tc.hint_key_fg)
+                .bg(tc.hint_key_bg)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(" Prev  ", Style::default().fg(tc.fg_dim)),
+        Span::styled(
+            " Enter ",
+            Style::default()
+                .fg(tc.hint_key_fg)
+                .bg(tc.hint_key_bg)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(" Save  ", Style::default().fg(tc.fg_dim)),
+        Span::styled(
+            " Esc ",
+            Style::default()
+                .fg(tc.hint_key_fg)
+                .bg(tc.hint_key_bg)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(" Cancel  ", Style::default().fg(tc.fg_dim)),
+        Span::styled(
+            " Ctrl+Enter ",
+            Style::default()
+                .fg(tc.hint_key_fg)
+                .bg(tc.hint_key_bg)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(" Add Session  ", Style::default().fg(tc.fg_dim)),
+        Span::styled(
+            " - ",
+            Style::default()
+                .fg(tc.hint_key_fg)
+                .bg(tc.hint_key_bg)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(" Remove", Style::default().fg(tc.fg_dim)),
+    ]);
+    if chunk_idx < chunks.len() {
+        frame.render_widget(Paragraph::new(hints), chunks[chunk_idx]);
     }
 }
 
@@ -2019,5 +2225,89 @@ mod tests {
     #[test]
     fn test_proxy_jump_placeholder_constant() {
         assert_eq!(PROXY_JUMP_PLACEHOLDER, "(e.g. admin@bastion)");
+    }
+
+    // ─── Group form rendering tests ───
+
+    #[test]
+    fn test_group_form_empty_session_line_no_panic() {
+        // Verify group form with 1 empty session line doesn't panic
+        let settings = Settings::default();
+        let state = FormState::new_group_add(&settings, &[]);
+        if let FormState::GroupAdd(f) = state {
+            assert_eq!(f.sessions.len(), 1);
+            assert!(f.sessions[0].name.is_empty());
+            assert!(f.sessions[0].on_connect.is_none());
+        } else {
+            panic!("Expected GroupAdd variant");
+        }
+    }
+
+    #[test]
+    fn test_group_form_session_count_display() {
+        let settings = Settings::default();
+        let mut state = FormState::new_group_add(&settings, &[]);
+
+        // Add sessions
+        state.add_session_line();
+        state.add_session_line();
+
+        if let FormState::GroupAdd(f) = &state {
+            assert_eq!(f.sessions.len(), 3);
+            // Session count shown as "Sessions (3)"
+            let count = f.sessions.len();
+            let label = if count == 1 { "Session" } else { "Sessions" };
+            assert_eq!(label, "Sessions");
+        } else {
+            panic!("Expected GroupAdd variant");
+        }
+    }
+
+    #[test]
+    fn test_group_form_session_highlighting() {
+        let settings = Settings::default();
+        let mut state = FormState::new_group_add(&settings, &[]);
+
+        if let FormState::GroupAdd(f) = &mut state {
+            f.sessions[0].name = "session-a".into();
+            f.add_session_line();
+            f.sessions[1].name = "session-b".into();
+        }
+
+        if let FormState::GroupAdd(f) = &state {
+            // session_cursor should be at the new session
+            assert_eq!(f.session_cursor, 1);
+            assert_eq!(f.sessions[0].name, "session-a");
+            assert_eq!(f.sessions[1].name, "session-b");
+        } else {
+            panic!("Expected GroupAdd variant");
+        }
+    }
+
+    #[test]
+    fn test_group_form_single_session_label() {
+        let settings = Settings::default();
+        let state = FormState::new_group_add(&settings, &[]);
+
+        if let FormState::GroupAdd(f) = &state {
+            let count = f.sessions.len();
+            let label = if count == 1 { "Session" } else { "Sessions" };
+            assert_eq!(label, "Session"); // Singular for 1
+        } else {
+            panic!("Expected GroupAdd variant");
+        }
+    }
+
+    #[test]
+    fn test_group_form_unnamed_session_display() {
+        let settings = Settings::default();
+        let state = FormState::new_group_add(&settings, &[]);
+
+        if let FormState::GroupAdd(f) = &state {
+            // Empty name should display as "(unnamed)"
+            assert!(f.sessions[0].name.is_empty());
+        } else {
+            panic!("Expected GroupAdd variant");
+        }
     }
 }

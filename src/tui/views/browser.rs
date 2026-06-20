@@ -25,12 +25,11 @@ use crate::tui::theme::ThemeColors;
 /// User input is detected instantly regardless of this value.
 const POLL_RATE: Duration = Duration::from_secs(1);
 
-/// Fast poll rate when the user is actively watching the transfer progress popup.
-const PROGRESS_POLL_RATE: Duration = Duration::from_millis(100);
+/// Poll rate when the user is watching the transfer progress popup.
+const PROGRESS_POLL_RATE: Duration = Duration::from_millis(500);
 
 /// Slower poll rate when transfers run in the background (user not watching popup).
-/// Redraws ~2x/sec instead of 10x/sec, cutting CPU usage from ~23% to ~5%.
-const BACKGROUND_POLL_RATE: Duration = Duration::from_millis(500);
+const BACKGROUND_POLL_RATE: Duration = Duration::from_millis(1000);
 
 /// Max concurrent SFTP `read_dir` calls during directory scanning.
 /// Higher values hide more network latency but use more SFTP channel capacity.

@@ -3982,10 +3982,6 @@ async fn run_file_transfer(
             let mut on_bytes = |bytes: u64| {
                 progress.mark_transfer_start();
                 progress.bytes_done_all.fetch_add(bytes, Ordering::Relaxed);
-                let mut active = progress.active_files.lock().unwrap();
-                if let Some(Some(af)) = active.get_mut(worker_id) {
-                    af.bytes_done += bytes;
-                }
             };
             let transfer = pipeline::upload_from_handle(
                 raw,
@@ -4054,10 +4050,6 @@ async fn run_file_transfer(
             let mut on_bytes = |bytes: u64| {
                 progress.mark_transfer_start();
                 progress.bytes_done_all.fetch_add(bytes, Ordering::Relaxed);
-                let mut active = progress.active_files.lock().unwrap();
-                if let Some(Some(af)) = active.get_mut(worker_id) {
-                    af.bytes_done += bytes;
-                }
             };
             let result: Result<()> = {
                 let transfer = pipeline::download_from_handle(

@@ -956,7 +956,7 @@ fn handle_list_key(app: &mut App, key: KeyEvent) {
                 let profile_names: Vec<String> =
                     app.config.profiles.iter().map(|p| p.name.clone()).collect();
                 let bookmark = &app.config.bookmarks[idx];
-                app.form_state = Some(FormState::new_edit(bookmark, &profile_names));
+                app.form_state = Some(FormState::new_edit(idx, bookmark, &profile_names));
                 app.screen = Screen::EditForm(idx);
             }
         }
@@ -1110,10 +1110,10 @@ fn handle_form_key(app: &mut App, key: KeyEvent) {
         }
         KeyCode::Tab | KeyCode::Down => form.next_field(),
         KeyCode::BackTab | KeyCode::Up => form.prev_field(),
-        KeyCode::Left if form.focused == FIELD_ENV => form.cycle_env_left(),
-        KeyCode::Right if form.focused == FIELD_ENV => form.cycle_env_right(),
-        KeyCode::Left if form.focused == FIELD_PROFILE => form.cycle_profile_left(),
-        KeyCode::Right if form.focused == FIELD_PROFILE => form.cycle_profile_right(),
+        KeyCode::Left if form.focused() == FIELD_ENV => form.cycle_env_left(),
+        KeyCode::Right if form.focused() == FIELD_ENV => form.cycle_env_right(),
+        KeyCode::Left if form.focused() == FIELD_PROFILE => form.cycle_profile_left(),
+        KeyCode::Right if form.focused() == FIELD_PROFILE => form.cycle_profile_right(),
         KeyCode::Backspace => form.delete_char(),
         KeyCode::Enter => {
             // Attempt to save
@@ -1139,8 +1139,8 @@ fn try_save_form(app: &mut App) {
         Ok(bookmark) => {
             let name = bookmark.name.clone();
             let password_value = form.password().to_string();
-            let password_modified = form.password_modified;
-            let has_stored = form.has_stored_password;
+            let password_modified = form.password_modified();
+            let has_stored = form.has_stored_password();
 
             // Handle keychain rename: if editing and name changed, migrate password
             let old_name = if let Screen::EditForm(idx) = app.screen {
@@ -1548,7 +1548,7 @@ mod tests {
         // form.error should remain None (not used for validation errors anymore)
         let form = app.form_state.as_ref().unwrap();
         assert!(
-            form.error.is_none(),
+            form.error().is_none(),
             "form.error should be None; validation errors go to status bar"
         );
     }
@@ -1571,7 +1571,7 @@ mod tests {
             let profile_names: Vec<String> =
                 app.config.profiles.iter().map(|p| p.name.clone()).collect();
             let bookmark = app.config.bookmarks[idx].clone();
-            app.form_state = Some(FormState::new_edit(&bookmark, &profile_names));
+            app.form_state = Some(FormState::new_edit(idx, &bookmark, &profile_names));
             app.screen = Screen::EditForm(idx);
             assert!(app.form_state.is_some());
         }

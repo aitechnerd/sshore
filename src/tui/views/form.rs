@@ -6,10 +6,12 @@ use ratatui::layout::{Alignment, Constraint, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph};
+use serde::{Deserialize, Serialize};
 
 use crate::config::env::detect_env;
 use crate::config::model::{
-    AppConfig, Bookmark, Settings, validate_bookmark_name, validate_hostname,
+    AppConfig, Bookmark, BookmarkGroup, Session, Settings, validate_bookmark_name,
+    validate_hostname,
 };
 use crate::keychain;
 use crate::tui::theme::ThemeColors;
@@ -45,8 +47,9 @@ const FIELD_ON_CONNECT: usize = 9;
 const FIELD_PASSWORD: usize = 10;
 pub(crate) const FIELD_PROFILE: usize = 11;
 
-/// Form state for add/edit bookmark.
-pub struct FormState {
+/// Form fields for bookmark add/edit.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BookmarkForm {
     pub fields: [String; FIELD_COUNT],
     pub focused: usize,
     pub env_index: usize,
@@ -65,7 +68,41 @@ pub struct FormState {
     pub password_modified: bool,
 }
 
-impl FormState {
+/// Form fields for group add/edit.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GroupForm {
+    pub fields: [String; FIELD_COUNT],
+    pub focused: usize,
+    pub env_index: usize,
+    pub profile_index: usize,
+    pub profile_options: Vec<String>,
+    pub is_edit: bool,
+    /// Original group name (for edit mode uniqueness check).
+    pub original_name: Option<String>,
+    /// Validation error to display.
+    pub error: Option<String>,
+    /// Session lines for this group.
+    pub sessions: Vec<Session>,
+    /// Current session line being edited.
+    pub session_cursor: usize,
+}
+
+/// Form state enum covering bookmark and group forms.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum FormState {
+    /// Adding a new bookmark.
+    Add(BookmarkForm),
+    /// Editing an existing bookmark at the given index.
+    Edit(usize, BookmarkForm),
+    /// Adding a new group.
+    GroupAdd(GroupForm),
+    /// Editing an existing group at the given index.
+    GroupEdit(usize, GroupForm),
+}
+
+// ─── BookmarkForm impl ───────────────────────────────────────────────
+
+impl BookmarkForm {
     /// Create a blank form for adding a new bookmark.
     pub fn new_add(settings: &Settings, profile_names: &[String]) -> Self {
         let mut fields = std::array::from_fn(|_| String::new());
@@ -325,6 +362,503 @@ impl FormState {
     }
 }
 
+// ─── GroupForm impl ──────────────────────────────────────────────────
+
+impl GroupForm {
+    /// Create a blank form for adding a new group.
+    pub fn new_add(settings: &Settings, profile_names: &[String]) -> Self {
+        let mut fields = std::array::from_fn(|_| String::new());
+        fields[FIELD_PORT] = "22".to_string();
+        if let Some(ref user) = settings.default_user {
+            fields[FIELD_USER] = user.clone();
+        }
+
+        let profile_options = build_profile_options(profile_names);
+
+        Self {
+            fields,
+            focused: FIELD_NAME,
+            env_index: 0,     // (none)
+            profile_index: 0, // (none)
+            profile_options,
+            is_edit: false,
+            original_name: None,
+            error: None,
+            sessions: vec![Session::default()], // Start with one empty session
+            session_cursor: 0,
+        }
+    }
+
+    /// Create a pre-populated form for editing an existing group.
+    pub fn new_edit(group: &BookmarkGroup, profile_names: &[String]) -> Self {
+        let mut fields = std::array::from_fn(|_| String::new());
+        fields[FIELD_NAME] = group.name.clone();
+        fields[FIELD_HOST] = group.host.clone();
+        fields[FIELD_USER] = group.user.clone().unwrap_or_default();
+        fields[FIELD_PORT] = group.port.to_string();
+        fields[FIELD_TAGS] = group.tags.join(", ");
+        fields[FIELD_IDENTITY] = group.identity_file.clone().unwrap_or_default();
+        fields[FIELD_PROXY] = group.proxy_jump.clone().unwrap_or_default();
+        fields[FIELD_NOTES] = group.notes.clone().unwrap_or_default();
+        // on_connect field holds the group-level default on_connect
+        fields[FIELD_ON_CONNECT] = group.on_connect.clone().unwrap_or_default();
+
+        let env_index = ENV_OPTIONS
+            .iter()
+            .position(|&e| e == group.env)
+            .unwrap_or(0);
+
+        let profile_options = build_profile_options(profile_names);
+
+        let profile_index = group
+            .profile
+            .as_ref()
+            .and_then(|p| profile_options.iter().position(|opt| opt == p))
+            .unwrap_or(0);
+
+        let sessions = if group.sessions.is_empty() {
+            vec![Session::default()]
+        } else {
+            group.sessions.clone()
+        };
+
+        Self {
+            fields,
+            focused: FIELD_NAME,
+            env_index,
+            profile_index,
+            profile_options,
+            is_edit: true,
+            original_name: Some(group.name.clone()),
+            error: None,
+            sessions,
+            session_cursor: 0,
+        }
+    }
+
+    /// Move focus to the next field.
+    pub fn next_field(&mut self) {
+        if self.focused < FIELD_COUNT - 1 {
+            self.focused += 1;
+        }
+    }
+
+    /// Move focus to the previous field.
+    pub fn prev_field(&mut self) {
+        if self.focused > 0 {
+            self.focused -= 1;
+        }
+    }
+
+    /// Cycle environment selection forward.
+    pub fn cycle_env_right(&mut self) {
+        self.env_index = (self.env_index + 1) % ENV_OPTIONS.len();
+    }
+
+    /// Cycle environment selection backward.
+    pub fn cycle_env_left(&mut self) {
+        if self.env_index == 0 {
+            self.env_index = ENV_OPTIONS.len() - 1;
+        } else {
+            self.env_index -= 1;
+        }
+    }
+
+    /// Cycle profile selection forward.
+    pub fn cycle_profile_right(&mut self) {
+        if !self.profile_options.is_empty() {
+            self.profile_index = (self.profile_index + 1) % self.profile_options.len();
+        }
+    }
+
+    /// Cycle profile selection backward.
+    pub fn cycle_profile_left(&mut self) {
+        if !self.profile_options.is_empty() {
+            if self.profile_index == 0 {
+                self.profile_index = self.profile_options.len() - 1;
+            } else {
+                self.profile_index -= 1;
+            }
+        }
+    }
+
+    /// Get the selected profile name, or None if "(none)" is selected.
+    pub fn selected_profile(&self) -> Option<&str> {
+        if self.profile_index == 0 {
+            None
+        } else {
+            Some(&self.profile_options[self.profile_index])
+        }
+    }
+
+    /// Insert a character at the current field (except env and profile, which use cycling).
+    pub fn insert_char(&mut self, c: char) {
+        if self.focused == FIELD_ENV || self.focused == FIELD_PROFILE {
+            return;
+        }
+        self.fields[self.focused].push(c);
+        self.error = None;
+
+        // Auto-detect env when name or host changes
+        if self.focused == FIELD_NAME || self.focused == FIELD_HOST {
+            self.auto_detect_env();
+        }
+    }
+
+    /// Delete last character from the current field.
+    pub fn delete_char(&mut self) {
+        if self.focused == FIELD_ENV || self.focused == FIELD_PROFILE {
+            return;
+        }
+        self.fields[self.focused].pop();
+        self.error = None;
+
+        if self.focused == FIELD_NAME || self.focused == FIELD_HOST {
+            self.auto_detect_env();
+        }
+    }
+
+    /// Auto-detect environment from name and host, updating env_index.
+    fn auto_detect_env(&mut self) {
+        let detected = detect_env(&self.fields[FIELD_NAME], &self.fields[FIELD_HOST]);
+        if let Some(idx) = ENV_OPTIONS.iter().position(|&e| e == detected) {
+            self.env_index = idx;
+        }
+    }
+
+    /// Get the selected environment string.
+    pub fn selected_env(&self) -> &str {
+        ENV_OPTIONS[self.env_index]
+    }
+
+    /// Add a new empty session line after the current cursor position.
+    pub fn add_session_line(&mut self) {
+        let insert_at = self.session_cursor + 1;
+        self.sessions.insert(
+            insert_at.min(self.sessions.len()),
+            Session::default(),
+        );
+        self.session_cursor = insert_at.min(self.sessions.len() - 1);
+    }
+
+    /// Remove the current session line (minimum 1 line enforced).
+    pub fn remove_session_line(&mut self) {
+        if self.sessions.len() > 1 {
+            self.sessions.remove(self.session_cursor);
+            if self.session_cursor >= self.sessions.len() {
+                self.session_cursor = self.sessions.len() - 1;
+            }
+        }
+    }
+
+    /// Validate the form and build a BookmarkGroup. Returns Err with a user-facing message on failure.
+    pub fn validate_and_build(&mut self, config: &AppConfig) -> Result<BookmarkGroup> {
+        self.error = None;
+
+        let name = self.fields[FIELD_NAME].trim().to_string();
+        let host = self.fields[FIELD_HOST].trim().to_string();
+
+        // Validate name
+        validate_bookmark_name(&name)?;
+
+        // Uniqueness check (skip for edit if name unchanged)
+        let is_rename = self
+            .original_name
+            .as_ref()
+            .is_some_and(|orig| orig != &name);
+        if (!self.is_edit || is_rename) && config.groups.iter().any(|g| g.name == name) {
+            anyhow::bail!("A group named '{}' already exists", name);
+        }
+
+        // Validate host
+        validate_hostname(&host)?;
+
+        // Validate port
+        let port: u16 = self.fields[FIELD_PORT]
+            .trim()
+            .parse()
+            .map_err(|_| anyhow::anyhow!("Port must be a number between 1 and 65535"))?;
+        if port == 0 {
+            anyhow::bail!("Port must be between 1 and 65535");
+        }
+
+        // Validate session names are unique within the group
+        let mut session_names = std::collections::HashSet::new();
+        for session in &self.sessions {
+            let session_name = session.name.trim();
+            if session_name.is_empty() {
+                anyhow::bail!("Session name cannot be empty");
+            }
+            if !session_names.insert(session_name) {
+                anyhow::bail!("Duplicate session name '{}'", session_name);
+            }
+        }
+
+        // Parse tags
+        let tags: Vec<String> = self.fields[FIELD_TAGS]
+            .split(',')
+            .map(|t| t.trim().to_string())
+            .filter(|t| !t.is_empty())
+            .collect();
+
+        let user = non_empty_option(&self.fields[FIELD_USER]);
+        let proxy_jump = non_empty_option(&self.fields[FIELD_PROXY]);
+        let notes = non_empty_option(&self.fields[FIELD_NOTES]);
+        let on_connect = non_empty_option(&self.fields[FIELD_ON_CONNECT]);
+        let env = self.selected_env().to_string();
+        let profile = self.selected_profile().map(|s| s.to_string());
+
+        Ok(BookmarkGroup {
+            name,
+            host,
+            user,
+            port,
+            env,
+            tags,
+            identity_file: non_empty_option(&self.fields[FIELD_IDENTITY]),
+            proxy_jump,
+            notes,
+            profile,
+            on_connect,
+            on_connect_prompt_pattern: None,
+            snippets: vec![],
+            connect_timeout_secs: None,
+            ssh_options: std::collections::BTreeMap::new(),
+            sessions: self.sessions.clone(),
+        })
+    }
+}
+
+// ─── FormState enum impl (delegating methods) ────────────────────────
+
+impl FormState {
+    // ── Constructors ──
+
+    /// Create a blank form for adding a new bookmark.
+    pub fn new_add(settings: &Settings, profile_names: &[String]) -> Self {
+        Self::Add(BookmarkForm::new_add(settings, profile_names))
+    }
+
+    /// Create a pre-populated form for editing an existing bookmark.
+    pub fn new_edit(idx: usize, bookmark: &Bookmark, profile_names: &[String]) -> Self {
+        Self::Edit(idx, BookmarkForm::new_edit(bookmark, profile_names))
+    }
+
+    /// Create a blank form for adding a new group.
+    pub fn new_group_add(settings: &Settings, profile_names: &[String]) -> Self {
+        Self::GroupAdd(GroupForm::new_add(settings, profile_names))
+    }
+
+    /// Create a pre-populated form for editing an existing group.
+    pub fn new_group_edit(idx: usize, group: &BookmarkGroup, profile_names: &[String]) -> Self {
+        Self::GroupEdit(idx, GroupForm::new_edit(group, profile_names))
+    }
+
+    // ── Shared navigation (delegated to inner form) ──
+
+    /// Move focus to the next field.
+    pub fn next_field(&mut self) {
+        match self {
+            Self::Add(f) => f.next_field(),
+            Self::Edit(_, f) => f.next_field(),
+            Self::GroupAdd(f) => f.next_field(),
+            Self::GroupEdit(_, f) => f.next_field(),
+        }
+    }
+
+    /// Move focus to the previous field.
+    pub fn prev_field(&mut self) {
+        match self {
+            Self::Add(f) => f.prev_field(),
+            Self::Edit(_, f) => f.prev_field(),
+            Self::GroupAdd(f) => f.prev_field(),
+            Self::GroupEdit(_, f) => f.prev_field(),
+        }
+    }
+
+    /// Get the current focused field index.
+    pub fn focused(&self) -> usize {
+        match self {
+            Self::Add(f) => f.focused,
+            Self::Edit(_, f) => f.focused,
+            Self::GroupAdd(f) => f.focused,
+            Self::GroupEdit(_, f) => f.focused,
+        }
+    }
+
+    /// Cycle environment selection forward.
+    pub fn cycle_env_right(&mut self) {
+        match self {
+            Self::Add(f) => f.cycle_env_right(),
+            Self::Edit(_, f) => f.cycle_env_right(),
+            Self::GroupAdd(f) => f.cycle_env_right(),
+            Self::GroupEdit(_, f) => f.cycle_env_right(),
+        }
+    }
+
+    /// Cycle environment selection backward.
+    pub fn cycle_env_left(&mut self) {
+        match self {
+            Self::Add(f) => f.cycle_env_left(),
+            Self::Edit(_, f) => f.cycle_env_left(),
+            Self::GroupAdd(f) => f.cycle_env_left(),
+            Self::GroupEdit(_, f) => f.cycle_env_left(),
+        }
+    }
+
+    /// Cycle profile selection forward.
+    pub fn cycle_profile_right(&mut self) {
+        match self {
+            Self::Add(f) => f.cycle_profile_right(),
+            Self::Edit(_, f) => f.cycle_profile_right(),
+            Self::GroupAdd(f) => f.cycle_profile_right(),
+            Self::GroupEdit(_, f) => f.cycle_profile_right(),
+        }
+    }
+
+    /// Cycle profile selection backward.
+    pub fn cycle_profile_left(&mut self) {
+        match self {
+            Self::Add(f) => f.cycle_profile_left(),
+            Self::Edit(_, f) => f.cycle_profile_left(),
+            Self::GroupAdd(f) => f.cycle_profile_left(),
+            Self::GroupEdit(_, f) => f.cycle_profile_left(),
+        }
+    }
+
+    /// Insert a character at the current field.
+    pub fn insert_char(&mut self, c: char) {
+        match self {
+            Self::Add(f) => f.insert_char(c),
+            Self::Edit(_, f) => f.insert_char(c),
+            Self::GroupAdd(f) => f.insert_char(c),
+            Self::GroupEdit(_, f) => f.insert_char(c),
+        }
+    }
+
+    /// Delete last character from the current field.
+    pub fn delete_char(&mut self) {
+        match self {
+            Self::Add(f) => f.delete_char(),
+            Self::Edit(_, f) => f.delete_char(),
+            Self::GroupAdd(f) => f.delete_char(),
+            Self::GroupEdit(_, f) => f.delete_char(),
+        }
+    }
+
+    /// Get the selected environment string.
+    pub fn selected_env(&self) -> &str {
+        match self {
+            Self::Add(f) => f.selected_env(),
+            Self::Edit(_, f) => f.selected_env(),
+            Self::GroupAdd(f) => f.selected_env(),
+            Self::GroupEdit(_, f) => f.selected_env(),
+        }
+    }
+
+    /// Get the error message if any.
+    pub fn error(&self) -> Option<&str> {
+        match self {
+            Self::Add(f) => f.error.as_deref(),
+            Self::Edit(_, f) => f.error.as_deref(),
+            Self::GroupAdd(f) => f.error.as_deref(),
+            Self::GroupEdit(_, f) => f.error.as_deref(),
+        }
+    }
+
+    // ── Bookmark-only methods ──
+
+    /// Get the password field value (bookmark forms only).
+    pub fn password(&self) -> &str {
+        match self {
+            Self::Add(f) => f.password(),
+            Self::Edit(_, f) => f.password(),
+            Self::GroupAdd(_) | Self::GroupEdit(_, _) => "",
+        }
+    }
+
+    /// Check if password was modified (bookmark forms only).
+    pub fn password_modified(&self) -> bool {
+        match self {
+            Self::Add(f) => f.password_modified,
+            Self::Edit(_, f) => f.password_modified,
+            Self::GroupAdd(_) | Self::GroupEdit(_, _) => false,
+        }
+    }
+
+    /// Check if there's a stored password (bookmark forms only).
+    pub fn has_stored_password(&self) -> bool {
+        match self {
+            Self::Add(f) => f.has_stored_password,
+            Self::Edit(_, f) => f.has_stored_password,
+            Self::GroupAdd(_) | Self::GroupEdit(_, _) => false,
+        }
+    }
+
+    /// Validate and build a Bookmark (bookmark forms only).
+    pub fn validate_and_build(&mut self, config: &AppConfig) -> Result<Bookmark> {
+        match self {
+            Self::Add(f) => f.validate_and_build(config),
+            Self::Edit(_, f) => f.validate_and_build(config),
+            Self::GroupAdd(_) | Self::GroupEdit(_, _) => {
+                anyhow::bail!("validate_and_build is for bookmark forms, not group forms")
+            }
+        }
+    }
+
+    // ── Group-only methods ──
+
+    /// Add a new session line (group forms only).
+    pub fn add_session_line(&mut self) {
+        match self {
+            Self::GroupAdd(f) => f.add_session_line(),
+            Self::GroupEdit(_, f) => f.add_session_line(),
+            Self::Add(_) | Self::Edit(_, _) => {} // no-op for bookmark forms
+        }
+    }
+
+    /// Remove the current session line (group forms only).
+    pub fn remove_session_line(&mut self) {
+        match self {
+            Self::GroupAdd(f) => f.remove_session_line(),
+            Self::GroupEdit(_, f) => f.remove_session_line(),
+            Self::Add(_) | Self::Edit(_, _) => {} // no-op for bookmark forms
+        }
+    }
+
+    /// Validate and build a BookmarkGroup (group forms only).
+    pub fn validate_and_build_group(&mut self, config: &AppConfig) -> Result<BookmarkGroup> {
+        match self {
+            Self::GroupAdd(f) => f.validate_and_build(config),
+            Self::GroupEdit(_, f) => f.validate_and_build(config),
+            Self::Add(_) | Self::Edit(_, _) => {
+                anyhow::bail!("validate_and_build_group is for group forms, not bookmark forms")
+            }
+        }
+    }
+
+    /// Get the session cursor (group forms only).
+    pub fn session_cursor(&self) -> usize {
+        match self {
+            Self::GroupAdd(f) => f.session_cursor,
+            Self::GroupEdit(_, f) => f.session_cursor,
+            Self::Add(_) | Self::Edit(_, _) => 0,
+        }
+    }
+
+    /// Check if this is a group form.
+    pub fn is_group_form(&self) -> bool {
+        matches!(self, Self::GroupAdd(_) | Self::GroupEdit(_, _))
+    }
+
+    /// Check if this is a bookmark form.
+    pub fn is_bookmark_form(&self) -> bool {
+        matches!(self, Self::Add(_) | Self::Edit(_, _))
+    }
+}
+
+// ─── Helpers ─────────────────────────────────────────────────────────
+
 /// Build the profile options list: ["(none)", "profile-a", "profile-b", ...].
 fn build_profile_options(profile_names: &[String]) -> Vec<String> {
     let mut options = Vec::with_capacity(profile_names.len() + 1);
@@ -343,6 +877,8 @@ fn non_empty_option(s: &str) -> Option<String> {
     }
 }
 
+// ─── Rendering ───────────────────────────────────────────────────────
+
 /// Render the add/edit form as a centered overlay.
 pub fn render_form(
     frame: &mut Frame,
@@ -351,13 +887,41 @@ pub fn render_form(
     settings: &Settings,
     tc: &ThemeColors,
 ) {
+    match state {
+        FormState::Add(f) | FormState::Edit(_, f) => {
+            render_bookmark_form(frame, area, f, false, settings, tc);
+        }
+        FormState::GroupAdd(f) | FormState::GroupEdit(_, f) => {
+            render_bookmark_form(frame, area, f, true, settings, tc);
+        }
+    }
+}
+
+/// Render a bookmark-style form (works for both BookmarkForm and GroupForm via trait-like approach).
+/// When `is_group` is true, the form is treated as a group form (different title, no password field).
+fn render_bookmark_form(
+    frame: &mut Frame,
+    area: Rect,
+    form: &dyn FormFields,
+    is_group: bool,
+    settings: &Settings,
+    tc: &ThemeColors,
+) {
     let popup = centered_rect(65, 80, area);
     frame.render_widget(Clear, popup);
 
-    let title = if state.is_edit {
-        " Edit Bookmark "
+    let title = if is_group {
+        if form.is_edit() {
+            " Edit Group "
+        } else {
+            " Add Group "
+        }
     } else {
-        " Add Bookmark "
+        if form.is_edit() {
+            " Edit Bookmark "
+        } else {
+            " Add Bookmark "
+        }
     };
 
     let block = Block::default()
@@ -373,13 +937,13 @@ pub fn render_form(
     // Layout: fields + optional error + hint line
     let field_count = FIELD_COUNT as u16;
     let mut constraints: Vec<Constraint> = (0..field_count)
-        .map(|_| Constraint::Length(2)) // Each field: label + input on one line, gap
+        .map(|_| Constraint::Length(2))
         .collect();
-    if state.error.is_some() {
-        constraints.push(Constraint::Length(1)); // Error line
+    if form.error().is_some() {
+        constraints.push(Constraint::Length(1));
     }
-    constraints.push(Constraint::Min(0)); // Spacer
-    constraints.push(Constraint::Length(1)); // Hints
+    constraints.push(Constraint::Min(0));
+    constraints.push(Constraint::Length(1));
 
     let chunks = Layout::vertical(constraints).split(inner);
 
@@ -399,12 +963,12 @@ pub fn render_form(
     ];
 
     for (i, &label) in field_labels.iter().enumerate() {
-        render_field(frame, chunks[i], label, i, state, settings, tc);
+        render_field(frame, chunks[i], label, i, form, is_group, settings, tc);
     }
 
     // Error message
     let mut hint_idx = FIELD_COUNT;
-    if let Some(ref err) = state.error {
+    if let Some(ref err) = form.error() {
         let color = if err.starts_with("Warning:") {
             tc.warning
         } else {
@@ -458,17 +1022,55 @@ pub fn render_form(
     }
 }
 
+/// Trait for shared form field access (used by render functions).
+trait FormFields {
+    fn fields(&self) -> &[String; FIELD_COUNT];
+    fn focused(&self) -> usize;
+    fn env_index(&self) -> usize;
+    fn profile_index(&self) -> usize;
+    fn profile_options(&self) -> &[String];
+    fn is_edit(&self) -> bool;
+    fn error(&self) -> Option<String>;
+    fn has_stored_password(&self) -> bool;
+    fn password_modified(&self) -> bool;
+}
+
+impl FormFields for BookmarkForm {
+    fn fields(&self) -> &[String; FIELD_COUNT] { &self.fields }
+    fn focused(&self) -> usize { self.focused }
+    fn env_index(&self) -> usize { self.env_index }
+    fn profile_index(&self) -> usize { self.profile_index }
+    fn profile_options(&self) -> &[String] { &self.profile_options }
+    fn is_edit(&self) -> bool { self.is_edit }
+    fn error(&self) -> Option<String> { self.error.clone() }
+    fn has_stored_password(&self) -> bool { self.has_stored_password }
+    fn password_modified(&self) -> bool { self.password_modified }
+}
+
+impl FormFields for GroupForm {
+    fn fields(&self) -> &[String; FIELD_COUNT] { &self.fields }
+    fn focused(&self) -> usize { self.focused }
+    fn env_index(&self) -> usize { self.env_index }
+    fn profile_index(&self) -> usize { self.profile_index }
+    fn profile_options(&self) -> &[String] { &self.profile_options }
+    fn is_edit(&self) -> bool { self.is_edit }
+    fn error(&self) -> Option<String> { self.error.clone() }
+    fn has_stored_password(&self) -> bool { false }
+    fn password_modified(&self) -> bool { false }
+}
+
 /// Render a single form field (label + value).
 fn render_field(
     frame: &mut Frame,
     area: Rect,
     label: &str,
     field_idx: usize,
-    state: &FormState,
+    form: &dyn FormFields,
+    is_group: bool,
     settings: &Settings,
     tc: &ThemeColors,
 ) {
-    let is_focused = field_idx == state.focused;
+    let is_focused = field_idx == form.focused();
     let [label_area, input_area] =
         Layout::vertical([Constraint::Length(1), Constraint::Length(1)]).areas(area);
 
@@ -483,18 +1085,26 @@ fn render_field(
     let label_line = Line::from(Span::styled(format!("  {label}{marker}"), label_style));
     frame.render_widget(Paragraph::new(label_line), label_area);
 
+    // Skip password field for group forms
+    if field_idx == FIELD_PASSWORD && is_group {
+        let style = Style::default().fg(tc.fg_dim);
+        let line = Line::from(Span::styled("  > (inherited from profile)", style));
+        frame.render_widget(Paragraph::new(line), input_area);
+        return;
+    }
+
     // Input value — special cases for env, password, profile, and proxy jump fields
     if field_idx == FIELD_ENV {
-        render_env_selector(frame, input_area, state, settings, is_focused, tc);
+        render_env_selector(frame, input_area, form, settings, is_focused, tc);
     } else if field_idx == FIELD_PASSWORD {
-        render_password_field(frame, input_area, state, is_focused, tc);
+        render_password_field(frame, input_area, form, is_focused, tc);
     } else if field_idx == FIELD_PROFILE {
-        render_profile_selector(frame, input_area, state, is_focused, tc);
+        render_profile_selector(frame, input_area, form, is_focused, tc);
     } else if field_idx == FIELD_PROXY {
-        render_proxy_jump_field(frame, input_area, state, is_focused, tc);
+        render_proxy_jump_field(frame, input_area, form, is_focused, tc);
     } else {
         let cursor = if is_focused { "_" } else { "" };
-        let value = &state.fields[field_idx];
+        let value = &form.fields()[field_idx];
         let input_style = if is_focused {
             Style::default().fg(tc.fg)
         } else {
@@ -513,7 +1123,7 @@ fn render_field(
 fn render_env_selector(
     frame: &mut Frame,
     area: Rect,
-    state: &FormState,
+    form: &dyn FormFields,
     settings: &Settings,
     is_focused: bool,
     tc: &ThemeColors,
@@ -521,10 +1131,9 @@ fn render_env_selector(
     let mut spans: Vec<Span> = vec![Span::raw(if is_focused { "  > " } else { "    " })];
 
     for (i, &env) in ENV_OPTIONS.iter().enumerate() {
-        let is_selected = i == state.env_index;
+        let is_selected = i == form.env_index();
 
         if env.is_empty() {
-            // "(none)" option
             let style = if is_selected {
                 Style::default()
                     .fg(tc.fg)
@@ -536,12 +1145,10 @@ fn render_env_selector(
         } else {
             let span = env_badge::env_badge_span(env, settings);
             if is_selected {
-                // Add underline to indicate selection
                 let mut style = span.style;
                 style = style.add_modifier(Modifier::UNDERLINED);
                 spans.push(Span::styled(span.content.to_string(), style));
             } else if !is_focused {
-                // Dim unselected options when not focused
                 spans.push(Span::styled(
                     span.content.to_string(),
                     Style::default().fg(tc.fg_muted),
@@ -568,14 +1175,14 @@ fn render_env_selector(
 fn render_profile_selector(
     frame: &mut Frame,
     area: Rect,
-    state: &FormState,
+    form: &dyn FormFields,
     is_focused: bool,
     tc: &ThemeColors,
 ) {
     let mut spans: Vec<Span> = vec![Span::raw(if is_focused { "  > " } else { "    " })];
 
-    for (i, option) in state.profile_options.iter().enumerate() {
-        let is_selected = i == state.profile_index;
+    for (i, option) in form.profile_options().iter().enumerate() {
+        let is_selected = i == form.profile_index();
 
         let style = if is_selected {
             Style::default()
@@ -600,28 +1207,24 @@ fn render_profile_selector(
 }
 
 /// Render the Proxy Jump field with placeholder text.
-/// - Has content → show value + cursor if focused
-/// - Empty → show placeholder hint in dim text
 fn render_proxy_jump_field(
     frame: &mut Frame,
     area: Rect,
-    state: &FormState,
+    form: &dyn FormFields,
     is_focused: bool,
     tc: &ThemeColors,
 ) {
     let prefix = if is_focused { "  > " } else { "    " };
-    let value = &state.fields[FIELD_PROXY];
+    let value = &form.fields()[FIELD_PROXY];
     let cursor = if is_focused { "_" } else { "" };
 
     let line = if value.is_empty() {
-        // Show placeholder hint
         let style = Style::default().fg(tc.fg_dim);
         Line::from(Span::styled(
             format!("{prefix}{PROXY_JUMP_PLACEHOLDER}{cursor}"),
             style,
         ))
     } else {
-        // Show actual value
         let style = if is_focused {
             Style::default().fg(tc.fg)
         } else {
@@ -634,21 +1237,17 @@ fn render_proxy_jump_field(
 }
 
 /// Render the password field with masking.
-/// - Has content → show `●` dots (one per char) + cursor
-/// - Empty + has_stored_password → show `●●●● (stored in keychain)` dim
-/// - Empty + not stored → show `(not set)` dim
 fn render_password_field(
     frame: &mut Frame,
     area: Rect,
-    state: &FormState,
+    form: &dyn FormFields,
     is_focused: bool,
     tc: &ThemeColors,
 ) {
     let prefix = if is_focused { "  > " } else { "    " };
-    let value = &state.fields[FIELD_PASSWORD];
+    let value = &form.fields()[FIELD_PASSWORD];
 
     let line = if !value.is_empty() {
-        // Show masked dots for each character
         let dots: String = "●".repeat(value.len());
         let cursor = if is_focused { "_" } else { "" };
         let style = if is_focused {
@@ -657,8 +1256,7 @@ fn render_password_field(
             Style::default().fg(tc.fg_muted)
         };
         Line::from(Span::styled(format!("{prefix}{dots}{cursor}"), style))
-    } else if state.has_stored_password && !state.password_modified {
-        // Password exists in keychain but not loaded into memory
+    } else if form.has_stored_password() && !form.password_modified() {
         let style = Style::default().fg(tc.fg_dim);
         let cursor = if is_focused { "_" } else { "" };
         Line::from(vec![
@@ -668,7 +1266,6 @@ fn render_password_field(
             Span::styled(cursor.to_string(), style),
         ])
     } else {
-        // No password
         let style = Style::default().fg(tc.fg_dim);
         let cursor = if is_focused { "_" } else { "" };
         Line::from(Span::styled(format!("{prefix}(not set){cursor}"), style))
@@ -731,13 +1328,15 @@ mod tests {
         }
     }
 
+    // ─── BookmarkForm tests ───
+
     #[test]
     fn test_new_add_form_defaults() {
         let settings = Settings {
             default_user: Some("admin".into()),
             ..Settings::default()
         };
-        let form = FormState::new_add(&settings, &[]);
+        let form = BookmarkForm::new_add(&settings, &[]);
         assert!(!form.is_edit);
         assert_eq!(form.focused, FIELD_NAME);
         assert_eq!(form.fields[FIELD_PORT], "22");
@@ -753,7 +1352,7 @@ mod tests {
     #[test]
     fn test_new_edit_form_populates() {
         let bookmark = sample_bookmark();
-        let form = FormState::new_edit(&bookmark, &[]);
+        let form = BookmarkForm::new_edit(&bookmark, &[]);
         assert!(form.is_edit);
         assert_eq!(form.fields[FIELD_NAME], "prod-web-01");
         assert_eq!(form.fields[FIELD_HOST], "10.0.1.5");
@@ -764,7 +1363,6 @@ mod tests {
         assert_eq!(form.fields[FIELD_PROXY], "bastion");
         assert_eq!(form.fields[FIELD_NOTES], "Primary web server");
         assert_eq!(form.selected_env(), "production");
-        // Password field starts empty (never loaded from keychain into memory)
         assert!(form.password().is_empty());
         assert!(!form.password_modified);
     }
@@ -772,7 +1370,7 @@ mod tests {
     #[test]
     fn test_field_navigation() {
         let settings = Settings::default();
-        let mut form = FormState::new_add(&settings, &[]);
+        let mut form = BookmarkForm::new_add(&settings, &[]);
         assert_eq!(form.focused, 0);
 
         form.next_field();
@@ -785,12 +1383,10 @@ mod tests {
         form.prev_field();
         assert_eq!(form.focused, 2);
 
-        // Clamp at top
         form.focused = 0;
         form.prev_field();
         assert_eq!(form.focused, 0);
 
-        // Clamp at bottom
         form.focused = FIELD_COUNT - 1;
         form.next_field();
         assert_eq!(form.focused, FIELD_COUNT - 1);
@@ -799,7 +1395,7 @@ mod tests {
     #[test]
     fn test_env_cycling() {
         let settings = Settings::default();
-        let mut form = FormState::new_add(&settings, &[]);
+        let mut form = BookmarkForm::new_add(&settings, &[]);
         assert_eq!(form.env_index, 0);
 
         form.cycle_env_right();
@@ -808,12 +1404,10 @@ mod tests {
         form.cycle_env_right();
         assert_eq!(form.selected_env(), "staging");
 
-        // Cycle wraps
         form.env_index = ENV_OPTIONS.len() - 1;
         form.cycle_env_right();
         assert_eq!(form.env_index, 0);
 
-        // Left from 0 wraps to end
         form.cycle_env_left();
         assert_eq!(form.env_index, ENV_OPTIONS.len() - 1);
     }
@@ -821,7 +1415,7 @@ mod tests {
     #[test]
     fn test_char_insert_and_delete() {
         let settings = Settings::default();
-        let mut form = FormState::new_add(&settings, &[]);
+        let mut form = BookmarkForm::new_add(&settings, &[]);
         form.focused = FIELD_NAME;
 
         form.insert_char('a');
@@ -835,7 +1429,7 @@ mod tests {
     #[test]
     fn test_env_field_ignores_typing() {
         let settings = Settings::default();
-        let mut form = FormState::new_add(&settings, &[]);
+        let mut form = BookmarkForm::new_add(&settings, &[]);
         form.focused = FIELD_ENV;
 
         form.insert_char('x');
@@ -849,7 +1443,7 @@ mod tests {
     fn test_validate_and_build_success() {
         let config = AppConfig::default();
         let settings = Settings::default();
-        let mut form = FormState::new_add(&settings, &[]);
+        let mut form = BookmarkForm::new_add(&settings, &[]);
         form.fields[FIELD_NAME] = "test-server".into();
         form.fields[FIELD_HOST] = "10.0.1.5".into();
         form.fields[FIELD_PORT] = "2222".into();
@@ -869,7 +1463,7 @@ mod tests {
     fn test_validate_empty_name_fails() {
         let config = AppConfig::default();
         let settings = Settings::default();
-        let mut form = FormState::new_add(&settings, &[]);
+        let mut form = BookmarkForm::new_add(&settings, &[]);
         form.fields[FIELD_HOST] = "10.0.1.5".into();
 
         let result = form.validate_and_build(&config);
@@ -880,7 +1474,7 @@ mod tests {
     fn test_validate_empty_host_fails() {
         let config = AppConfig::default();
         let settings = Settings::default();
-        let mut form = FormState::new_add(&settings, &[]);
+        let mut form = BookmarkForm::new_add(&settings, &[]);
         form.fields[FIELD_NAME] = "test".into();
 
         let result = form.validate_and_build(&config);
@@ -891,7 +1485,7 @@ mod tests {
     fn test_validate_invalid_port_fails() {
         let config = AppConfig::default();
         let settings = Settings::default();
-        let mut form = FormState::new_add(&settings, &[]);
+        let mut form = BookmarkForm::new_add(&settings, &[]);
         form.fields[FIELD_NAME] = "test".into();
         form.fields[FIELD_HOST] = "10.0.1.5".into();
         form.fields[FIELD_PORT] = "abc".into();
@@ -904,7 +1498,7 @@ mod tests {
     fn test_validate_duplicate_name_fails() {
         let config = sample_config();
         let settings = Settings::default();
-        let mut form = FormState::new_add(&settings, &[]);
+        let mut form = BookmarkForm::new_add(&settings, &[]);
         form.fields[FIELD_NAME] = "prod-web-01".into();
         form.fields[FIELD_HOST] = "10.0.1.5".into();
 
@@ -917,7 +1511,7 @@ mod tests {
     fn test_validate_edit_same_name_succeeds() {
         let config = sample_config();
         let bookmark = sample_bookmark();
-        let mut form = FormState::new_edit(&bookmark, &[]);
+        let mut form = BookmarkForm::new_edit(&bookmark, &[]);
 
         let result = form.validate_and_build(&config);
         assert!(result.is_ok());
@@ -933,7 +1527,7 @@ mod tests {
         });
 
         let bookmark = sample_bookmark();
-        let mut form = FormState::new_edit(&bookmark, &[]);
+        let mut form = BookmarkForm::new_edit(&bookmark, &[]);
         form.fields[FIELD_NAME] = "other-server".into();
 
         let result = form.validate_and_build(&config);
@@ -944,7 +1538,7 @@ mod tests {
     fn test_validate_shell_metachar_in_host_fails() {
         let config = AppConfig::default();
         let settings = Settings::default();
-        let mut form = FormState::new_add(&settings, &[]);
+        let mut form = BookmarkForm::new_add(&settings, &[]);
         form.fields[FIELD_NAME] = "test".into();
         form.fields[FIELD_HOST] = "host;evil".into();
 
@@ -955,7 +1549,7 @@ mod tests {
     #[test]
     fn test_auto_detect_env_on_name_input() {
         let settings = Settings::default();
-        let mut form = FormState::new_add(&settings, &[]);
+        let mut form = BookmarkForm::new_add(&settings, &[]);
         form.focused = FIELD_NAME;
         for c in "prod-web".chars() {
             form.insert_char(c);
@@ -964,30 +1558,19 @@ mod tests {
     }
 
     #[test]
-    fn test_non_empty_option() {
-        assert_eq!(non_empty_option(""), None);
-        assert_eq!(non_empty_option("  "), None);
-        assert_eq!(non_empty_option("hello"), Some("hello".into()));
-        assert_eq!(non_empty_option("  hello  "), Some("hello".into()));
-    }
-
-    #[test]
     fn test_password_field_masking_and_tracking() {
         let settings = Settings::default();
-        let mut form = FormState::new_add(&settings, &[]);
+        let mut form = BookmarkForm::new_add(&settings, &[]);
         form.focused = FIELD_PASSWORD;
 
-        // Initially not modified
         assert!(!form.password_modified);
 
-        // Typing sets password_modified
         form.insert_char('s');
         form.insert_char('e');
         form.insert_char('c');
         assert!(form.password_modified);
         assert_eq!(form.password(), "sec");
 
-        // Delete also keeps password_modified true
         form.delete_char();
         assert!(form.password_modified);
         assert_eq!(form.password(), "se");
@@ -996,11 +1579,10 @@ mod tests {
     #[test]
     fn test_password_field_clearing_marks_modified() {
         let settings = Settings::default();
-        let mut form = FormState::new_add(&settings, &[]);
-        form.has_stored_password = true; // Simulate stored password
+        let mut form = BookmarkForm::new_add(&settings, &[]);
+        form.has_stored_password = true;
         form.focused = FIELD_PASSWORD;
 
-        // Typing then clearing everything
         form.insert_char('x');
         form.delete_char();
         assert!(form.password_modified);
@@ -1011,7 +1593,7 @@ mod tests {
     fn test_validate_port_zero_fails() {
         let config = AppConfig::default();
         let settings = Settings::default();
-        let mut form = FormState::new_add(&settings, &[]);
+        let mut form = BookmarkForm::new_add(&settings, &[]);
         form.fields[FIELD_NAME] = "test".into();
         form.fields[FIELD_HOST] = "10.0.1.5".into();
         form.fields[FIELD_PORT] = "0".into();
@@ -1020,13 +1602,13 @@ mod tests {
         assert!(result.is_err());
     }
 
-    // --- Profile selector tests (Phase 5) ---
+    // ─── Profile selector tests ───
 
     #[test]
     fn test_profile_cycling() {
         let settings = Settings::default();
         let profiles = vec!["corp-bastion".to_string(), "dev-tunnel".to_string()];
-        let mut form = FormState::new_add(&settings, &profiles);
+        let mut form = BookmarkForm::new_add(&settings, &profiles);
 
         assert_eq!(form.profile_index, 0);
         assert!(form.selected_profile().is_none());
@@ -1037,12 +1619,10 @@ mod tests {
         form.cycle_profile_right();
         assert_eq!(form.selected_profile(), Some("dev-tunnel"));
 
-        // Wraps around
         form.cycle_profile_right();
         assert_eq!(form.profile_index, 0);
         assert!(form.selected_profile().is_none());
 
-        // Left from 0 wraps to end
         form.cycle_profile_left();
         assert_eq!(form.selected_profile(), Some("dev-tunnel"));
     }
@@ -1051,7 +1631,7 @@ mod tests {
     fn test_profile_field_ignores_typing() {
         let settings = Settings::default();
         let profiles = vec!["ops".to_string()];
-        let mut form = FormState::new_add(&settings, &profiles);
+        let mut form = BookmarkForm::new_add(&settings, &profiles);
         form.focused = FIELD_PROFILE;
 
         form.insert_char('x');
@@ -1067,8 +1647,8 @@ mod tests {
         let mut bookmark = sample_bookmark();
         bookmark.profile = Some("dev".to_string());
 
-        let form = FormState::new_edit(&bookmark, &profiles);
-        assert_eq!(form.profile_index, 2); // index 0=(none), 1=ops, 2=dev
+        let form = BookmarkForm::new_edit(&bookmark, &profiles);
+        assert_eq!(form.profile_index, 2);
         assert_eq!(form.selected_profile(), Some("dev"));
     }
 
@@ -1078,8 +1658,8 @@ mod tests {
         let mut bookmark = sample_bookmark();
         bookmark.profile = Some("deleted-profile".to_string());
 
-        let form = FormState::new_edit(&bookmark, &profiles);
-        assert_eq!(form.profile_index, 0); // Falls back to (none)
+        let form = BookmarkForm::new_edit(&bookmark, &profiles);
+        assert_eq!(form.profile_index, 0);
         assert!(form.selected_profile().is_none());
     }
 
@@ -1088,10 +1668,10 @@ mod tests {
         let config = AppConfig::default();
         let settings = Settings::default();
         let profiles = vec!["corp-bastion".to_string()];
-        let mut form = FormState::new_add(&settings, &profiles);
+        let mut form = BookmarkForm::new_add(&settings, &profiles);
         form.fields[FIELD_NAME] = "test-server".into();
         form.fields[FIELD_HOST] = "10.0.1.5".into();
-        form.profile_index = 1; // "corp-bastion"
+        form.profile_index = 1;
 
         let bookmark = form.validate_and_build(&config).unwrap();
         assert_eq!(bookmark.profile, Some("corp-bastion".to_string()));
@@ -1102,10 +1682,9 @@ mod tests {
         let config = AppConfig::default();
         let settings = Settings::default();
         let profiles = vec!["corp-bastion".to_string()];
-        let mut form = FormState::new_add(&settings, &profiles);
+        let mut form = BookmarkForm::new_add(&settings, &profiles);
         form.fields[FIELD_NAME] = "test-server".into();
         form.fields[FIELD_HOST] = "10.0.1.5".into();
-        // profile_index stays 0 = (none)
 
         let bookmark = form.validate_and_build(&config).unwrap();
         assert!(bookmark.profile.is_none());
@@ -1114,35 +1693,23 @@ mod tests {
     #[test]
     fn test_profile_options_with_no_profiles() {
         let settings = Settings::default();
-        let form = FormState::new_add(&settings, &[]);
+        let form = BookmarkForm::new_add(&settings, &[]);
         assert_eq!(form.profile_options, vec!["(none)"]);
         assert_eq!(form.profile_index, 0);
         assert!(form.selected_profile().is_none());
     }
 
     #[test]
-    fn test_build_profile_options() {
-        let names = vec!["alpha".to_string(), "beta".to_string()];
-        let options = build_profile_options(&names);
-        assert_eq!(options, vec!["(none)", "alpha", "beta"]);
-    }
-
-    #[test]
-    fn test_proxy_jump_placeholder_constant() {
-        assert_eq!(PROXY_JUMP_PLACEHOLDER, "(e.g. admin@bastion)");
-    }
-
-    #[test]
     fn test_proxy_jump_field_empty_in_add_form() {
         let settings = Settings::default();
-        let form = FormState::new_add(&settings, &[]);
+        let form = BookmarkForm::new_add(&settings, &[]);
         assert_eq!(form.fields[FIELD_PROXY], "");
     }
 
     #[test]
     fn test_proxy_jump_field_populated_in_edit_form() {
         let bookmark = sample_bookmark();
-        let form = FormState::new_edit(&bookmark, &[]);
+        let form = BookmarkForm::new_edit(&bookmark, &[]);
         assert_eq!(form.fields[FIELD_PROXY], "bastion");
     }
 
@@ -1150,7 +1717,7 @@ mod tests {
     fn test_validate_and_build_proxy_jump_included() {
         let config = AppConfig::default();
         let settings = Settings::default();
-        let mut form = FormState::new_add(&settings, &[]);
+        let mut form = BookmarkForm::new_add(&settings, &[]);
         form.fields[FIELD_NAME] = "test-server".into();
         form.fields[FIELD_HOST] = "10.0.1.5".into();
         form.fields[FIELD_PROXY] = "admin@bastion:2222".into();
@@ -1163,12 +1730,294 @@ mod tests {
     fn test_validate_and_build_empty_proxy_jump_is_none() {
         let config = AppConfig::default();
         let settings = Settings::default();
-        let mut form = FormState::new_add(&settings, &[]);
+        let mut form = BookmarkForm::new_add(&settings, &[]);
         form.fields[FIELD_NAME] = "test-server".into();
         form.fields[FIELD_HOST] = "10.0.1.5".into();
-        // FIELD_PROXY stays empty
 
         let bookmark = form.validate_and_build(&config).unwrap();
         assert!(bookmark.proxy_jump.is_none());
+    }
+
+    // ─── FormState enum delegation tests ───
+
+    #[test]
+    fn test_form_state_new_add_wraps_bookmark_form() {
+        let settings = Settings::default();
+        let state = FormState::new_add(&settings, &[]);
+        assert!(state.is_bookmark_form());
+        assert!(!state.is_group_form());
+    }
+
+    #[test]
+    fn test_form_state_new_group_add_has_one_session() {
+        let settings = Settings::default();
+        let state = FormState::new_group_add(&settings, &[]);
+        assert!(state.is_group_form());
+        assert!(!state.is_bookmark_form());
+
+        if let FormState::GroupAdd(f) = state {
+            assert_eq!(f.sessions.len(), 1);
+            assert_eq!(f.session_cursor, 0);
+        } else {
+            panic!("Expected GroupAdd variant");
+        }
+    }
+
+    #[test]
+    fn test_form_state_add_session_line() {
+        let settings = Settings::default();
+        let mut state = FormState::new_group_add(&settings, &[]);
+
+        state.add_session_line();
+
+        if let FormState::GroupAdd(f) = state {
+            assert_eq!(f.sessions.len(), 2);
+            assert_eq!(f.session_cursor, 1);
+        } else {
+            panic!("Expected GroupAdd variant");
+        }
+    }
+
+    #[test]
+    fn test_form_state_remove_session_line() {
+        let settings = Settings::default();
+        let mut state = FormState::new_group_add(&settings, &[]);
+
+        // Add two sessions first
+        state.add_session_line();
+        state.add_session_line();
+
+        if let FormState::GroupAdd(ref f) = state {
+            assert_eq!(f.sessions.len(), 3);
+        }
+
+        // Remove current session
+        state.remove_session_line();
+
+        if let FormState::GroupAdd(f) = state {
+            assert_eq!(f.sessions.len(), 2);
+        }
+    }
+
+    #[test]
+    fn test_form_state_remove_session_line_min_one() {
+        let settings = Settings::default();
+        let mut state = FormState::new_group_add(&settings, &[]);
+
+        // Try to remove the only session — should be no-op
+        state.remove_session_line();
+
+        if let FormState::GroupAdd(f) = state {
+            assert_eq!(f.sessions.len(), 1);
+        }
+    }
+
+    #[test]
+    fn test_form_state_new_group_edit_populates() {
+        let group = BookmarkGroup {
+            name: "prod-web".into(),
+            host: "10.0.1.5".into(),
+            user: Some("deploy".into()),
+            port: 2222,
+            env: "production".into(),
+            tags: vec!["web".into()],
+            identity_file: Some("~/.ssh/id_ed25519".into()),
+            proxy_jump: Some("bastion".into()),
+            notes: Some("Web servers".into()),
+            profile: None,
+            on_connect: Some("cd /app".into()),
+            on_connect_prompt_pattern: None,
+            snippets: vec![],
+            connect_timeout_secs: None,
+            ssh_options: std::collections::BTreeMap::new(),
+            sessions: vec![
+                Session {
+                    name: "session-a".into(),
+                    on_connect: Some("tail -f /var/log/app.log".into()),
+                    ..Session::default()
+                },
+                Session {
+                    name: "session-b".into(),
+                    on_connect: None,
+                    ..Session::default()
+                },
+            ],
+        };
+        let state = FormState::new_group_edit(0, &group, &[]);
+
+        if let FormState::GroupEdit(_, f) = state {
+            assert!(f.is_edit);
+            assert_eq!(f.original_name, Some("prod-web".into()));
+            assert_eq!(f.fields[FIELD_NAME], "prod-web");
+            assert_eq!(f.fields[FIELD_HOST], "10.0.1.5");
+            assert_eq!(f.fields[FIELD_PORT], "2222");
+            assert_eq!(f.selected_env(), "production");
+            assert_eq!(f.sessions.len(), 2);
+            assert_eq!(f.sessions[0].name, "session-a");
+            assert_eq!(f.sessions[1].name, "session-b");
+        } else {
+            panic!("Expected GroupEdit variant");
+        }
+    }
+
+    #[test]
+    fn test_form_state_new_group_edit_empty_sessions_gets_one() {
+        let group = BookmarkGroup {
+            name: "empty-group".into(),
+            host: "10.0.1.5".into(),
+            sessions: vec![],
+            ..BookmarkGroup::default()
+        };
+        let state = FormState::new_group_edit(0, &group, &[]);
+
+        if let FormState::GroupEdit(_, f) = state {
+            assert_eq!(f.sessions.len(), 1); // Gets one empty session
+        } else {
+            panic!("Expected GroupEdit variant");
+        }
+    }
+
+    #[test]
+    fn test_form_state_delegation_next_field_add() {
+        let settings = Settings::default();
+        let mut state = FormState::new_add(&settings, &[]);
+        assert_eq!(state.focused(), FIELD_NAME);
+
+        state.next_field();
+        assert_eq!(state.focused(), FIELD_HOST);
+    }
+
+    #[test]
+    fn test_form_state_delegation_next_field_group_add() {
+        let settings = Settings::default();
+        let mut state = FormState::new_group_add(&settings, &[]);
+        assert_eq!(state.focused(), FIELD_NAME);
+
+        state.next_field();
+        assert_eq!(state.focused(), FIELD_HOST);
+    }
+
+    #[test]
+    fn test_form_state_delegation_insert_char() {
+        let settings = Settings::default();
+        let mut state = FormState::new_add(&settings, &[]);
+        state.insert_char('h');
+        state.insert_char('i');
+
+        if let FormState::Add(f) = state {
+            assert_eq!(f.fields[FIELD_NAME], "hi");
+        } else {
+            panic!("Expected Add variant");
+        }
+    }
+
+    #[test]
+    fn test_form_state_delegation_insert_char_group() {
+        let settings = Settings::default();
+        let mut state = FormState::new_group_add(&settings, &[]);
+        state.insert_char('g');
+
+        if let FormState::GroupAdd(f) = state {
+            assert_eq!(f.fields[FIELD_NAME], "g");
+        } else {
+            panic!("Expected GroupAdd variant");
+        }
+    }
+
+    #[test]
+    fn test_form_state_validate_and_build_group() {
+        let config = AppConfig::default();
+        let settings = Settings::default();
+        let mut state = FormState::new_group_add(&settings, &[]);
+
+        if let FormState::GroupAdd(f) = &mut state {
+            f.fields[FIELD_NAME] = "my-group".into();
+            f.fields[FIELD_HOST] = "10.0.1.5".into();
+            f.sessions[0].name = "session-1".into();
+        }
+
+        let group = state.validate_and_build_group(&config).unwrap();
+        assert_eq!(group.name, "my-group");
+        assert_eq!(group.host, "10.0.1.5");
+        assert_eq!(group.sessions.len(), 1);
+        assert_eq!(group.sessions[0].name, "session-1");
+    }
+
+    #[test]
+    fn test_form_state_validate_and_build_group_duplicate_session_names() {
+        let config = AppConfig::default();
+        let settings = Settings::default();
+        let mut state = FormState::new_group_add(&settings, &[]);
+
+        if let FormState::GroupAdd(f) = &mut state {
+            f.fields[FIELD_NAME] = "my-group".into();
+            f.fields[FIELD_HOST] = "10.0.1.5".into();
+            f.sessions[0].name = "dup".into();
+            f.add_session_line();
+            f.sessions[1].name = "dup".into();
+        }
+
+        let result = state.validate_and_build_group(&config);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("Duplicate session name"));
+    }
+
+    #[test]
+    fn test_form_state_validate_and_build_group_empty_session_name() {
+        let config = AppConfig::default();
+        let settings = Settings::default();
+        let mut state = FormState::new_group_add(&settings, &[]);
+
+        if let FormState::GroupAdd(f) = &mut state {
+            f.fields[FIELD_NAME] = "my-group".into();
+            f.fields[FIELD_HOST] = "10.0.1.5".into();
+            f.sessions[0].name = "".into();
+        }
+
+        let result = state.validate_and_build_group(&config);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("Session name cannot be empty"));
+    }
+
+    #[test]
+    fn test_form_state_validate_and_build_group_duplicate_group_name() {
+        let mut config = AppConfig::default();
+        config.groups.push(BookmarkGroup {
+            name: "existing".into(),
+            host: "10.0.0.1".into(),
+            ..BookmarkGroup::default()
+        });
+        let settings = Settings::default();
+        let mut state = FormState::new_group_add(&settings, &[]);
+
+        if let FormState::GroupAdd(f) = &mut state {
+            f.fields[FIELD_NAME] = "existing".into();
+            f.fields[FIELD_HOST] = "10.0.1.5".into();
+            f.sessions[0].name = "session-1".into();
+        }
+
+        let result = state.validate_and_build_group(&config);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("already exists"));
+    }
+
+    #[test]
+    fn test_non_empty_option() {
+        assert_eq!(non_empty_option(""), None);
+        assert_eq!(non_empty_option("  "), None);
+        assert_eq!(non_empty_option("hello"), Some("hello".into()));
+        assert_eq!(non_empty_option("  hello  "), Some("hello".into()));
+    }
+
+    #[test]
+    fn test_build_profile_options() {
+        let names = vec!["alpha".to_string(), "beta".to_string()];
+        let options = build_profile_options(&names);
+        assert_eq!(options, vec!["(none)", "alpha", "beta"]);
+    }
+
+    #[test]
+    fn test_proxy_jump_placeholder_constant() {
+        assert_eq!(PROXY_JUMP_PLACEHOLDER, "(e.g. admin@bastion)");
     }
 }

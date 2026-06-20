@@ -35,10 +35,10 @@ const ENV_OPTIONS: &[&str] = &[
 const PROXY_JUMP_PLACEHOLDER: &str = "(e.g. admin@bastion)";
 
 /// Index of each form field.
-const FIELD_NAME: usize = 0;
-const FIELD_HOST: usize = 1;
+pub(crate) const FIELD_NAME: usize = 0;
+pub(crate) const FIELD_HOST: usize = 1;
 const FIELD_USER: usize = 2;
-const FIELD_PORT: usize = 3;
+pub(crate) const FIELD_PORT: usize = 3;
 pub(crate) const FIELD_ENV: usize = 4;
 const FIELD_TAGS: usize = 5;
 const FIELD_IDENTITY: usize = 6;

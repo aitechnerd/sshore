@@ -26,7 +26,7 @@ use crate::ssh;
 use crate::tui::theme::{ThemeColors, resolve_theme};
 use crate::tui::views::browser::truncate_name;
 use crate::tui::views::confirm::{ConfirmState, ConfirmTarget};
-use crate::tui::views::form::{FIELD_ENV, FIELD_PROFILE, FormState};
+use crate::tui::views::form::{FIELD_ENV, FIELD_HOST, FIELD_NAME, FIELD_PORT, FIELD_PROFILE, FormState};
 use crate::tui::views::{confirm, form, help, import_wizard, list};
 use crate::tui::widgets::{search_bar, status_bar};
 
@@ -2233,5 +2233,140 @@ mod tests {
 
         assert!(app.form_state.is_none());
         assert_eq!(app.screen, Screen::List);
+    }
+
+    // ─── Integration tests ───
+
+    #[test]
+    fn test_group_form_full_workflow_add_with_sessions() {
+        let mut app = sample_app();
+        let profile_names: Vec<String> =
+            app.config.profiles.iter().map(|p| p.name.clone()).collect();
+        app.form_state = Some(FormState::new_group_add(&app.config.settings, &profile_names));
+        app.screen = Screen::GroupAddForm;
+
+        // Fill in the form fields
+        if let Some(FormState::GroupAdd(f)) = &mut app.form_state {
+            f.fields[FIELD_NAME] = "test-group".into();
+            f.fields[FIELD_HOST] = "10.0.1.5".into();
+            f.fields[FIELD_PORT] = "2222".into();
+            f.sessions[0].name = "session-a".into();
+            f.sessions[0].on_connect = Some("tail -f /var/log/app.log".into());
+            // Add second session
+            f.add_session_line();
+            f.sessions[1].name = "session-b".into();
+            f.sessions[1].on_connect = Some("htop".into());
+        }
+
+        // Save the form
+        try_save_group_form(&mut app);
+
+        // Verify the group was added
+        assert_eq!(app.screen, Screen::List);
+        assert!(app.form_state.is_none());
+        assert_eq!(app.config.groups.len(), 1);
+        let group = &app.config.groups[0];
+        assert_eq!(group.name, "test-group");
+        assert_eq!(group.host, "10.0.1.5");
+        assert_eq!(group.port, 2222);
+        assert_eq!(group.sessions.len(), 2);
+        assert_eq!(group.sessions[0].name, "session-a");
+        assert_eq!(group.sessions[0].on_connect, Some("tail -f /var/log/app.log".into()));
+        assert_eq!(group.sessions[1].name, "session-b");
+        assert_eq!(group.sessions[1].on_connect, Some("htop".into()));
+    }
+
+    #[test]
+    fn test_group_form_edit_workflow() {
+        let mut app = sample_app();
+        // Add a group first
+        app.config.groups.push(BookmarkGroup {
+            name: "edit-me".into(),
+            host: "10.0.1.5".into(),
+            port: 22,
+            sessions: vec![Session {
+                name: "original".into(),
+                on_connect: Some("echo hello".into()),
+                ..Session::default()
+            }],
+            ..BookmarkGroup::default()
+        });
+
+        let profile_names: Vec<String> =
+            app.config.profiles.iter().map(|p| p.name.clone()).collect();
+        let group = app.config.groups[0].clone();
+        app.form_state = Some(FormState::new_group_edit(0, &group, &profile_names));
+        app.screen = Screen::GroupEditForm(0);
+
+        // Modify the session
+        if let Some(FormState::GroupEdit(_, f)) = &mut app.form_state {
+            f.sessions[0].on_connect = Some("echo world".into());
+        }
+
+        // Verify the form state was mutated
+        if let Some(FormState::GroupEdit(_, f)) = &app.form_state {
+            assert_eq!(f.sessions[0].on_connect, Some("echo world".into()));
+        }
+
+        // Build the group from form and verify
+        if let Some(ref mut form) = app.form_state {
+            let built = form.validate_and_build_group(&app.config).unwrap();
+            assert_eq!(built.sessions[0].on_connect, Some("echo world".into()));
+        }
+    }
+
+    #[test]
+    fn test_group_form_delete_workflow() {
+        let mut app = sample_app();
+        // Add a group first
+        app.config.groups.push(BookmarkGroup {
+            name: "delete-me".into(),
+            host: "10.0.1.5".into(),
+            ..BookmarkGroup::default()
+        });
+
+        // Set up delete confirmation
+        let group = &app.config.groups[0];
+        app.confirm_state = Some(ConfirmState::new_group(group));
+        app.screen = Screen::DeleteConfirm(0);
+
+        // Confirm deletion (non-production, so Enter confirms immediately)
+        let key = KeyEvent {
+            code: KeyCode::Enter,
+            modifiers: KeyModifiers::NONE,
+            kind: crossterm::event::KeyEventKind::Press,
+            state: crossterm::event::KeyEventState::empty(),
+        };
+        handle_confirm_key(&mut app, key);
+
+        // Verify the group was removed
+        assert!(app.config.groups.is_empty());
+        assert_eq!(app.screen, Screen::List);
+        assert!(app.confirm_state.is_none());
+    }
+
+    #[test]
+    fn test_bookmark_form_unchanged() {
+        let mut app = sample_app();
+        let initial_count = app.config.bookmarks.len();
+        let profile_names: Vec<String> =
+            app.config.profiles.iter().map(|p| p.name.clone()).collect();
+        app.form_state = Some(FormState::new_add(&app.config.settings, &profile_names));
+        app.screen = Screen::AddForm;
+
+        // Fill in the form fields
+        if let Some(FormState::Add(f)) = &mut app.form_state {
+            f.fields[FIELD_NAME] = "new-bookmark".into();
+            f.fields[FIELD_HOST] = "10.0.1.5".into();
+        }
+
+        // Save
+        try_save_form(&mut app);
+
+        // Verify the bookmark was added
+        assert_eq!(app.config.bookmarks.len(), initial_count + 1);
+        let bookmark = app.config.bookmarks.iter().find(|b| b.name == "new-bookmark");
+        assert!(bookmark.is_some());
+        assert_eq!(bookmark.unwrap().host, "10.0.1.5");
     }
 }

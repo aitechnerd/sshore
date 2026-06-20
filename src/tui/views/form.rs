@@ -13,6 +13,7 @@ use crate::config::model::{
     AppConfig, Bookmark, BookmarkGroup, Session, Settings, validate_bookmark_name,
     validate_hostname,
 };
+use crate::config::validate_on_connect;
 use crate::keychain;
 use crate::tui::theme::ThemeColors;
 use crate::tui::widgets::env_badge;
@@ -591,6 +592,13 @@ impl GroupForm {
             }
             if !session_names.insert(session_name) {
                 anyhow::bail!("Duplicate session name '{}'", session_name);
+            }
+            // Validate session-level on_connect
+            if let Some(ref cmd) = session.on_connect {
+                validate_on_connect(
+                    cmd,
+                    &format!("Session '{}' in group '{}'", session_name, name),
+                )?;
             }
         }
 
@@ -2205,6 +2213,44 @@ mod tests {
         let result = state.validate_and_build_group(&config);
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("already exists"));
+    }
+
+    #[test]
+    fn test_form_state_validate_and_build_group_on_connect_escape_rejected() {
+        let config = AppConfig::default();
+        let settings = Settings::default();
+        let mut state = FormState::new_group_add(&settings, &[]);
+
+        if let FormState::GroupAdd(f) = &mut state {
+            f.fields[FIELD_NAME] = "my-group".into();
+            f.fields[FIELD_HOST] = "10.0.1.5".into();
+            f.sessions[0].name = "session-1".into();
+            // Escape sequence in on_connect should be rejected
+            f.sessions[0].on_connect = Some("\x1b[31mred\x1b[0m".into());
+        }
+
+        let result = state.validate_and_build_group(&config);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("escape"));
+    }
+
+    #[test]
+    fn test_form_state_validate_and_build_group_on_connect_too_long() {
+        let config = AppConfig::default();
+        let settings = Settings::default();
+        let mut state = FormState::new_group_add(&settings, &[]);
+
+        if let FormState::GroupAdd(f) = &mut state {
+            f.fields[FIELD_NAME] = "my-group".into();
+            f.fields[FIELD_HOST] = "10.0.1.5".into();
+            f.sessions[0].name = "session-1".into();
+            // on_connect exceeding 1024 bytes should be rejected
+            f.sessions[0].on_connect = Some("x".repeat(1025));
+        }
+
+        let result = state.validate_and_build_group(&config);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("maximum length"));
     }
 
     #[test]

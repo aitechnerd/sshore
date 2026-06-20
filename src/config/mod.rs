@@ -228,7 +228,7 @@ fn validate_profiles(profiles: &[Profile]) -> Result<()> {
 /// the local terminal, and enforces a maximum length to prevent abuse.
 /// Legitimate shell metacharacters (`;`, `|`, `&&`) are allowed — the command
 /// runs remotely.
-fn validate_on_connect(cmd: &str, context: &str) -> Result<()> {
+pub(crate) fn validate_on_connect(cmd: &str, context: &str) -> Result<()> {
     if cmd.len() > MAX_ON_CONNECT_LEN {
         anyhow::bail!(
             "{} on_connect command exceeds maximum length of {} bytes (actual: {} bytes)",

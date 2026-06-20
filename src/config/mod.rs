@@ -24,17 +24,25 @@ use crate::config::writer::atomic_write;
 
 /// Return the XDG-compliant config file path.
 ///
-/// Return the sshore config directory.
-/// - Linux/macOS: ~/.config/sshore/
-/// - Windows: %APPDATA%\sshore\
+/// Uses a separate directory for debug builds to avoid overwriting
+/// production data during development.
+///
+/// - Debug (dev):  `~/.config/sshore-dev/` (Linux) / `~/Library/Application Support/sshore-dev/` (macOS)
+/// - Release:      `~/.config/sshore/` (Linux) / `~/Library/Application Support/sshore/` (macOS)
+/// - Windows:      `%APPDATA%/sshore-dev/` (debug) / `%APPDATA%/sshore/` (release)
 pub fn config_dir() -> PathBuf {
     let base = dirs::config_dir().unwrap_or_else(|| PathBuf::from(".config"));
-    base.join("sshore")
+    let dir_name = if cfg!(debug_assertions) {
+        "sshore-dev"
+    } else {
+        "sshore"
+    };
+    base.join(dir_name)
 }
 
 /// Return the default config file path.
-/// - Linux/macOS: ~/.config/sshore/config.toml
-/// - Windows: %APPDATA%\sshore\config.toml
+/// - Debug: `~/.config/sshore-dev/config.toml` (Linux) / `~/Library/Application Support/sshore-dev/config.toml` (macOS)
+/// - Release: `~/.config/sshore/config.toml` (Linux) / `~/Library/Application Support/sshore/config.toml` (macOS)
 pub fn config_path() -> PathBuf {
     config_dir().join("config.toml")
 }

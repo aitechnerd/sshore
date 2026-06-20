@@ -26,7 +26,7 @@ use crate::ssh;
 use crate::tui::theme::{ThemeColors, resolve_theme};
 use crate::tui::views::browser::truncate_name;
 use crate::tui::views::confirm::{ConfirmState, ConfirmTarget};
-use crate::tui::views::form::{FIELD_ENV, FIELD_HOST, FIELD_NAME, FIELD_PORT, FIELD_PROFILE, FormState};
+use crate::tui::views::form::{FIELD_ENV, FIELD_PROFILE, FormState};
 use crate::tui::views::{confirm, form, help, import_wizard, list};
 use crate::tui::widgets::{search_bar, status_bar};
 
@@ -1483,6 +1483,7 @@ fn jump_to_end(app: &mut App) {
 mod tests {
     use super::*;
     use crate::config::model::{Bookmark, BookmarkGroup, Session, Settings};
+    use crate::tui::views::form::{FIELD_HOST, FIELD_NAME, FIELD_PORT};
 
     fn sample_bookmark(name: &str, env: &str) -> Bookmark {
         Bookmark {

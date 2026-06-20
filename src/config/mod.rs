@@ -25,12 +25,18 @@ use crate::config::writer::atomic_write;
 /// Return the XDG-compliant config file path.
 ///
 /// Uses a separate directory for debug builds to avoid overwriting
-/// production data during development.
+/// production data during development. Can be overridden via the
+/// `SSHORE_CONFIG_DIR` environment variable.
 ///
+/// - `SSHORE_CONFIG_DIR` env var: uses that path directly
 /// - Debug (dev):  `~/.config/sshore-dev/` (Linux) / `~/Library/Application Support/sshore-dev/` (macOS)
 /// - Release:      `~/.config/sshore/` (Linux) / `~/Library/Application Support/sshore/` (macOS)
 /// - Windows:      `%APPDATA%/sshore-dev/` (debug) / `%APPDATA%/sshore/` (release)
 pub fn config_dir() -> PathBuf {
+    // Allow override via environment variable
+    if let Ok(dir) = std::env::var("SSHORE_CONFIG_DIR") {
+        return PathBuf::from(shellexpand::tilde(&dir).to_string());
+    }
     let base = dirs::config_dir().unwrap_or_else(|| PathBuf::from(".config"));
     let dir_name = if cfg!(debug_assertions) {
         "sshore-dev"

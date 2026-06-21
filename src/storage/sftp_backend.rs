@@ -26,6 +26,15 @@ pub struct SftpBackend {
     bookmark_index: Option<usize>,
 }
 
+/// Ensure a path is absolute (starts with /).
+fn ensure_absolute(path: &str) -> String {
+    if path.starts_with('/') {
+        path.to_string()
+    } else {
+        format!("/{}", path)
+    }
+}
+
 impl SftpBackend {
     /// Create a new SFTP backend connected to a bookmark.
     pub async fn new(config: &AppConfig, bookmark_index: usize) -> Result<Self> {
@@ -46,10 +55,10 @@ impl SftpBackend {
             .await
             .context("Failed to initialize SFTP session")?;
 
-        let cwd = sftp
+        let cwd = ensure_absolute(&sftp
             .canonicalize(".")
             .await
-            .unwrap_or_else(|_| "/".to_string());
+            .unwrap_or_else(|_| "/".to_string()));
 
         let display_name = format!("{} (SFTP)", bookmark.name);
 

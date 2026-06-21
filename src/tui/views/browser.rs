@@ -3673,20 +3673,26 @@ fn spawn_worker(
 }
 
 /// Create a directory and all missing parent directories on a remote SFTP server
-/// (like `mkdir -p`). Ignores "already exists" errors.
-async fn sftp_mkdir_all(sftp: &SftpSession, path: &str) {
+/// (like `mkdir -p`). Returns the first error encountered (if any).
+async fn sftp_mkdir_all(sftp: &RawSftpSession, path: &str) -> Option<String> {
+    // Ensure path is absolute (prepend / if missing)
+    let path = if path.starts_with('/') { path.to_string() } else { format!("/{}", path) };
     let mut current = String::new();
+    let mut first_error: Option<String> = None;
     for component in path.split('/') {
         if component.is_empty() {
             continue;
         }
-        if !current.is_empty() {
-            current.push('/');
-        }
+        current.push('/');
         current.push_str(component);
-        // Ignore errors - directory may already exist
-        let _ = sftp.create_dir(&current).await;
+        if let Err(e) = sftp.mkdir(&current, russh_sftp::protocol::FileAttributes::default()).await {
+            // Capture first error for reporting, but continue (mkdir -p style)
+            if first_error.is_none() {
+                first_error = Some(format!("{}: {}", current, e));
+            }
+        }
     }
+    first_error
 }
 
 /// Run a file transfer using a dynamic pool of pipelined SFTP workers.
@@ -3764,34 +3770,32 @@ async fn run_background_transfer(
     );
 
     // Create directories sequentially first (order matters for nested dirs)
-    let mkdir_start = std::time::Instant::now();
-    for dir_target in &dir_targets {
-        if cancel.load(Ordering::Relaxed) {
-            return TransferResult {
-                copied: 0,
-                total: file_targets.len(),
-                last_error: None,
-            };
-        }
-        let result = match direction {
-            TransferDirection::LocalToRemote => {
-                sftp_mkdir_all(&scan_sftp, &dir_target.dst_path).await;
-                Ok(())
+    // For LocalToRemote, skip upfront mkdir - workers create parent dirs on-demand
+    // to avoid stalling the entire transfer if one mkdir fails.
+    if direction == TransferDirection::RemoteToLocal {
+        let mkdir_start = std::time::Instant::now();
+        for dir_target in &dir_targets {
+            if cancel.load(Ordering::Relaxed) {
+                return TransferResult {
+                    copied: 0,
+                    total: file_targets.len(),
+                    last_error: None,
+                };
             }
-            TransferDirection::RemoteToLocal => tokio::fs::create_dir_all(&dir_target.dst_path)
+            let result = tokio::fs::create_dir_all(&dir_target.dst_path)
                 .await
-                .with_context(|| format!("Failed to create local dir: {}", dir_target.dst_path)),
-        };
-        if let Err(e) = result {
-            tracing::error!("mkdir failed: {}: {e:#}", dir_target.dst_path);
+                .with_context(|| format!("Failed to create local dir: {}", dir_target.dst_path));
+            if let Err(e) = result {
+                tracing::error!("mkdir failed: {}: {e:#}", dir_target.dst_path);
+            }
         }
-    }
-    if !dir_targets.is_empty() {
-        tracing::debug!(
-            "transfer:mkdir {} dirs in {}ms",
-            dir_targets.len(),
-            mkdir_start.elapsed().as_millis(),
-        );
+        if !dir_targets.is_empty() {
+            tracing::debug!(
+                "transfer:mkdir {} dirs in {}ms",
+                dir_targets.len(),
+                mkdir_start.elapsed().as_millis(),
+            );
+        }
     }
 
     // Drop scan session — frees its SSH channel and mlocked buffers before
@@ -4159,6 +4163,7 @@ async fn run_file_transfer(
 }
 
 /// Open the SFTP file handle for a target (read for download, write for upload).
+/// For LocalToRemote, creates parent directories on-demand before opening the file.
 async fn open_target_handle(
     raw: &RawSftpSession,
     target: &TransferTarget,
@@ -4166,7 +4171,16 @@ async fn open_target_handle(
 ) -> Result<Arc<str>> {
     match direction {
         TransferDirection::RemoteToLocal => pipeline::open_read(raw, &target.src_path).await,
-        TransferDirection::LocalToRemote => pipeline::open_write(raw, &target.dst_path).await,
+        TransferDirection::LocalToRemote => {
+            // Create parent directory on-demand (mkdir -p style)
+            if let Some(parent) = std::path::Path::new(&target.dst_path).parent() {
+                let parent = parent.to_string_lossy();
+                if !parent.is_empty() {
+                    let _ = sftp_mkdir_all(raw, &parent).await;
+                }
+            }
+            pipeline::open_write(raw, &target.dst_path).await
+        }
     }
 }
 
@@ -4253,12 +4267,17 @@ async fn start_copy_transfer(
 
             let transfer_targets: Vec<TransferTarget> = targets
                 .iter()
-                .map(|(src, name, is_dir, size)| TransferTarget {
-                    src_path: src.clone(),
-                    dst_path: format!("{}/{}", dst_cwd.trim_end_matches('/'), name),
-                    name: name.clone(),
-                    size: *size,
-                    is_dir: *is_dir,
+                .map(|(src, name, is_dir, size)| {
+                    let cwd = dst_cwd.trim_end_matches('/');
+                    // Ensure absolute path for SFTP (prepend / if missing)
+                    let base = if cwd.starts_with('/') { cwd.to_string() } else { format!("/{}", cwd) };
+                    TransferTarget {
+                        src_path: src.clone(),
+                        dst_path: format!("{}/{}", base, name),
+                        name: name.clone(),
+                        size: *size,
+                        is_dir: *is_dir,
+                    }
                 })
                 .collect();
 

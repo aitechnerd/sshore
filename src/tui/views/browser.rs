@@ -3672,6 +3672,23 @@ fn spawn_worker(
     })
 }
 
+/// Create a directory and all missing parent directories on a remote SFTP server
+/// (like `mkdir -p`). Ignores "already exists" errors.
+async fn sftp_mkdir_all(sftp: &SftpSession, path: &str) {
+    let mut current = String::new();
+    for component in path.split('/') {
+        if component.is_empty() {
+            continue;
+        }
+        if !current.is_empty() {
+            current.push('/');
+        }
+        current.push_str(component);
+        // Ignore errors - directory may already exist
+        let _ = sftp.create_dir(&current).await;
+    }
+}
+
 /// Run a file transfer using a dynamic pool of pipelined SFTP workers.
 /// `scan_sftp` is used for directory scanning/mkdir; `initial_workers` start immediately.
 /// Extra workers arriving on `extra_workers_rx` are added to the pool on the fly
@@ -3757,10 +3774,10 @@ async fn run_background_transfer(
             };
         }
         let result = match direction {
-            TransferDirection::LocalToRemote => scan_sftp
-                .create_dir(&dir_target.dst_path)
-                .await
-                .with_context(|| format!("Failed to create remote dir: {}", dir_target.dst_path)),
+            TransferDirection::LocalToRemote => {
+                sftp_mkdir_all(&scan_sftp, &dir_target.dst_path).await;
+                Ok(())
+            }
             TransferDirection::RemoteToLocal => tokio::fs::create_dir_all(&dir_target.dst_path)
                 .await
                 .with_context(|| format!("Failed to create local dir: {}", dir_target.dst_path)),

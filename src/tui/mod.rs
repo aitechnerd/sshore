@@ -42,7 +42,8 @@ const TICK_RATE_IDLE: Duration = Duration::from_secs(1);
 
 /// If `event::poll()` returns this many times in a row faster than the requested
 /// timeout (i.e. the fd is in a POLLHUP/error state), assume the terminal is gone.
-const RAPID_POLL_LIMIT: u32 = 10;
+/// Raised from 10 to 100 to avoid false positives on some Mac terminals.
+const RAPID_POLL_LIMIT: u32 = 100;
 
 /// Threshold: if a poll that requested ≥100ms returns in under this duration,
 /// it counts as suspiciously fast (broken fd returning immediately).

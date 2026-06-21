@@ -3102,6 +3102,8 @@ struct WorkerPool {
     session_dead: Arc<AtomicBool>,
     /// If true, delete each source file immediately after successful transfer (move).
     is_move: bool,
+    /// Cache of directories already created on remote (avoids redundant mkdir calls).
+    created_dirs: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
 }
 
 /// Receive the next work item from the shared queue, handling overwrite checks.
@@ -3381,7 +3383,7 @@ fn spawn_worker(
             let open_start = std::time::Instant::now();
             let handle_str = match file_handle {
                 Some(h) => h,
-                None => match open_target_handle(&raw, &target, pool.direction).await {
+                None => match open_target_handle(&raw, &target, pool.direction, &pool.created_dirs).await {
                     Ok(h) => h,
                     Err(e) => {
                         // If the session is dead, stop the worker entirely.
@@ -3463,6 +3465,7 @@ fn spawn_worker(
                             &prefetch_raw,
                             &next_target,
                             prefetch_pool.direction,
+                            &prefetch_pool.created_dirs,
                         )
                         .await
                         {
@@ -3674,22 +3677,51 @@ fn spawn_worker(
 
 /// Create a directory and all missing parent directories on a remote SFTP server
 /// (like `mkdir -p`). Returns the first error encountered (if any).
-async fn sftp_mkdir_all(sftp: &RawSftpSession, path: &str) -> Option<String> {
+/// Uses `created_dirs` cache to avoid redundant mkdir calls for the same path.
+async fn sftp_mkdir_all(
+    sftp: &RawSftpSession,
+    path: &str,
+    created_dirs: &std::sync::Mutex<std::collections::HashSet<String>>,
+) -> Option<String> {
     // Ensure path is absolute (prepend / if missing)
     let path = if path.starts_with('/') { path.to_string() } else { format!("/{}", path) };
+    // Check if we already created this exact path
+    {
+        let dirs = created_dirs.lock().unwrap();
+        if dirs.contains(&path) {
+            return None;
+        }
+    }
     let mut current = String::new();
     let mut first_error: Option<String> = None;
+    let mut new_dirs = Vec::new();
     for component in path.split('/') {
         if component.is_empty() {
             continue;
         }
         current.push('/');
         current.push_str(component);
+        // Skip if already created
+        if created_dirs.lock().unwrap().contains(&current) {
+            continue;
+        }
         if let Err(e) = sftp.mkdir(&current, russh_sftp::protocol::FileAttributes::default()).await {
             // Capture first error for reporting, but continue (mkdir -p style)
             if first_error.is_none() {
                 first_error = Some(format!("{}: {}", current, e));
             }
+        } else {
+            new_dirs.push(current.clone());
+        }
+    }
+    // Record successfully created dirs
+    if new_dirs.is_empty() {
+        // Even if all failed, record the path to avoid retrying
+        created_dirs.lock().unwrap().insert(path);
+    } else {
+        let mut dirs = created_dirs.lock().unwrap();
+        for d in new_dirs {
+            dirs.insert(d);
         }
     }
     first_error
@@ -3839,6 +3871,7 @@ async fn run_background_transfer(
         overwrite_policy,
         session_dead: Arc::new(AtomicBool::new(false)),
         is_move,
+        created_dirs: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
     });
 
     // Track which sessions already have a heartbeat task (one per unique RawSftpSession).
@@ -4168,15 +4201,16 @@ async fn open_target_handle(
     raw: &RawSftpSession,
     target: &TransferTarget,
     direction: TransferDirection,
+    created_dirs: &std::sync::Mutex<std::collections::HashSet<String>>,
 ) -> Result<Arc<str>> {
     match direction {
         TransferDirection::RemoteToLocal => pipeline::open_read(raw, &target.src_path).await,
         TransferDirection::LocalToRemote => {
-            // Create parent directory on-demand (mkdir -p style)
+            // Create parent directory on-demand (mkdir -p style), using cache to avoid redundant calls
             if let Some(parent) = std::path::Path::new(&target.dst_path).parent() {
                 let parent = parent.to_string_lossy();
                 if !parent.is_empty() {
-                    let _ = sftp_mkdir_all(raw, &parent).await;
+                    let _ = sftp_mkdir_all(raw, &parent, created_dirs).await;
                 }
             }
             pipeline::open_write(raw, &target.dst_path).await

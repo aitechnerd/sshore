@@ -528,10 +528,11 @@ fn event_loop(
 
         // Detect broken terminal: when the fd is in POLLHUP/error state,
         // poll() returns immediately regardless of the requested timeout.
-        // A legitimate key/resize event resets the counter.
+        // Only count rapid polls when there was NO event (legitimate input resets counter).
         // Can be disabled via SSHORE_NO_POLL_CHECK=1 (e.g. for problematic terminals).
         let poll_check_disabled = std::env::var("SSHORE_NO_POLL_CHECK").is_ok();
         if !poll_check_disabled
+            && !has_event
             && poll_timeout >= TICK_RATE_ACTIVE
             && before_poll.elapsed() < RAPID_POLL_THRESHOLD
         {

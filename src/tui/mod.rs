@@ -502,9 +502,8 @@ fn event_loop(
         // internally calls read() on stdin, which can block forever when the
         // terminal is closed (POLLHUP state). Our libc::poll() has a bounded
         // timeout and checks for POLLHUP/POLLERR directly.
-        let has_event = poll_stdin(poll_timeout);
-
         let before_poll = Instant::now();
+        let has_event = poll_stdin(poll_timeout);
 
         if has_event {
             match event::read() {

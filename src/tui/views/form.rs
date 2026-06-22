@@ -1390,18 +1390,13 @@ pub fn render_form(
 ) {
     match state {
         FormState::Add(f) | FormState::Edit(_, _, f) => {
-            if f.is_group() {
-                // For group mode: render with sessions section
-                render_group_form_unified(frame, area, f, settings, tc);
-            } else {
-                // For bookmark mode: render without sessions section
-                render_bookmark_form(frame, area, f as &dyn FormFields, false, settings, tc);
-            }
+            render_unified_form(frame, area, f, settings, tc);
         }
     }
+}
 
-/// Render a unified form in group mode (with sessions section).
-fn render_group_form_unified(
+/// Render the unified form (handles both bookmark and group mode).
+fn render_unified_form(
     frame: &mut Frame,
     area: Rect,
     form: &UnifiedForm,
@@ -1411,10 +1406,18 @@ fn render_group_form_unified(
     let popup = centered_rect(70, 90, area);
     frame.render_widget(Clear, popup);
 
-    let title = if form.is_edit {
-        " Edit Connection "
+    // Title with mode indicator
+    let mode_suffix = if form.is_group() {
+        let count = form.sessions.len();
+        let label = if count == 1 { "session" } else { "sessions" };
+        format!(" ({count} {label})")
     } else {
-        " Add Connection "
+        String::new()
+    };
+    let title = if form.is_edit {
+        format!(" Edit Connection{mode_suffix} ")
+    } else {
+        format!(" Add Connection{mode_suffix} ")
     };
 
     let block = Block::default()
@@ -1427,25 +1430,30 @@ fn render_group_form_unified(
     let inner = block.inner(popup);
     frame.render_widget(block, popup);
 
-    // Layout: fields (all 12 including password) + sessions header + session lines + error + spacer + hints
-    let visible_fields = FIELD_COUNT; // All fields including password
-    let session_line_count = form.sessions.len();
+    // Build layout constraints
+    let mut constraints: Vec<Constraint> = Vec::new();
 
-    let mut constraints: Vec<Constraint> = Vec::with_capacity(visible_fields + 1 + session_line_count * 2 + 3);
-    // Fields
-    for _ in 0..visible_fields {
+    // All 12 fields
+    for _ in 0..FIELD_COUNT {
         constraints.push(Constraint::Length(2));
     }
-    // Sessions header
-    constraints.push(Constraint::Length(1));
-    // Session lines
-    for _ in 0..session_line_count {
-        constraints.push(Constraint::Length(2));
+
+    // Sessions section (only when expanded and has sessions)
+    if !form.sessions_collapsed && !form.sessions.is_empty() {
+        // Sessions header
+        constraints.push(Constraint::Length(1));
+        // Session lines (2 per session: name + command)
+        for _ in 0..form.sessions.len() {
+            constraints.push(Constraint::Length(2));
+        }
     }
+
     // Error
     if form.error.is_some() {
         constraints.push(Constraint::Length(1));
     }
+
+    // Spacer + hints
     constraints.push(Constraint::Min(0));
     constraints.push(Constraint::Length(1));
 
@@ -1468,66 +1476,67 @@ fn render_group_form_unified(
     ];
 
     let mut chunk_idx = 0;
+
+    // Render all fields
     for (label, field_idx) in &field_labels {
         render_field(frame, chunks[chunk_idx], label, *field_idx, form as &dyn FormFields, false, settings, tc);
         chunk_idx += 1;
     }
 
-    // Sessions header: " Sessions (N) "
-    let count = form.sessions.len();
-    let label = if count == 1 {
-        "Session".to_string()
-    } else {
-        "Sessions".to_string()
-    };
-    let line = Line::from(Span::styled(
-        format!(" ── {label} ({count}) ──"),
-        Style::default().fg(tc.accent).add_modifier(Modifier::BOLD),
-    ));
-    frame.render_widget(Paragraph::new(line), chunks[chunk_idx]);
-    chunk_idx += 1;
-
-    // Session lines
-    for (i, session) in form.sessions.iter().enumerate() {
-        let is_current = i == form.session_cursor;
-        let prefix = if is_current { "  > " } else { "    " };
-        let cursor = if is_current { "_" } else { "" };
-
-        let name_style = if is_current {
-            Style::default().fg(tc.accent).add_modifier(Modifier::BOLD)
-        } else {
-            Style::default().fg(tc.fg)
-        };
-        let cmd_style = if is_current {
-            Style::default().fg(tc.fg)
-        } else {
-            Style::default().fg(tc.fg_muted)
-        };
-
-        let name_display = if session.name.is_empty() {
-            "(unnamed)".to_string()
-        } else {
-            session.name.clone()
-        };
-
-        let on_connect_display = session.on_connect.as_deref().unwrap_or("(no command)");
-
-        // Name line
-        let name_line = Line::from(vec![
-            Span::raw(format!("{}{}: ", prefix, i + 1)),
-            Span::styled(name_display, name_style),
-            Span::styled(cursor, name_style),
-        ]);
-        frame.render_widget(Paragraph::new(name_line), chunks[chunk_idx]);
+    // Render sessions section if expanded and has sessions
+    if !form.sessions_collapsed && !form.sessions.is_empty() {
+        // Sessions header
+        let count = form.sessions.len();
+        let label = if count == 1 { "Session" } else { "Sessions" };
+        let header = Line::from(Span::styled(
+            format!(" ── {label} ({count}) ──"),
+            Style::default().fg(tc.accent).add_modifier(Modifier::BOLD),
+        ));
+        frame.render_widget(Paragraph::new(header), chunks[chunk_idx]);
         chunk_idx += 1;
 
-        // Command line
-        let cmd_line = Line::from(vec![
-            Span::raw("     "),
-            Span::styled(format!("cmd: {}", on_connect_display), cmd_style),
-        ]);
-        frame.render_widget(Paragraph::new(cmd_line), chunks[chunk_idx]);
-        chunk_idx += 1;
+        // Session lines
+        for (i, session) in form.sessions.iter().enumerate() {
+            let is_current = i == form.session_cursor;
+            let prefix = if is_current { "  > " } else { "    " };
+            let cursor = if is_current { "_" } else { "" };
+
+            let name_style = if is_current {
+                Style::default().fg(tc.accent).add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(tc.fg)
+            };
+            let cmd_style = if is_current {
+                Style::default().fg(tc.fg)
+            } else {
+                Style::default().fg(tc.fg_muted)
+            };
+
+            let name_display = if session.name.is_empty() {
+                "(unnamed)".to_string()
+            } else {
+                session.name.clone()
+            };
+
+            let on_connect_display = session.on_connect.as_deref().unwrap_or("(no command)");
+
+            // Name line
+            let name_line = Line::from(vec![
+                Span::raw(format!("{}{}: ", prefix, i + 1)),
+                Span::styled(name_display, name_style),
+                Span::styled(cursor, name_style),
+            ]);
+            frame.render_widget(Paragraph::new(name_line), chunks[chunk_idx]);
+            chunk_idx += 1;
+
+            // Command line
+            let cmd_line = Line::from(vec![
+                Span::raw("     "),
+                Span::styled(format!("cmd: {}", on_connect_display), cmd_style),
+            ]);
+            frame.render_widget(Paragraph::new(cmd_line), chunks[chunk_idx]);
+            chunk_idx += 1;
+        }
     }
 
     // Error message
@@ -1545,7 +1554,7 @@ fn render_group_form_unified(
     // Skip spacer
     chunk_idx += 1;
 
-    // Hints line (with session hints)
+    // Hints line
     let hints = Line::from(vec![
         Span::styled(
             " Tab/\u{2193} ",
@@ -1599,7 +1608,6 @@ fn render_group_form_unified(
     if chunk_idx < chunks.len() {
         frame.render_widget(Paragraph::new(hints), chunks[chunk_idx]);
     }
-}
 }
 
 /// Render a group form with fields + session lines section.
@@ -2395,6 +2403,54 @@ mod tests {
         } else {
             panic!("Expected Edit variant with Group target");
         }
+    }
+
+    #[test]
+    fn test_unified_form_sessions_collapsed_default() {
+        // new_add starts with sessions collapsed
+        let settings = Settings::default();
+        let form = UnifiedForm::new_add(&settings, &[]);
+        assert!(form.sessions_collapsed);
+        assert!(form.sessions.is_empty());
+    }
+
+    #[test]
+    fn test_unified_form_add_session_expands() {
+        let settings = Settings::default();
+        let mut form = UnifiedForm::new_add(&settings, &[]);
+        assert!(form.sessions_collapsed);
+
+        form.add_session_line();
+        assert!(!form.sessions_collapsed);
+        assert_eq!(form.sessions.len(), 1);
+    }
+
+    #[test]
+    fn test_unified_form_remove_last_session_collapses() {
+        let settings = Settings::default();
+        let mut form = UnifiedForm::new_add(&settings, &[]);
+        form.add_session_line();
+        assert!(!form.sessions_collapsed);
+
+        form.remove_session_line();
+        assert!(form.sessions_collapsed);
+        assert!(form.sessions.is_empty());
+    }
+
+    #[test]
+    fn test_unified_form_is_group_transitions() {
+        let settings = Settings::default();
+        let mut form = UnifiedForm::new_add(&settings, &[]);
+        assert!(form.is_bookmark());
+        assert!(!form.is_group());
+
+        form.add_session_line();
+        assert!(!form.is_bookmark());
+        assert!(form.is_group());
+
+        form.remove_session_line();
+        assert!(form.is_bookmark());
+        assert!(!form.is_group());
     }
 
     // ─── BookmarkForm tests ───

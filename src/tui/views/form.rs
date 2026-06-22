@@ -48,6 +48,57 @@ const FIELD_ON_CONNECT: usize = 9;
 const FIELD_PASSWORD: usize = 10;
 pub(crate) const FIELD_PROFILE: usize = 11;
 
+/// Target type for editing: a bookmark or a group.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum EditTarget {
+    Bookmark,
+    Group,
+}
+
+/// Trait for items that can be edited in the form.
+/// Allows passing either a Bookmark or BookmarkGroup to FormState::new_edit.
+pub(crate) trait EditableItem {
+    fn as_bookmark(&self) -> Option<&Bookmark>;
+    fn as_group(&self) -> Option<&BookmarkGroup>;
+}
+
+impl EditableItem for Bookmark {
+    fn as_bookmark(&self) -> Option<&Bookmark> { Some(self) }
+    fn as_group(&self) -> Option<&BookmarkGroup> { None }
+}
+
+impl EditableItem for BookmarkGroup {
+    fn as_bookmark(&self) -> Option<&Bookmark> { None }
+    fn as_group(&self) -> Option<&BookmarkGroup> { Some(self) }
+}
+
+/// Form fields for the unified bookmark/group form.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UnifiedForm {
+    pub fields: [String; FIELD_COUNT],
+    pub focused: usize,
+    pub env_index: usize,
+    /// Index into `profile_options` for the profile cycle selector.
+    pub profile_index: usize,
+    /// Dynamic list of profile options: ["(none)", "profile-a", "profile-b", ...].
+    pub profile_options: Vec<String>,
+    pub is_edit: bool,
+    /// Original name (for edit mode uniqueness check).
+    pub original_name: Option<String>,
+    /// Validation error to display.
+    pub error: Option<String>,
+    /// Whether a password is already stored in the keychain.
+    pub has_stored_password: bool,
+    /// Whether the user has modified the password field (typed or deleted chars).
+    pub password_modified: bool,
+    /// Session lines for this connection (groups have >= 1, bookmarks have 0).
+    pub sessions: Vec<Session>,
+    /// Current session line being edited.
+    pub session_cursor: usize,
+    /// Whether the sessions section is collapsed in the UI.
+    pub sessions_collapsed: bool,
+}
+
 /// Form fields for bookmark add/edit.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BookmarkForm {
@@ -88,17 +139,13 @@ pub struct GroupForm {
     pub session_cursor: usize,
 }
 
-/// Form state enum covering bookmark and group forms.
+/// Form state enum covering the unified form.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum FormState {
-    /// Adding a new bookmark.
-    Add(BookmarkForm),
-    /// Editing an existing bookmark at the given index.
-    Edit(usize, BookmarkForm),
-    /// Adding a new group.
-    GroupAdd(GroupForm),
-    /// Editing an existing group at the given index.
-    GroupEdit(usize, GroupForm),
+    /// Adding a new connection (bookmark or group, determined by sessions count).
+    Add(UnifiedForm),
+    /// Editing an existing entry (bookmark or group, determined by EditTarget).
+    Edit(usize, EditTarget, UnifiedForm),
 }
 
 // ─── BookmarkForm impl ───────────────────────────────────────────────
@@ -359,6 +406,437 @@ impl BookmarkForm {
             connect_timeout_secs: None,
             ssh_options: std::collections::BTreeMap::new(),
             profile,
+        })
+    }
+}
+
+// ─── UnifiedForm impl ─────────────────────────────────────────────────
+
+impl UnifiedForm {
+    /// Create a blank form for adding a new connection.
+    pub fn new_add(settings: &Settings, profile_names: &[String]) -> Self {
+        let mut fields = std::array::from_fn(|_| String::new());
+        fields[FIELD_PORT] = "22".to_string();
+        if let Some(ref user) = settings.default_user {
+            fields[FIELD_USER] = user.clone();
+        }
+
+        let profile_options = build_profile_options(profile_names);
+
+        Self {
+            fields,
+            focused: FIELD_NAME,
+            env_index: 0,     // (none)
+            profile_index: 0, // (none)
+            profile_options,
+            is_edit: false,
+            original_name: None,
+            error: None,
+            has_stored_password: false,
+            password_modified: false,
+            sessions: vec![],
+            session_cursor: 0,
+            sessions_collapsed: true,
+        }
+    }
+
+    /// Create a pre-populated form for editing an existing bookmark.
+    pub fn new_edit_bookmark(bookmark: &Bookmark, profile_names: &[String]) -> Self {
+        let mut fields = std::array::from_fn(|_| String::new());
+        fields[FIELD_NAME] = bookmark.name.clone();
+        fields[FIELD_HOST] = bookmark.host.clone();
+        fields[FIELD_USER] = bookmark.user.clone().unwrap_or_default();
+        fields[FIELD_PORT] = bookmark.port.to_string();
+        fields[FIELD_TAGS] = bookmark.tags.join(", ");
+        fields[FIELD_IDENTITY] = bookmark.identity_file.clone().unwrap_or_default();
+        fields[FIELD_PROXY] = bookmark.proxy_jump.clone().unwrap_or_default();
+        fields[FIELD_NOTES] = bookmark.notes.clone().unwrap_or_default();
+        fields[FIELD_ON_CONNECT] = bookmark.on_connect.clone().unwrap_or_default();
+        // Password field starts empty — never load actual password into memory.
+
+        let env_index = ENV_OPTIONS
+            .iter()
+            .position(|&e| e == bookmark.env)
+            .unwrap_or(0);
+
+        let profile_options = build_profile_options(profile_names);
+
+        let profile_index = bookmark
+            .profile
+            .as_ref()
+            .and_then(|p| profile_options.iter().position(|opt| opt == p))
+            .unwrap_or(0);
+
+        let has_stored_password = keychain::get_password(&bookmark.name)
+            .unwrap_or(None)
+            .is_some();
+
+        Self {
+            fields,
+            focused: FIELD_NAME,
+            env_index,
+            profile_index,
+            profile_options,
+            is_edit: true,
+            original_name: Some(bookmark.name.clone()),
+            error: None,
+            has_stored_password,
+            password_modified: false,
+            sessions: vec![],
+            session_cursor: 0,
+            sessions_collapsed: true,
+        }
+    }
+
+    /// Create a pre-populated form for editing an existing group.
+    pub fn new_edit_group(group: &BookmarkGroup, profile_names: &[String]) -> Self {
+        let mut fields = std::array::from_fn(|_| String::new());
+        fields[FIELD_NAME] = group.name.clone();
+        fields[FIELD_HOST] = group.host.clone();
+        fields[FIELD_USER] = group.user.clone().unwrap_or_default();
+        fields[FIELD_PORT] = group.port.to_string();
+        fields[FIELD_TAGS] = group.tags.join(", ");
+        fields[FIELD_IDENTITY] = group.identity_file.clone().unwrap_or_default();
+        fields[FIELD_PROXY] = group.proxy_jump.clone().unwrap_or_default();
+        fields[FIELD_NOTES] = group.notes.clone().unwrap_or_default();
+        fields[FIELD_ON_CONNECT] = group.on_connect.clone().unwrap_or_default();
+
+        let env_index = ENV_OPTIONS
+            .iter()
+            .position(|&e| e == group.env)
+            .unwrap_or(0);
+
+        let profile_options = build_profile_options(profile_names);
+
+        let profile_index = group
+            .profile
+            .as_ref()
+            .and_then(|p| profile_options.iter().position(|opt| opt == p))
+            .unwrap_or(0);
+
+        let sessions = if group.sessions.is_empty() {
+            vec![Session::default()]
+        } else {
+            group.sessions.clone()
+        };
+
+        Self {
+            fields,
+            focused: FIELD_NAME,
+            env_index,
+            profile_index,
+            profile_options,
+            is_edit: true,
+            original_name: Some(group.name.clone()),
+            error: None,
+            has_stored_password: false,
+            password_modified: false,
+            sessions,
+            session_cursor: 0,
+            sessions_collapsed: false,
+        }
+    }
+
+    /// Move focus to the next field.
+    pub fn next_field(&mut self) {
+        if self.focused < FIELD_COUNT - 1 {
+            self.focused += 1;
+        }
+    }
+
+    /// Move focus to the previous field.
+    pub fn prev_field(&mut self) {
+        if self.focused > 0 {
+            self.focused -= 1;
+        }
+    }
+
+    /// Cycle environment selection forward.
+    pub fn cycle_env_right(&mut self) {
+        self.env_index = (self.env_index + 1) % ENV_OPTIONS.len();
+    }
+
+    /// Cycle environment selection backward.
+    pub fn cycle_env_left(&mut self) {
+        if self.env_index == 0 {
+            self.env_index = ENV_OPTIONS.len() - 1;
+        } else {
+            self.env_index -= 1;
+        }
+    }
+
+    /// Cycle profile selection forward.
+    pub fn cycle_profile_right(&mut self) {
+        if !self.profile_options.is_empty() {
+            self.profile_index = (self.profile_index + 1) % self.profile_options.len();
+        }
+    }
+
+    /// Cycle profile selection backward.
+    pub fn cycle_profile_left(&mut self) {
+        if !self.profile_options.is_empty() {
+            if self.profile_index == 0 {
+                self.profile_index = self.profile_options.len() - 1;
+            } else {
+                self.profile_index -= 1;
+            }
+        }
+    }
+
+    /// Get the selected profile name, or None if "(none)" is selected.
+    pub fn selected_profile(&self) -> Option<&str> {
+        if self.profile_index == 0 {
+            None
+        } else {
+            Some(&self.profile_options[self.profile_index])
+        }
+    }
+
+    /// Insert a character at the current field (except env and profile, which use cycling).
+    pub fn insert_char(&mut self, c: char) {
+        if self.focused == FIELD_ENV || self.focused == FIELD_PROFILE {
+            return;
+        }
+        self.fields[self.focused].push(c);
+        self.error = None;
+
+        if self.focused == FIELD_PASSWORD {
+            self.password_modified = true;
+        }
+
+        // Auto-detect env when name or host changes
+        if self.focused == FIELD_NAME || self.focused == FIELD_HOST {
+            self.auto_detect_env();
+        }
+    }
+
+    /// Delete last character from the current field.
+    pub fn delete_char(&mut self) {
+        if self.focused == FIELD_ENV || self.focused == FIELD_PROFILE {
+            return;
+        }
+        self.fields[self.focused].pop();
+        self.error = None;
+
+        if self.focused == FIELD_PASSWORD {
+            self.password_modified = true;
+        }
+
+        if self.focused == FIELD_NAME || self.focused == FIELD_HOST {
+            self.auto_detect_env();
+        }
+    }
+
+    /// Auto-detect environment from name and host, updating env_index.
+    fn auto_detect_env(&mut self) {
+        let detected = detect_env(&self.fields[FIELD_NAME], &self.fields[FIELD_HOST]);
+        if let Some(idx) = ENV_OPTIONS.iter().position(|&e| e == detected) {
+            self.env_index = idx;
+        }
+    }
+
+    /// Get the selected environment string.
+    pub fn selected_env(&self) -> &str {
+        ENV_OPTIONS[self.env_index]
+    }
+
+    /// Get the password field value.
+    pub fn password(&self) -> &str {
+        &self.fields[FIELD_PASSWORD]
+    }
+
+    /// Add a new empty session line after the current cursor position.
+    /// Expands the sessions section if this is the first session.
+    pub fn add_session_line(&mut self) {
+        let insert_at = self.session_cursor + 1;
+        self.sessions.insert(
+            insert_at.min(self.sessions.len()),
+            Session::default(),
+        );
+        self.session_cursor = insert_at.min(self.sessions.len() - 1);
+        self.sessions_collapsed = false;
+    }
+
+    /// Remove the current session line.
+    /// Collapses the sessions section if this was the last session.
+    pub fn remove_session_line(&mut self) {
+        if !self.sessions.is_empty() {
+            self.sessions.remove(self.session_cursor);
+            if self.session_cursor >= self.sessions.len() {
+                self.session_cursor = self.sessions.len().saturating_sub(1);
+            }
+            if self.sessions.is_empty() {
+                self.sessions_collapsed = true;
+            }
+        }
+    }
+
+    /// Check if this form represents a group (has sessions) or bookmark (no sessions).
+    pub fn is_group(&self) -> bool {
+        !self.sessions.is_empty()
+    }
+
+    /// Check if this form represents a bookmark (no sessions).
+    pub fn is_bookmark(&self) -> bool {
+        self.sessions.is_empty()
+    }
+
+    /// Validate and build a Bookmark (when sessions is empty).
+    pub fn validate_and_build_bookmark(&mut self, config: &AppConfig) -> Result<Bookmark> {
+        self.error = None;
+
+        let name = self.fields[FIELD_NAME].trim().to_string();
+        let host = self.fields[FIELD_HOST].trim().to_string();
+
+        validate_bookmark_name(&name)?;
+
+        // Uniqueness check across both bookmarks and groups
+        let is_rename = self
+            .original_name
+            .as_ref()
+            .is_some_and(|orig| orig != &name);
+        if (!self.is_edit || is_rename) {
+            if config.bookmarks.iter().any(|b| b.name == name) {
+                anyhow::bail!("A bookmark named '{}' already exists", name);
+            }
+            if config.groups.iter().any(|g| g.name == name) {
+                anyhow::bail!("A group named '{}' already exists", name);
+            }
+        }
+
+        validate_hostname(&host)?;
+
+        let port: u16 = self.fields[FIELD_PORT]
+            .trim()
+            .parse()
+            .map_err(|_| anyhow::anyhow!("Port must be a number between 1 and 65535"))?;
+        if port == 0 {
+            anyhow::bail!("Port must be between 1 and 65535");
+        }
+
+        let tags: Vec<String> = self.fields[FIELD_TAGS]
+            .split(',')
+            .map(|t| t.trim().to_string())
+            .filter(|t| !t.is_empty())
+            .collect();
+
+        let identity_file = non_empty_option(&self.fields[FIELD_IDENTITY]);
+        if let Some(ref path_str) = identity_file {
+            let expanded = shellexpand::tilde(path_str).to_string();
+            if !Path::new(&expanded).exists() {
+                self.error = Some(format!("Warning: identity file not found: {expanded}"));
+            }
+        }
+
+        let user = non_empty_option(&self.fields[FIELD_USER]);
+        let proxy_jump = non_empty_option(&self.fields[FIELD_PROXY]);
+        let notes = non_empty_option(&self.fields[FIELD_NOTES]);
+        let on_connect = non_empty_option(&self.fields[FIELD_ON_CONNECT]);
+        let env = self.selected_env().to_string();
+        let profile = self.selected_profile().map(|s| s.to_string());
+
+        Ok(Bookmark {
+            name,
+            host,
+            user,
+            port,
+            env,
+            tags,
+            identity_file,
+            proxy_jump,
+            notes,
+            last_connected: None,
+            connect_count: 0,
+            on_connect,
+            on_connect_prompt_pattern: None,
+            snippets: vec![],
+            connect_timeout_secs: None,
+            ssh_options: std::collections::BTreeMap::new(),
+            profile,
+        })
+    }
+
+    /// Validate and build a BookmarkGroup (when sessions has entries).
+    pub fn validate_and_build_group(&mut self, config: &AppConfig) -> Result<BookmarkGroup> {
+        self.error = None;
+
+        let name = self.fields[FIELD_NAME].trim().to_string();
+        let host = self.fields[FIELD_HOST].trim().to_string();
+
+        validate_bookmark_name(&name)?;
+
+        // Uniqueness check across both bookmarks and groups
+        let is_rename = self
+            .original_name
+            .as_ref()
+            .is_some_and(|orig| orig != &name);
+        if (!self.is_edit || is_rename) {
+            if config.groups.iter().any(|g| g.name == name) {
+                anyhow::bail!("A group named '{}' already exists", name);
+            }
+            if config.bookmarks.iter().any(|b| b.name == name) {
+                anyhow::bail!("A bookmark named '{}' already exists", name);
+            }
+        }
+
+        validate_hostname(&host)?;
+
+        let port: u16 = self.fields[FIELD_PORT]
+            .trim()
+            .parse()
+            .map_err(|_| anyhow::anyhow!("Port must be a number between 1 and 65535"))?;
+        if port == 0 {
+            anyhow::bail!("Port must be between 1 and 65535");
+        }
+
+        // Validate session names are unique within the group
+        let mut session_names = std::collections::HashSet::new();
+        for session in &self.sessions {
+            let session_name = session.name.trim();
+            if session_name.is_empty() {
+                anyhow::bail!("Session name cannot be empty");
+            }
+            if !session_names.insert(session_name) {
+                anyhow::bail!("Duplicate session name '{}'", session_name);
+            }
+            if let Some(ref cmd) = session.on_connect {
+                validate_on_connect(
+                    cmd,
+                    &format!("Session '{}' in group '{}'", session_name, name),
+                )?;
+            }
+        }
+
+        let tags: Vec<String> = self.fields[FIELD_TAGS]
+            .split(',')
+            .map(|t| t.trim().to_string())
+            .filter(|t| !t.is_empty())
+            .collect();
+
+        let user = non_empty_option(&self.fields[FIELD_USER]);
+        let proxy_jump = non_empty_option(&self.fields[FIELD_PROXY]);
+        let notes = non_empty_option(&self.fields[FIELD_NOTES]);
+        let on_connect = non_empty_option(&self.fields[FIELD_ON_CONNECT]);
+        let env = self.selected_env().to_string();
+        let profile = self.selected_profile().map(|s| s.to_string());
+
+        Ok(BookmarkGroup {
+            name,
+            host,
+            user,
+            port,
+            env,
+            tags,
+            identity_file: non_empty_option(&self.fields[FIELD_IDENTITY]),
+            proxy_jump,
+            notes,
+            profile,
+            on_connect,
+            on_connect_prompt_pattern: None,
+            snippets: vec![],
+            connect_timeout_secs: None,
+            ssh_options: std::collections::BTreeMap::new(),
+            sessions: self.sessions.clone(),
         })
     }
 }
@@ -642,24 +1120,24 @@ impl GroupForm {
 impl FormState {
     // ── Constructors ──
 
-    /// Create a blank form for adding a new bookmark.
+    /// Create a blank form for adding a new connection (bookmark or group).
     pub fn new_add(settings: &Settings, profile_names: &[String]) -> Self {
-        Self::Add(BookmarkForm::new_add(settings, profile_names))
+        Self::Add(UnifiedForm::new_add(settings, profile_names))
     }
 
-    /// Create a pre-populated form for editing an existing bookmark.
-    pub fn new_edit(idx: usize, bookmark: &Bookmark, profile_names: &[String]) -> Self {
-        Self::Edit(idx, BookmarkForm::new_edit(bookmark, profile_names))
-    }
-
-    /// Create a blank form for adding a new group.
-    pub fn new_group_add(settings: &Settings, profile_names: &[String]) -> Self {
-        Self::GroupAdd(GroupForm::new_add(settings, profile_names))
-    }
-
-    /// Create a pre-populated form for editing an existing group.
-    pub fn new_group_edit(idx: usize, group: &BookmarkGroup, profile_names: &[String]) -> Self {
-        Self::GroupEdit(idx, GroupForm::new_edit(group, profile_names))
+    /// Create a pre-populated form for editing an existing entry.
+    /// For bookmarks, passes the bookmark and creates form with no sessions.
+    /// For groups, passes the group and pre-populates sessions.
+    pub fn new_edit(idx: usize, target: EditTarget, item: &dyn EditableItem, profile_names: &[String]) -> Self {
+        let form = match target {
+            EditTarget::Bookmark => {
+                UnifiedForm::new_edit_bookmark(item.as_bookmark().unwrap(), profile_names)
+            }
+            EditTarget::Group => {
+                UnifiedForm::new_edit_group(item.as_group().unwrap(), profile_names)
+            }
+        };
+        Self::Edit(idx, target, form)
     }
 
     // ── Shared navigation (delegated to inner form) ──
@@ -668,9 +1146,7 @@ impl FormState {
     pub fn next_field(&mut self) {
         match self {
             Self::Add(f) => f.next_field(),
-            Self::Edit(_, f) => f.next_field(),
-            Self::GroupAdd(f) => f.next_field(),
-            Self::GroupEdit(_, f) => f.next_field(),
+            Self::Edit(_, _, f) => f.next_field(),
         }
     }
 
@@ -678,9 +1154,7 @@ impl FormState {
     pub fn prev_field(&mut self) {
         match self {
             Self::Add(f) => f.prev_field(),
-            Self::Edit(_, f) => f.prev_field(),
-            Self::GroupAdd(f) => f.prev_field(),
-            Self::GroupEdit(_, f) => f.prev_field(),
+            Self::Edit(_, _, f) => f.prev_field(),
         }
     }
 
@@ -688,9 +1162,7 @@ impl FormState {
     pub fn focused(&self) -> usize {
         match self {
             Self::Add(f) => f.focused,
-            Self::Edit(_, f) => f.focused,
-            Self::GroupAdd(f) => f.focused,
-            Self::GroupEdit(_, f) => f.focused,
+            Self::Edit(_, _, f) => f.focused,
         }
     }
 
@@ -698,9 +1170,7 @@ impl FormState {
     pub fn cycle_env_right(&mut self) {
         match self {
             Self::Add(f) => f.cycle_env_right(),
-            Self::Edit(_, f) => f.cycle_env_right(),
-            Self::GroupAdd(f) => f.cycle_env_right(),
-            Self::GroupEdit(_, f) => f.cycle_env_right(),
+            Self::Edit(_, _, f) => f.cycle_env_right(),
         }
     }
 
@@ -708,9 +1178,7 @@ impl FormState {
     pub fn cycle_env_left(&mut self) {
         match self {
             Self::Add(f) => f.cycle_env_left(),
-            Self::Edit(_, f) => f.cycle_env_left(),
-            Self::GroupAdd(f) => f.cycle_env_left(),
-            Self::GroupEdit(_, f) => f.cycle_env_left(),
+            Self::Edit(_, _, f) => f.cycle_env_left(),
         }
     }
 
@@ -718,9 +1186,7 @@ impl FormState {
     pub fn cycle_profile_right(&mut self) {
         match self {
             Self::Add(f) => f.cycle_profile_right(),
-            Self::Edit(_, f) => f.cycle_profile_right(),
-            Self::GroupAdd(f) => f.cycle_profile_right(),
-            Self::GroupEdit(_, f) => f.cycle_profile_right(),
+            Self::Edit(_, _, f) => f.cycle_profile_right(),
         }
     }
 
@@ -728,9 +1194,7 @@ impl FormState {
     pub fn cycle_profile_left(&mut self) {
         match self {
             Self::Add(f) => f.cycle_profile_left(),
-            Self::Edit(_, f) => f.cycle_profile_left(),
-            Self::GroupAdd(f) => f.cycle_profile_left(),
-            Self::GroupEdit(_, f) => f.cycle_profile_left(),
+            Self::Edit(_, _, f) => f.cycle_profile_left(),
         }
     }
 
@@ -738,9 +1202,7 @@ impl FormState {
     pub fn insert_char(&mut self, c: char) {
         match self {
             Self::Add(f) => f.insert_char(c),
-            Self::Edit(_, f) => f.insert_char(c),
-            Self::GroupAdd(f) => f.insert_char(c),
-            Self::GroupEdit(_, f) => f.insert_char(c),
+            Self::Edit(_, _, f) => f.insert_char(c),
         }
     }
 
@@ -748,9 +1210,7 @@ impl FormState {
     pub fn delete_char(&mut self) {
         match self {
             Self::Add(f) => f.delete_char(),
-            Self::Edit(_, f) => f.delete_char(),
-            Self::GroupAdd(f) => f.delete_char(),
-            Self::GroupEdit(_, f) => f.delete_char(),
+            Self::Edit(_, _, f) => f.delete_char(),
         }
     }
 
@@ -758,9 +1218,7 @@ impl FormState {
     pub fn selected_env(&self) -> &str {
         match self {
             Self::Add(f) => f.selected_env(),
-            Self::Edit(_, f) => f.selected_env(),
-            Self::GroupAdd(f) => f.selected_env(),
-            Self::GroupEdit(_, f) => f.selected_env(),
+            Self::Edit(_, _, f) => f.selected_env(),
         }
     }
 
@@ -768,100 +1226,135 @@ impl FormState {
     pub fn error(&self) -> Option<&str> {
         match self {
             Self::Add(f) => f.error.as_deref(),
-            Self::Edit(_, f) => f.error.as_deref(),
-            Self::GroupAdd(f) => f.error.as_deref(),
-            Self::GroupEdit(_, f) => f.error.as_deref(),
+            Self::Edit(_, _, f) => f.error.as_deref(),
         }
     }
 
-    // ── Bookmark-only methods ──
-
-    /// Get the password field value (bookmark forms only).
+    /// Get the password field value.
     pub fn password(&self) -> &str {
         match self {
             Self::Add(f) => f.password(),
-            Self::Edit(_, f) => f.password(),
-            Self::GroupAdd(_) | Self::GroupEdit(_, _) => "",
+            Self::Edit(_, _, f) => f.password(),
         }
     }
 
-    /// Check if password was modified (bookmark forms only).
+    /// Check if password was modified.
     pub fn password_modified(&self) -> bool {
         match self {
             Self::Add(f) => f.password_modified,
-            Self::Edit(_, f) => f.password_modified,
-            Self::GroupAdd(_) | Self::GroupEdit(_, _) => false,
+            Self::Edit(_, _, f) => f.password_modified,
         }
     }
 
-    /// Check if there's a stored password (bookmark forms only).
+    /// Check if there's a stored password.
     pub fn has_stored_password(&self) -> bool {
         match self {
             Self::Add(f) => f.has_stored_password,
-            Self::Edit(_, f) => f.has_stored_password,
-            Self::GroupAdd(_) | Self::GroupEdit(_, _) => false,
+            Self::Edit(_, _, f) => f.has_stored_password,
         }
     }
 
-    /// Validate and build a Bookmark (bookmark forms only).
-    pub fn validate_and_build(&mut self, config: &AppConfig) -> Result<Bookmark> {
-        match self {
-            Self::Add(f) => f.validate_and_build(config),
-            Self::Edit(_, f) => f.validate_and_build(config),
-            Self::GroupAdd(_) | Self::GroupEdit(_, _) => {
-                anyhow::bail!("validate_and_build is for bookmark forms, not group forms")
-            }
-        }
-    }
-
-    // ── Group-only methods ──
-
-    /// Add a new session line (group forms only).
+    /// Add a new session line. Expands sessions section if first session.
     pub fn add_session_line(&mut self) {
         match self {
-            Self::GroupAdd(f) => f.add_session_line(),
-            Self::GroupEdit(_, f) => f.add_session_line(),
-            Self::Add(_) | Self::Edit(_, _) => {} // no-op for bookmark forms
+            Self::Add(f) => f.add_session_line(),
+            Self::Edit(_, _, f) => f.add_session_line(),
         }
     }
 
-    /// Remove the current session line (group forms only).
+    /// Remove the current session line. Collapses sessions if last removed.
     pub fn remove_session_line(&mut self) {
         match self {
-            Self::GroupAdd(f) => f.remove_session_line(),
-            Self::GroupEdit(_, f) => f.remove_session_line(),
-            Self::Add(_) | Self::Edit(_, _) => {} // no-op for bookmark forms
+            Self::Add(f) => f.remove_session_line(),
+            Self::Edit(_, _, f) => f.remove_session_line(),
         }
     }
 
-    /// Validate and build a BookmarkGroup (group forms only).
-    pub fn validate_and_build_group(&mut self, config: &AppConfig) -> Result<BookmarkGroup> {
-        match self {
-            Self::GroupAdd(f) => f.validate_and_build(config),
-            Self::GroupEdit(_, f) => f.validate_and_build(config),
-            Self::Add(_) | Self::Edit(_, _) => {
-                anyhow::bail!("validate_and_build_group is for group forms, not bookmark forms")
-            }
-        }
-    }
-
-    /// Get the session cursor (group forms only).
+    /// Get the session cursor.
     pub fn session_cursor(&self) -> usize {
         match self {
-            Self::GroupAdd(f) => f.session_cursor,
-            Self::GroupEdit(_, f) => f.session_cursor,
-            Self::Add(_) | Self::Edit(_, _) => 0,
+            Self::Add(f) => f.session_cursor,
+            Self::Edit(_, _, f) => f.session_cursor,
         }
     }
 
-    /// Check if this is a group form.
-    pub fn is_group_form(&self) -> bool {
-        matches!(self, Self::GroupAdd(_) | Self::GroupEdit(_, _))
+    /// Check if sessions section is collapsed.
+    pub fn sessions_collapsed(&self) -> bool {
+        match self {
+            Self::Add(f) => f.sessions_collapsed,
+            Self::Edit(_, _, f) => f.sessions_collapsed,
+        }
     }
 
-    /// Check if this is a bookmark form.
+    /// Get reference to the inner form.
+    pub fn inner(&self) -> &UnifiedForm {
+        match self {
+            Self::Add(f) => f,
+            Self::Edit(_, _, f) => f,
+        }
+    }
+
+    /// Get mutable reference to the inner form.
+    pub fn inner_mut(&mut self) -> &mut UnifiedForm {
+        match self {
+            Self::Add(f) => f,
+            Self::Edit(_, _, f) => f,
+        }
+    }
+
+    /// Get the edit target (for Edit variants). Returns None for Add.
+    pub fn edit_target(&self) -> Option<EditTarget> {
+        match self {
+            Self::Add(_) => None,
+            Self::Edit(_, target, _) => Some(*target),
+        }
+    }
+
+    /// Check if this form has sessions (group mode).
+    pub fn is_group_form(&self) -> bool {
+        match self {
+            Self::Add(f) => f.is_group(),
+            Self::Edit(_, target, _) => *target == EditTarget::Group,
+        }
+    }
+
+    /// Check if this form is bookmark mode (no sessions).
     pub fn is_bookmark_form(&self) -> bool {
-        matches!(self, Self::Add(_) | Self::Edit(_, _))
+        !self.is_group_form()
+    }
+
+    /// Check if this is an add form (not editing existing).
+    pub fn is_add(&self) -> bool {
+        matches!(self, Self::Add(_))
+    }
+
+    // ── Legacy compatibility methods (used by tui/mod.rs, removed in task 003) ──
+
+    /// Create a blank form for adding a new group (alias for new_add, adds one empty session).
+    #[deprecated(note = "Use new_add() — sessions determine bookmark vs group")]
+    pub fn new_group_add(settings: &Settings, profile_names: &[String]) -> Self {
+        let mut state = Self::new_add(settings, profile_names);
+        // Old GroupForm::new_add started with one empty session
+        state.inner_mut().add_session_line();
+        state
+    }
+
+    /// Create a pre-populated form for editing an existing group.
+    #[deprecated(note = "Use new_edit(idx, EditTarget::Group, &group, profiles)")]
+    pub fn new_group_edit(idx: usize, group: &BookmarkGroup, profile_names: &[String]) -> Self {
+        Self::new_edit(idx, EditTarget::Group, group, profile_names)
+    }
+
+    /// Validate and build a BookmarkGroup (for group mode forms).
+    pub fn validate_and_build_group(&mut self, config: &AppConfig) -> Result<BookmarkGroup> {
+        let form = self.inner_mut();
+        form.validate_and_build_group(config)
+    }
+
+    /// Validate and build a Bookmark (for bookmark mode forms).
+    pub fn validate_and_build(&mut self, config: &AppConfig) -> Result<Bookmark> {
+        let form = self.inner_mut();
+        form.validate_and_build_bookmark(config)
     }
 }
 
@@ -896,13 +1389,217 @@ pub fn render_form(
     tc: &ThemeColors,
 ) {
     match state {
-        FormState::Add(f) | FormState::Edit(_, f) => {
-            render_bookmark_form(frame, area, f, false, settings, tc);
-        }
-        FormState::GroupAdd(f) | FormState::GroupEdit(_, f) => {
-            render_group_form(frame, area, f, settings, tc);
+        FormState::Add(f) | FormState::Edit(_, _, f) => {
+            if f.is_group() {
+                // For group mode: render with sessions section
+                render_group_form_unified(frame, area, f, settings, tc);
+            } else {
+                // For bookmark mode: render without sessions section
+                render_bookmark_form(frame, area, f as &dyn FormFields, false, settings, tc);
+            }
         }
     }
+
+/// Render a unified form in group mode (with sessions section).
+fn render_group_form_unified(
+    frame: &mut Frame,
+    area: Rect,
+    form: &UnifiedForm,
+    settings: &Settings,
+    tc: &ThemeColors,
+) {
+    let popup = centered_rect(70, 90, area);
+    frame.render_widget(Clear, popup);
+
+    let title = if form.is_edit {
+        " Edit Connection "
+    } else {
+        " Add Connection "
+    };
+
+    let block = Block::default()
+        .title(title)
+        .title_alignment(Alignment::Center)
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(tc.border))
+        .style(Style::default().bg(tc.surface));
+
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
+
+    // Layout: fields (all 12 including password) + sessions header + session lines + error + spacer + hints
+    let visible_fields = FIELD_COUNT; // All fields including password
+    let session_line_count = form.sessions.len();
+
+    let mut constraints: Vec<Constraint> = Vec::with_capacity(visible_fields + 1 + session_line_count * 2 + 3);
+    // Fields
+    for _ in 0..visible_fields {
+        constraints.push(Constraint::Length(2));
+    }
+    // Sessions header
+    constraints.push(Constraint::Length(1));
+    // Session lines
+    for _ in 0..session_line_count {
+        constraints.push(Constraint::Length(2));
+    }
+    // Error
+    if form.error.is_some() {
+        constraints.push(Constraint::Length(1));
+    }
+    constraints.push(Constraint::Min(0));
+    constraints.push(Constraint::Length(1));
+
+    let chunks = Layout::vertical(constraints).split(inner);
+
+    // Field labels (all 12 fields)
+    let field_labels = [
+        ("Name", FIELD_NAME),
+        ("Host", FIELD_HOST),
+        ("User", FIELD_USER),
+        ("Port", FIELD_PORT),
+        ("Env", FIELD_ENV),
+        ("Tags", FIELD_TAGS),
+        ("Identity File", FIELD_IDENTITY),
+        ("Proxy Jump", FIELD_PROXY),
+        ("Notes", FIELD_NOTES),
+        ("On-Connect", FIELD_ON_CONNECT),
+        ("Password", FIELD_PASSWORD),
+        ("Profile", FIELD_PROFILE),
+    ];
+
+    let mut chunk_idx = 0;
+    for (label, field_idx) in &field_labels {
+        render_field(frame, chunks[chunk_idx], label, *field_idx, form as &dyn FormFields, false, settings, tc);
+        chunk_idx += 1;
+    }
+
+    // Sessions header: " Sessions (N) "
+    let count = form.sessions.len();
+    let label = if count == 1 {
+        "Session".to_string()
+    } else {
+        "Sessions".to_string()
+    };
+    let line = Line::from(Span::styled(
+        format!(" ── {label} ({count}) ──"),
+        Style::default().fg(tc.accent).add_modifier(Modifier::BOLD),
+    ));
+    frame.render_widget(Paragraph::new(line), chunks[chunk_idx]);
+    chunk_idx += 1;
+
+    // Session lines
+    for (i, session) in form.sessions.iter().enumerate() {
+        let is_current = i == form.session_cursor;
+        let prefix = if is_current { "  > " } else { "    " };
+        let cursor = if is_current { "_" } else { "" };
+
+        let name_style = if is_current {
+            Style::default().fg(tc.accent).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(tc.fg)
+        };
+        let cmd_style = if is_current {
+            Style::default().fg(tc.fg)
+        } else {
+            Style::default().fg(tc.fg_muted)
+        };
+
+        let name_display = if session.name.is_empty() {
+            "(unnamed)".to_string()
+        } else {
+            session.name.clone()
+        };
+
+        let on_connect_display = session.on_connect.as_deref().unwrap_or("(no command)");
+
+        // Name line
+        let name_line = Line::from(vec![
+            Span::raw(format!("{}{}: ", prefix, i + 1)),
+            Span::styled(name_display, name_style),
+            Span::styled(cursor, name_style),
+        ]);
+        frame.render_widget(Paragraph::new(name_line), chunks[chunk_idx]);
+        chunk_idx += 1;
+
+        // Command line
+        let cmd_line = Line::from(vec![
+            Span::raw("     "),
+            Span::styled(format!("cmd: {}", on_connect_display), cmd_style),
+        ]);
+        frame.render_widget(Paragraph::new(cmd_line), chunks[chunk_idx]);
+        chunk_idx += 1;
+    }
+
+    // Error message
+    if let Some(ref err) = form.error {
+        let color = if err.starts_with("Warning:") {
+            tc.warning
+        } else {
+            tc.error
+        };
+        let line = Line::from(Span::styled(format!(" {err}"), Style::default().fg(color)));
+        frame.render_widget(Paragraph::new(line), chunks[chunk_idx]);
+        chunk_idx += 1;
+    }
+
+    // Skip spacer
+    chunk_idx += 1;
+
+    // Hints line (with session hints)
+    let hints = Line::from(vec![
+        Span::styled(
+            " Tab/\u{2193} ",
+            Style::default()
+                .fg(tc.hint_key_fg)
+                .bg(tc.hint_key_bg)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(" Next  ", Style::default().fg(tc.fg_dim)),
+        Span::styled(
+            " S-Tab/\u{2191} ",
+            Style::default()
+                .fg(tc.hint_key_fg)
+                .bg(tc.hint_key_bg)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(" Prev  ", Style::default().fg(tc.fg_dim)),
+        Span::styled(
+            " Enter ",
+            Style::default()
+                .fg(tc.hint_key_fg)
+                .bg(tc.hint_key_bg)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(" Save  ", Style::default().fg(tc.fg_dim)),
+        Span::styled(
+            " Esc ",
+            Style::default()
+                .fg(tc.hint_key_fg)
+                .bg(tc.hint_key_bg)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(" Cancel  ", Style::default().fg(tc.fg_dim)),
+        Span::styled(
+            " Ctrl+Enter ",
+            Style::default()
+                .fg(tc.hint_key_fg)
+                .bg(tc.hint_key_bg)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(" Add Session  ", Style::default().fg(tc.fg_dim)),
+        Span::styled(
+            " - ",
+            Style::default()
+                .fg(tc.hint_key_fg)
+                .bg(tc.hint_key_bg)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(" Remove", Style::default().fg(tc.fg_dim)),
+    ]);
+    if chunk_idx < chunks.len() {
+        frame.render_widget(Paragraph::new(hints), chunks[chunk_idx]);
+    }
+}
 }
 
 /// Render a group form with fields + session lines section.
@@ -1273,6 +1970,18 @@ impl FormFields for GroupForm {
     fn password_modified(&self) -> bool { false }
 }
 
+impl FormFields for UnifiedForm {
+    fn fields(&self) -> &[String; FIELD_COUNT] { &self.fields }
+    fn focused(&self) -> usize { self.focused }
+    fn env_index(&self) -> usize { self.env_index }
+    fn profile_index(&self) -> usize { self.profile_index }
+    fn profile_options(&self) -> &[String] { &self.profile_options }
+    fn is_edit(&self) -> bool { self.is_edit }
+    fn error(&self) -> Option<String> { self.error.clone() }
+    fn has_stored_password(&self) -> bool { self.has_stored_password }
+    fn password_modified(&self) -> bool { self.password_modified }
+}
+
 /// Render a single form field (label + value).
 fn render_field(
     frame: &mut Frame,
@@ -1539,6 +2248,152 @@ mod tests {
             profiles: vec![],
             bookmarks: vec![sample_bookmark()],
             groups: vec![],
+        }
+    }
+
+    // ─── UnifiedForm tests ───
+
+    #[test]
+    fn test_unified_form_new_add_defaults() {
+        let settings = Settings {
+            default_user: Some("admin".into()),
+            ..Settings::default()
+        };
+        let form = UnifiedForm::new_add(&settings, &[]);
+        assert!(!form.is_edit);
+        assert_eq!(form.focused, FIELD_NAME);
+        assert_eq!(form.fields[FIELD_PORT], "22");
+        assert_eq!(form.fields[FIELD_USER], "admin");
+        assert_eq!(form.env_index, 0); // (none)
+        assert_eq!(form.profile_index, 0); // (none)
+        assert_eq!(form.profile_options, vec!["(none)"]);
+        assert!(!form.has_stored_password);
+        assert!(!form.password_modified);
+        assert!(form.password().is_empty());
+        assert!(form.sessions.is_empty());
+        assert!(form.sessions_collapsed);
+        assert_eq!(form.session_cursor, 0);
+    }
+
+    #[test]
+    fn test_unified_form_new_edit_bookmark_populates() {
+        let bookmark = sample_bookmark();
+        let form = UnifiedForm::new_edit_bookmark(&bookmark, &[]);
+        assert!(form.is_edit);
+        assert_eq!(form.fields[FIELD_NAME], "prod-web-01");
+        assert_eq!(form.fields[FIELD_HOST], "10.0.1.5");
+        assert_eq!(form.fields[FIELD_USER], "deploy");
+        assert_eq!(form.fields[FIELD_PORT], "22");
+        assert_eq!(form.fields[FIELD_TAGS], "web, frontend");
+        assert_eq!(form.fields[FIELD_IDENTITY], "~/.ssh/id_ed25519");
+        assert_eq!(form.fields[FIELD_PROXY], "bastion");
+        assert_eq!(form.fields[FIELD_NOTES], "Primary web server");
+        assert_eq!(form.selected_env(), "production");
+        assert!(form.password().is_empty());
+        assert!(!form.password_modified);
+        assert!(form.sessions.is_empty());
+        assert!(form.sessions_collapsed);
+    }
+
+    #[test]
+    fn test_unified_form_new_edit_group_populates() {
+        let group = BookmarkGroup {
+            name: "prod-web".into(),
+            host: "10.0.1.5".into(),
+            user: Some("deploy".into()),
+            port: 2222,
+            env: "production".into(),
+            tags: vec!["web".into()],
+            identity_file: Some("~/.ssh/id_ed25519".into()),
+            proxy_jump: Some("bastion".into()),
+            notes: Some("Web servers".into()),
+            profile: None,
+            on_connect: Some("cd /app".into()),
+            on_connect_prompt_pattern: None,
+            snippets: vec![],
+            connect_timeout_secs: None,
+            ssh_options: std::collections::BTreeMap::new(),
+            sessions: vec![
+                Session {
+                    name: "session-a".into(),
+                    on_connect: Some("tail -f /var/log/app.log".into()),
+                    ..Session::default()
+                },
+                Session {
+                    name: "session-b".into(),
+                    on_connect: None,
+                    ..Session::default()
+                },
+            ],
+        };
+        let form = UnifiedForm::new_edit_group(&group, &[]);
+        assert!(form.is_edit);
+        assert_eq!(form.fields[FIELD_NAME], "prod-web");
+        assert_eq!(form.fields[FIELD_HOST], "10.0.1.5");
+        assert_eq!(form.fields[FIELD_PORT], "2222");
+        assert_eq!(form.selected_env(), "production");
+        assert_eq!(form.sessions.len(), 2);
+        assert_eq!(form.sessions[0].name, "session-a");
+        assert_eq!(form.sessions[1].name, "session-b");
+        assert!(!form.sessions_collapsed);
+    }
+
+    #[test]
+    fn test_unified_form_new_edit_group_empty_sessions_gets_one() {
+        let group = BookmarkGroup {
+            name: "empty-group".into(),
+            host: "10.0.1.5".into(),
+            sessions: vec![],
+            ..BookmarkGroup::default()
+        };
+        let form = UnifiedForm::new_edit_group(&group, &[]);
+        assert_eq!(form.sessions.len(), 1); // Gets one empty session
+        assert!(!form.sessions_collapsed);
+    }
+
+    #[test]
+    fn test_form_state_unified_add() {
+        let settings = Settings::default();
+        let state = FormState::new_add(&settings, &[]);
+        if let FormState::Add(f) = state {
+            assert!(!f.is_edit);
+            assert!(f.sessions.is_empty());
+        } else {
+            panic!("Expected Add variant");
+        }
+    }
+
+    #[test]
+    fn test_form_state_unified_edit_bookmark() {
+        let bookmark = sample_bookmark();
+        let state = FormState::new_edit(0, EditTarget::Bookmark, &bookmark, &[]);
+        if let FormState::Edit(_, EditTarget::Bookmark, f) = state {
+            assert!(f.is_edit);
+            assert!(f.sessions.is_empty());
+            assert!(f.sessions_collapsed);
+        } else {
+            panic!("Expected Edit variant with Bookmark target");
+        }
+    }
+
+    #[test]
+    fn test_form_state_unified_edit_group() {
+        let group = BookmarkGroup {
+            name: "test-group".into(),
+            host: "10.0.1.5".into(),
+            sessions: vec![Session {
+                name: "s1".into(),
+                ..Session::default()
+            }],
+            ..BookmarkGroup::default()
+        };
+        let state = FormState::new_edit(0, EditTarget::Group, &group, &[]);
+        if let FormState::Edit(_, EditTarget::Group, f) = state {
+            assert!(f.is_edit);
+            assert_eq!(f.sessions.len(), 1);
+            assert!(!f.sessions_collapsed);
+        } else {
+            panic!("Expected Edit variant with Group target");
         }
     }
 
@@ -1969,7 +2824,7 @@ mod tests {
         assert!(state.is_group_form());
         assert!(!state.is_bookmark_form());
 
-        if let FormState::GroupAdd(f) = state {
+        if let FormState::Add(f) = state {
             assert_eq!(f.sessions.len(), 1);
             assert_eq!(f.session_cursor, 0);
         } else {
@@ -1984,7 +2839,7 @@ mod tests {
 
         state.add_session_line();
 
-        if let FormState::GroupAdd(f) = state {
+        if let FormState::Add(f) = state {
             assert_eq!(f.sessions.len(), 2);
             assert_eq!(f.session_cursor, 1);
         } else {
@@ -2001,14 +2856,14 @@ mod tests {
         state.add_session_line();
         state.add_session_line();
 
-        if let FormState::GroupAdd(ref f) = state {
+        if let FormState::Add(ref f) = state {
             assert_eq!(f.sessions.len(), 3);
         }
 
         // Remove current session
         state.remove_session_line();
 
-        if let FormState::GroupAdd(f) = state {
+        if let FormState::Add(f) = state {
             assert_eq!(f.sessions.len(), 2);
         }
     }
@@ -2018,11 +2873,12 @@ mod tests {
         let settings = Settings::default();
         let mut state = FormState::new_group_add(&settings, &[]);
 
-        // Try to remove the only session — should be no-op
+        // In unified form, removing the last session reverts to bookmark mode
         state.remove_session_line();
 
-        if let FormState::GroupAdd(f) = state {
-            assert_eq!(f.sessions.len(), 1);
+        if let FormState::Add(f) = state {
+            assert_eq!(f.sessions.len(), 0); // Reverted to bookmark mode
+            assert!(f.sessions_collapsed);
         }
     }
 
@@ -2059,7 +2915,7 @@ mod tests {
         };
         let state = FormState::new_group_edit(0, &group, &[]);
 
-        if let FormState::GroupEdit(_, f) = state {
+        if let FormState::Edit(_, EditTarget::Group, f) = state {
             assert!(f.is_edit);
             assert_eq!(f.original_name, Some("prod-web".into()));
             assert_eq!(f.fields[FIELD_NAME], "prod-web");
@@ -2084,7 +2940,7 @@ mod tests {
         };
         let state = FormState::new_group_edit(0, &group, &[]);
 
-        if let FormState::GroupEdit(_, f) = state {
+        if let FormState::Edit(_, EditTarget::Group, f) = state {
             assert_eq!(f.sessions.len(), 1); // Gets one empty session
         } else {
             panic!("Expected GroupEdit variant");
@@ -2131,7 +2987,7 @@ mod tests {
         let mut state = FormState::new_group_add(&settings, &[]);
         state.insert_char('g');
 
-        if let FormState::GroupAdd(f) = state {
+        if let FormState::Add(f) = state {
             assert_eq!(f.fields[FIELD_NAME], "g");
         } else {
             panic!("Expected GroupAdd variant");
@@ -2144,7 +3000,7 @@ mod tests {
         let settings = Settings::default();
         let mut state = FormState::new_group_add(&settings, &[]);
 
-        if let FormState::GroupAdd(f) = &mut state {
+        if let FormState::Add(f) = &mut state {
             f.fields[FIELD_NAME] = "my-group".into();
             f.fields[FIELD_HOST] = "10.0.1.5".into();
             f.sessions[0].name = "session-1".into();
@@ -2163,7 +3019,7 @@ mod tests {
         let settings = Settings::default();
         let mut state = FormState::new_group_add(&settings, &[]);
 
-        if let FormState::GroupAdd(f) = &mut state {
+        if let FormState::Add(f) = &mut state {
             f.fields[FIELD_NAME] = "my-group".into();
             f.fields[FIELD_HOST] = "10.0.1.5".into();
             f.sessions[0].name = "dup".into();
@@ -2182,7 +3038,7 @@ mod tests {
         let settings = Settings::default();
         let mut state = FormState::new_group_add(&settings, &[]);
 
-        if let FormState::GroupAdd(f) = &mut state {
+        if let FormState::Add(f) = &mut state {
             f.fields[FIELD_NAME] = "my-group".into();
             f.fields[FIELD_HOST] = "10.0.1.5".into();
             f.sessions[0].name = "".into();
@@ -2204,7 +3060,7 @@ mod tests {
         let settings = Settings::default();
         let mut state = FormState::new_group_add(&settings, &[]);
 
-        if let FormState::GroupAdd(f) = &mut state {
+        if let FormState::Add(f) = &mut state {
             f.fields[FIELD_NAME] = "existing".into();
             f.fields[FIELD_HOST] = "10.0.1.5".into();
             f.sessions[0].name = "session-1".into();
@@ -2221,7 +3077,7 @@ mod tests {
         let settings = Settings::default();
         let mut state = FormState::new_group_add(&settings, &[]);
 
-        if let FormState::GroupAdd(f) = &mut state {
+        if let FormState::Add(f) = &mut state {
             f.fields[FIELD_NAME] = "my-group".into();
             f.fields[FIELD_HOST] = "10.0.1.5".into();
             f.sessions[0].name = "session-1".into();
@@ -2240,7 +3096,7 @@ mod tests {
         let settings = Settings::default();
         let mut state = FormState::new_group_add(&settings, &[]);
 
-        if let FormState::GroupAdd(f) = &mut state {
+        if let FormState::Add(f) = &mut state {
             f.fields[FIELD_NAME] = "my-group".into();
             f.fields[FIELD_HOST] = "10.0.1.5".into();
             f.sessions[0].name = "session-1".into();
@@ -2280,7 +3136,7 @@ mod tests {
         // Verify group form with 1 empty session line doesn't panic
         let settings = Settings::default();
         let state = FormState::new_group_add(&settings, &[]);
-        if let FormState::GroupAdd(f) = state {
+        if let FormState::Add(f) = state {
             assert_eq!(f.sessions.len(), 1);
             assert!(f.sessions[0].name.is_empty());
             assert!(f.sessions[0].on_connect.is_none());
@@ -2298,7 +3154,7 @@ mod tests {
         state.add_session_line();
         state.add_session_line();
 
-        if let FormState::GroupAdd(f) = &state {
+        if let FormState::Add(f) = &state {
             assert_eq!(f.sessions.len(), 3);
             // Session count shown as "Sessions (3)"
             let count = f.sessions.len();
@@ -2314,13 +3170,13 @@ mod tests {
         let settings = Settings::default();
         let mut state = FormState::new_group_add(&settings, &[]);
 
-        if let FormState::GroupAdd(f) = &mut state {
+        if let FormState::Add(f) = &mut state {
             f.sessions[0].name = "session-a".into();
             f.add_session_line();
             f.sessions[1].name = "session-b".into();
         }
 
-        if let FormState::GroupAdd(f) = &state {
+        if let FormState::Add(f) = &state {
             // session_cursor should be at the new session
             assert_eq!(f.session_cursor, 1);
             assert_eq!(f.sessions[0].name, "session-a");
@@ -2335,7 +3191,7 @@ mod tests {
         let settings = Settings::default();
         let state = FormState::new_group_add(&settings, &[]);
 
-        if let FormState::GroupAdd(f) = &state {
+        if let FormState::Add(f) = &state {
             let count = f.sessions.len();
             let label = if count == 1 { "Session" } else { "Sessions" };
             assert_eq!(label, "Session"); // Singular for 1
@@ -2349,7 +3205,7 @@ mod tests {
         let settings = Settings::default();
         let state = FormState::new_group_add(&settings, &[]);
 
-        if let FormState::GroupAdd(f) = &state {
+        if let FormState::Add(f) = &state {
             // Empty name should display as "(unnamed)"
             assert!(f.sessions[0].name.is_empty());
         } else {

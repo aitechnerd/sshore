@@ -26,7 +26,7 @@ use crate::ssh;
 use crate::tui::theme::{ThemeColors, resolve_theme};
 use crate::tui::views::browser::truncate_name;
 use crate::tui::views::confirm::{ConfirmState, ConfirmTarget};
-use crate::tui::views::form::{FIELD_ENV, FIELD_PROFILE, FormState};
+use crate::tui::views::form::{EditTarget, FIELD_ENV, FIELD_PROFILE, FormState};
 use crate::tui::views::{confirm, form, help, import_wizard, list};
 use crate::tui::widgets::{search_bar, status_bar};
 
@@ -976,7 +976,7 @@ fn handle_list_key(app: &mut App, key: KeyEvent) {
                 let profile_names: Vec<String> =
                     app.config.profiles.iter().map(|p| p.name.clone()).collect();
                 let bookmark = &app.config.bookmarks[idx];
-                app.form_state = Some(FormState::new_edit(idx, bookmark, &profile_names));
+                app.form_state = Some(FormState::new_edit(idx, EditTarget::Bookmark, bookmark, &profile_names));
                 app.screen = Screen::EditForm(idx);
             }
         }
@@ -1720,7 +1720,7 @@ mod tests {
             let profile_names: Vec<String> =
                 app.config.profiles.iter().map(|p| p.name.clone()).collect();
             let bookmark = app.config.bookmarks[idx].clone();
-            app.form_state = Some(FormState::new_edit(idx, &bookmark, &profile_names));
+            app.form_state = Some(FormState::new_edit(idx, EditTarget::Bookmark, &bookmark, &profile_names));
             app.screen = Screen::EditForm(idx);
             assert!(app.form_state.is_some());
         }
@@ -2160,7 +2160,7 @@ mod tests {
         };
         handle_group_form_key(&mut app, key);
 
-        if let Some(FormState::GroupAdd(f)) = &app.form_state {
+        if let Some(FormState::Add(f)) = &app.form_state {
             assert_eq!(f.sessions.len(), 2);
         } else {
             panic!("Expected GroupAdd form state");
@@ -2189,7 +2189,7 @@ mod tests {
         };
         handle_group_form_key(&mut app, key);
 
-        if let Some(FormState::GroupAdd(f)) = &app.form_state {
+        if let Some(FormState::Add(f)) = &app.form_state {
             // Started with 1, added 1 (cursor at index 1), removed current (index 1) = 1 left
             assert_eq!(f.sessions.len(), 1);
         } else {
@@ -2198,7 +2198,7 @@ mod tests {
     }
 
     #[test]
-    fn test_group_form_minus_keeps_min_one_session() {
+    fn test_group_form_minus_removes_last_session_reverts_to_bookmark() {
         let mut app = sample_app();
         let profile_names: Vec<String> =
             app.config.profiles.iter().map(|p| p.name.clone()).collect();
@@ -2214,11 +2214,12 @@ mod tests {
         };
         handle_group_form_key(&mut app, key);
 
-        if let Some(FormState::GroupAdd(f)) = &app.form_state {
-            // Should still have 1 session (minimum enforced)
-            assert_eq!(f.sessions.len(), 1);
+        if let Some(FormState::Add(f)) = &app.form_state {
+            // Last session removed, reverts to bookmark mode (0 sessions)
+            assert_eq!(f.sessions.len(), 0);
+            assert!(f.sessions_collapsed);
         } else {
-            panic!("Expected GroupAdd form state");
+            panic!("Expected Add form state");
         }
     }
 
@@ -2253,7 +2254,7 @@ mod tests {
         app.screen = Screen::GroupAddForm;
 
         // Fill in the form fields
-        if let Some(FormState::GroupAdd(f)) = &mut app.form_state {
+        if let Some(FormState::Add(f)) = &mut app.form_state {
             f.fields[FIELD_NAME] = "test-group".into();
             f.fields[FIELD_HOST] = "10.0.1.5".into();
             f.fields[FIELD_PORT] = "2222".into();
@@ -2306,12 +2307,12 @@ mod tests {
         app.screen = Screen::GroupEditForm(0);
 
         // Modify the session
-        if let Some(FormState::GroupEdit(_, f)) = &mut app.form_state {
+        if let Some(FormState::Edit(_, EditTarget::Group, f)) = &mut app.form_state {
             f.sessions[0].on_connect = Some("echo world".into());
         }
 
         // Verify the form state was mutated
-        if let Some(FormState::GroupEdit(_, f)) = &app.form_state {
+        if let Some(FormState::Edit(_, EditTarget::Group, f)) = &app.form_state {
             assert_eq!(f.sessions[0].on_connect, Some("echo world".into()));
         }
 

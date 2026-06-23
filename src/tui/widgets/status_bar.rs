@@ -28,8 +28,7 @@ fn build_hints<'a>(screen: &Screen, search_active: bool, theme: &ThemeColors) ->
     match screen {
         Screen::List => list_hints(theme),
         Screen::Help => help_hints(theme),
-        Screen::AddForm | Screen::EditForm(_, _) => form_hints(theme),
-        Screen::AddForm | Screen::EditForm(_, _) => group_form_hints(theme),
+        Screen::AddForm | Screen::EditForm(_, _) => unified_form_hints(theme),
         Screen::DeleteConfirm(_) => delete_hints(theme),
     }
 }
@@ -71,16 +70,7 @@ fn search_hints(theme: &ThemeColors) -> Line<'static> {
     Line::from(spans)
 }
 
-fn form_hints(theme: &ThemeColors) -> Line<'static> {
-    let mut spans = Vec::new();
-    spans.extend(hint_pair("Tab/\u{2193}", "Next field", theme));
-    spans.extend(hint_pair("S-Tab/\u{2191}", "Prev field", theme));
-    spans.extend(hint_pair("Enter", "Save", theme));
-    spans.extend(hint_pair("Esc", "Cancel", theme));
-    Line::from(spans)
-}
-
-fn group_form_hints(theme: &ThemeColors) -> Line<'static> {
+fn unified_form_hints(theme: &ThemeColors) -> Line<'static> {
     let mut spans = Vec::new();
     spans.extend(hint_pair("Tab/\u{2193}", "Next field", theme));
     spans.extend(hint_pair("S-Tab/\u{2191}", "Prev field", theme));

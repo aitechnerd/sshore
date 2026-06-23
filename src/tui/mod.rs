@@ -1323,7 +1323,7 @@ fn handle_confirm_key(app: &mut App, key: KeyEvent) {
                 && let Screen::DeleteConfirm(idx) = app.screen
             {
                 // Determine if we're deleting a bookmark or group based on the target
-                let was_group = matches!(state.target, ConfirmTarget::Group { .. });
+                let was_group = state.target.is_group;
 
                 if was_group {
                     let name = app.config.groups[idx].name.clone();

@@ -1164,8 +1164,8 @@ fn handle_unified_form_key(app: &mut App, key: KeyEvent) {
         KeyCode::Left if form.focused() == FIELD_PROFILE => form.cycle_profile_left(),
         KeyCode::Right if form.focused() == FIELD_PROFILE => form.cycle_profile_right(),
         KeyCode::Backspace => form.delete_char(),
-        KeyCode::Enter if key.modifiers.contains(KeyModifiers::ALT) => {
-            // Alt+Enter: add a new session line
+        KeyCode::Char('o') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            // Ctrl+O: add a new session line
             form.add_session_line();
         }
         KeyCode::Enter => {
@@ -2101,10 +2101,10 @@ mod tests {
         app.form_state = Some(FormState::new_group_add(&app.config.settings, &profile_names));
         app.screen = Screen::AddForm;
 
-        // Simulate Alt+Enter
+        // Simulate Ctrl+O
         let key = KeyEvent {
-            code: KeyCode::Enter,
-            modifiers: KeyModifiers::ALT,
+            code: KeyCode::Char('o'),
+            modifiers: KeyModifiers::CONTROL,
             kind: crossterm::event::KeyEventKind::Press,
             state: crossterm::event::KeyEventState::empty(),
         };

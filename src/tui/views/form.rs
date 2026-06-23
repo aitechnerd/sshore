@@ -1606,7 +1606,7 @@ fn render_unified_form(
         ),
         Span::styled(" Cancel  ", Style::default().fg(tc.fg_dim)),
         Span::styled(
-            " Alt+Enter ",
+            " Ctrl+O ",
             Style::default()
                 .fg(tc.hint_key_fg)
                 .bg(tc.hint_key_bg)
@@ -1812,7 +1812,7 @@ fn render_group_form(
         ),
         Span::styled(" Cancel  ", Style::default().fg(tc.fg_dim)),
         Span::styled(
-            " Alt+Enter ",
+            " Ctrl+O ",
             Style::default()
                 .fg(tc.hint_key_fg)
                 .bg(tc.hint_key_bg)

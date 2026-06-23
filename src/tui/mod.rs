@@ -957,7 +957,7 @@ fn handle_key_event(app: &mut App, key: KeyEvent) {
         Screen::List => handle_list_key(app, key),
         Screen::AddForm | Screen::EditForm(_, _) => handle_unified_form_key(app, key),
         Screen::DeleteConfirm(_) => handle_confirm_key(app, key),
-        Screen::GroupMux(_) => handle_list_key(app, key),
+        Screen::GroupMux(_) => handle_mux_key(app, key),
     }
 }
 
@@ -1152,6 +1152,74 @@ fn handle_session_list_key(app: &mut App, key: KeyEvent) {
                 app.confirm_state = Some(ConfirmState::new_group(&group));
                 app.screen = Screen::DeleteConfirm(group_idx);
             }
+        }
+
+        _ => {}
+    }
+}
+
+/// Handle key events in mux mode (GroupMux screen).
+///
+/// Up/Down navigate sessions within the group, Enter connects,
+/// Esc/q returns to the main list.
+fn handle_mux_key(app: &mut App, key: KeyEvent) {
+    let group_idx = match app.screen {
+        Screen::GroupMux(idx) => idx,
+        _ => return,
+    };
+
+    // Guard against invalid group index
+    if group_idx >= app.config.groups.len() {
+        app.screen = Screen::List;
+        app.mux_session = None;
+        return;
+    }
+
+    let group = &app.config.groups[group_idx];
+    let session_count = group.sessions.len();
+
+    match key.code {
+        // Quit mux, return to main list
+        KeyCode::Esc | KeyCode::Char('q') => {
+            app.screen = Screen::List;
+            app.mux_session = None;
+        }
+
+        // Navigation: move through sessions with wrapping
+        KeyCode::Up | KeyCode::Char('k') => {
+            if session_count == 0 {
+                return;
+            }
+            let current = app.mux_session.unwrap_or(0);
+            let new = if current == 0 {
+                session_count - 1  // wrap to last
+            } else {
+                current - 1
+            };
+            app.mux_session = Some(new);
+        }
+        KeyCode::Down | KeyCode::Char('j') => {
+            if session_count == 0 {
+                return;
+            }
+            let current = app.mux_session.unwrap_or(0);
+            let new = if current >= session_count - 1 {
+                0  // wrap to first
+            } else {
+                current + 1
+            };
+            app.mux_session = Some(new);
+        }
+
+        // Connect to selected session
+        KeyCode::Enter => {
+            if session_count == 0 {
+                return;
+            }
+            let session_idx = app.mux_session.unwrap_or(0);
+            // Encode as: (group_idx+1)*10000 + (session_idx+1)
+            let encoded = (group_idx + 1) * 10000 + (session_idx + 1);
+            app.connect_request = Some(encoded);
         }
 
         _ => {}

@@ -2519,4 +2519,185 @@ mod tests {
         assert!(bookmark.is_some());
         assert_eq!(bookmark.unwrap().host, "10.0.1.5");
     }
+
+    // ── Mux mode tests ──
+
+    #[test]
+    fn test_mux_enter_from_list() {
+        let mut app = app_with_groups(vec![sample_group()]);
+        // Enter mux mode for group 0
+        app.screen = Screen::GroupMux(0);
+        app.mux_session = None;
+
+        // Down from None (treated as 0) goes to 1
+        let down = KeyEvent::new(KeyCode::Down, KeyModifiers::NONE);
+        handle_key_event(&mut app, down);
+        assert_eq!(app.mux_session, Some(1));
+
+        // Up goes back to 0
+        let up = KeyEvent::new(KeyCode::Up, KeyModifiers::NONE);
+        handle_key_event(&mut app, up);
+        assert_eq!(app.mux_session, Some(0));
+    }
+
+    #[test]
+    fn test_mux_down_cycles_sessions() {
+        let mut app = app_with_groups(vec![sample_group()]);
+        app.screen = Screen::GroupMux(0);
+        app.mux_session = Some(0);
+
+        // Down moves to next session
+        let down = KeyEvent::new(KeyCode::Down, KeyModifiers::NONE);
+        handle_key_event(&mut app, down);
+        assert_eq!(app.mux_session, Some(1));
+
+        // Down again
+        handle_key_event(&mut app, down);
+        assert_eq!(app.mux_session, Some(2));
+    }
+
+    #[test]
+    fn test_mux_up_cycles_sessions() {
+        let mut app = app_with_groups(vec![sample_group()]);
+        app.screen = Screen::GroupMux(0);
+        app.mux_session = Some(2);
+
+        // Up moves to previous session
+        let up = KeyEvent::new(KeyCode::Up, KeyModifiers::NONE);
+        handle_key_event(&mut app, up);
+        assert_eq!(app.mux_session, Some(1));
+
+        // Up again
+        handle_key_event(&mut app, up);
+        assert_eq!(app.mux_session, Some(0));
+    }
+
+    #[test]
+    fn test_mux_wrap_down_at_end() {
+        let mut app = app_with_groups(vec![sample_group()]);
+        app.screen = Screen::GroupMux(0);
+        app.mux_session = Some(2); // last session (3 sessions: 0, 1, 2)
+
+        // Down at end wraps to first
+        let down = KeyEvent::new(KeyCode::Down, KeyModifiers::NONE);
+        handle_key_event(&mut app, down);
+        assert_eq!(app.mux_session, Some(0));
+    }
+
+    #[test]
+    fn test_mux_wrap_up_at_start() {
+        let mut app = app_with_groups(vec![sample_group()]);
+        app.screen = Screen::GroupMux(0);
+        app.mux_session = Some(0);
+
+        // Up at start wraps to last
+        let up = KeyEvent::new(KeyCode::Up, KeyModifiers::NONE);
+        handle_key_event(&mut app, up);
+        assert_eq!(app.mux_session, Some(2));
+    }
+
+    #[test]
+    fn test_mux_enter_sets_connect_request() {
+        let mut app = app_with_groups(vec![sample_group()]);
+        app.screen = Screen::GroupMux(0);
+        app.mux_session = Some(1); // second session
+
+        let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+        handle_key_event(&mut app, enter);
+        // Encoded: (group_idx+1)*10000 + (session_idx+1) = (0+1)*10000 + (1+1) = 10002
+        assert_eq!(app.connect_request, Some(10002));
+    }
+
+    #[test]
+    fn test_mux_enter_first_session() {
+        let mut app = app_with_groups(vec![sample_group()]);
+        app.screen = Screen::GroupMux(0);
+        app.mux_session = Some(0);
+
+        let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+        handle_key_event(&mut app, enter);
+        // Encoded: (0+1)*10000 + (0+1) = 10001
+        assert_eq!(app.connect_request, Some(10001));
+    }
+
+    #[test]
+    fn test_mux_q_exits_to_list() {
+        let mut app = app_with_groups(vec![sample_group()]);
+        app.screen = Screen::GroupMux(0);
+        app.mux_session = Some(1);
+
+        let q = KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE);
+        handle_key_event(&mut app, q);
+        assert_eq!(app.screen, Screen::List);
+        assert_eq!(app.mux_session, None);
+    }
+
+    #[test]
+    fn test_mux_esc_exits_to_list() {
+        let mut app = app_with_groups(vec![sample_group()]);
+        app.screen = Screen::GroupMux(0);
+        app.mux_session = Some(1);
+
+        let esc = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
+        handle_key_event(&mut app, esc);
+        assert_eq!(app.screen, Screen::List);
+        assert_eq!(app.mux_session, None);
+    }
+
+    #[test]
+    fn test_mux_j_key_navigates_down() {
+        let mut app = app_with_groups(vec![sample_group()]);
+        app.screen = Screen::GroupMux(0);
+        app.mux_session = Some(0);
+
+        let j = KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE);
+        handle_key_event(&mut app, j);
+        assert_eq!(app.mux_session, Some(1));
+    }
+
+    #[test]
+    fn test_mux_k_key_navigates_up() {
+        let mut app = app_with_groups(vec![sample_group()]);
+        app.screen = Screen::GroupMux(0);
+        app.mux_session = Some(1);
+
+        let k = KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE);
+        handle_key_event(&mut app, k);
+        assert_eq!(app.mux_session, Some(0));
+    }
+
+    #[test]
+    fn test_mux_invalid_group_exits_to_list() {
+        let mut app = app_with_groups(vec![sample_group()]);
+        app.screen = Screen::GroupMux(99); // invalid group index
+        app.mux_session = Some(0);
+
+        // Any key should trigger the guard and exit
+        let down = KeyEvent::new(KeyCode::Down, KeyModifiers::NONE);
+        handle_key_event(&mut app, down);
+        assert_eq!(app.screen, Screen::List);
+        assert_eq!(app.mux_session, None);
+    }
+
+    #[test]
+    fn test_mux_empty_group_no_crash() {
+        let mut app = app_with_groups(vec![BookmarkGroup {
+            name: "empty".into(),
+            host: "10.0.1.5".into(),
+            sessions: vec![],
+            ..BookmarkGroup::default()
+        }]);
+        app.screen = Screen::GroupMux(0);
+        app.mux_session = None;
+
+        // Down on empty group should do nothing (no crash)
+        let down = KeyEvent::new(KeyCode::Down, KeyModifiers::NONE);
+        handle_key_event(&mut app, down);
+        assert_eq!(app.mux_session, None);
+
+        // Enter on empty group should do nothing
+        let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+        handle_key_event(&mut app, enter);
+        assert_eq!(app.connect_request, None);
+    }
 }

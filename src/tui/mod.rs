@@ -11,7 +11,7 @@ use anyhow::{Context, Result};
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
 use crossterm::execute;
 use crossterm::terminal::{self, EnterAlternateScreen, LeaveAlternateScreen};
-use fuzzy_matcher::skim::SkimMatcherV2;
+use fuzzy_matcher::{FuzzyMatcher, skim::SkimMatcherV2};
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Layout};
@@ -86,6 +86,10 @@ enum LoopAction {
     Browse(usize),
 }
 
+/// Marker: filtered_indices >= this value are group indices (value - GROUP_INDEX_MARKER = group_idx).
+/// This allows mixing bookmarks and groups in a unified list.
+pub const GROUP_INDEX_MARKER: usize = 100000;
+
 /// Main application state.
 pub struct App {
     pub config: AppConfig,
@@ -124,7 +128,11 @@ impl App {
     /// Create a new App from loaded config.
     pub fn new(config: AppConfig) -> Self {
         let matcher = SkimMatcherV2::default();
-        let filtered_indices = search_bar::filter_bookmarks(&matcher, &config.bookmarks, "", None);
+        let mut filtered_indices = search_bar::filter_bookmarks(&matcher, &config.bookmarks, "", None);
+        // Append groups to filtered_indices for unified list
+        for (idx, _) in config.groups.iter().enumerate() {
+            filtered_indices.push(GROUP_INDEX_MARKER + idx);
+        }
         let theme = resolve_theme(&config.settings.theme);
         let tunnel_bookmarks = crate::ssh::tunnel::active_tunnel_bookmarks();
 
@@ -179,12 +187,23 @@ impl App {
 
     /// Recompute filtered_indices based on current search query and env filter.
     fn refilter(&mut self) {
-        self.filtered_indices = search_bar::filter_bookmarks(
+        let mut indices = search_bar::filter_bookmarks(
             &self.matcher,
             &self.config.bookmarks,
             &self.search_query,
             self.env_filter.as_deref(),
         );
+        // Append groups as unified list items (encoded as GROUP_INDEX_MARKER + group_idx)
+        for (idx, group) in self.config.groups.iter().enumerate() {
+            // Apply same search/env filter to groups
+            let name_match = self.search_query.is_empty()
+                || self.matcher.fuzzy_match(&group.name, &self.search_query).is_some();
+            let env_match = self.env_filter.as_ref().map_or(true, |f| f.is_empty() || group.env == *f);
+            if name_match && env_match {
+                indices.push(GROUP_INDEX_MARKER + idx);
+            }
+        }
+        self.filtered_indices = indices;
         // Clamp selection to valid range
         if self.filtered_indices.is_empty() {
             self.selected_index = 0;
@@ -193,12 +212,43 @@ impl App {
         }
     }
 
+    /// Check if a filtered index is a group (>= GROUP_INDEX_MARKER).
+    fn is_group_index(idx: usize) -> bool {
+        idx >= GROUP_INDEX_MARKER
+    }
+
+    /// Get the group index from a filtered index (returns None if it's a bookmark).
+    fn group_index_from_filtered(idx: usize) -> Option<usize> {
+        if idx >= GROUP_INDEX_MARKER {
+            Some(idx - GROUP_INDEX_MARKER)
+        } else {
+            None
+        }
+    }
+
     /// Get the bookmark index in config.bookmarks for the currently selected filtered item.
+    /// Returns None if the selected item is a group.
     fn selected_bookmark_index(&self) -> Option<usize> {
         if self.filtered_indices.is_empty() {
             None
         } else {
-            Some(self.filtered_indices[self.selected_index])
+            let idx = self.filtered_indices[self.selected_index];
+            if Self::is_group_index(idx) {
+                None
+            } else {
+                Some(idx)
+            }
+        }
+    }
+
+    /// Get the group index for the currently selected filtered item.
+    /// Returns None if the selected item is a bookmark.
+    fn selected_group_index(&self) -> Option<usize> {
+        if self.filtered_indices.is_empty() {
+            None
+        } else {
+            let idx = self.filtered_indices[self.selected_index];
+            Self::group_index_from_filtered(idx)
         }
     }
 
@@ -324,12 +374,13 @@ pub async fn run(config: &mut AppConfig, cfg_override: Option<&str>) -> Result<(
                 break;
             }
             LoopAction::Connect(index) => {
-                // Session indices are encoded as: group_idx * 10000 + session_idx
+                // Session indices are encoded as: (group_idx+1)*10000 + (session_idx+1)
                 // If index >= 10000, it's a session connection
                 if index >= 10000 {
-                    let display_name = if index / 10000 < app.config.groups.len() {
-                        let g = &app.config.groups[index / 10000];
-                        let s_idx = index % 10000;
+                    let group_idx = index / 10000 - 1;
+                    let s_idx = index % 10000 - 1;
+                    let display_name = if group_idx < app.config.groups.len() {
+                        let g = &app.config.groups[group_idx];
                         if s_idx < g.sessions.len() {
                             g.sessions[s_idx].display_name(g)
                         } else {
@@ -881,6 +932,7 @@ fn draw(frame: &mut ratatui::Frame, app: &App) {
 
 /// Handle a key event based on current screen and search state.
 fn handle_key_event(app: &mut App, key: KeyEvent) {
+    tracing::debug!("handle_key_event: code={:?} modifiers={:?} screen={:?}", key.code, key.modifiers, app.screen);
     // Ctrl+C always quits
     if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
         app.should_quit = true;
@@ -898,13 +950,8 @@ fn handle_key_event(app: &mut App, key: KeyEvent) {
 
 /// Handle key events in the list view (not searching).
 fn handle_list_key(app: &mut App, key: KeyEvent) {
-    // If we have groups, use session navigation
-    if !app.config.groups.is_empty() {
-        handle_session_list_key(app, key);
-        return;
-    }
-
-    // No groups — use bookmark navigation
+    tracing::debug!("handle_list_key: code={:?} groups={}", key.code, app.config.groups.len());
+    // Unified list: always use bookmark navigation (groups are in filtered_indices)
     match key.code {
         // Quit
         KeyCode::Char('q') => app.should_quit = true,
@@ -949,6 +996,12 @@ fn handle_list_key(app: &mut App, key: KeyEvent) {
         KeyCode::Enter => {
             if let Some(idx) = app.selected_bookmark_index() {
                 app.connect_request = Some(idx);
+            } else if let Some(group_idx) = app.selected_group_index() {
+                // Connect to the group's first session
+                if !app.config.groups[group_idx].sessions.is_empty() {
+                    let encoded = (group_idx + 1) * 10000 + 1;
+                    app.connect_request = Some(encoded);
+                }
             }
         }
         KeyCode::Char('a') => {
@@ -970,6 +1023,12 @@ fn handle_list_key(app: &mut App, key: KeyEvent) {
                 let bookmark = &app.config.bookmarks[idx];
                 app.form_state = Some(FormState::new_edit(idx, EditTarget::Bookmark, bookmark, &profile_names));
                 app.screen = Screen::EditForm(EditTarget::Bookmark, idx);
+            } else if let Some(group_idx) = app.selected_group_index() {
+                let profile_names: Vec<String> =
+                    app.config.profiles.iter().map(|p| p.name.clone()).collect();
+                let group = &app.config.groups[group_idx];
+                app.form_state = Some(FormState::new_edit(group_idx, EditTarget::Group, group, &profile_names));
+                app.screen = Screen::EditForm(EditTarget::Group, group_idx);
             }
         }
         KeyCode::Char('d') => {
@@ -977,11 +1036,17 @@ fn handle_list_key(app: &mut App, key: KeyEvent) {
                 let bookmark = &app.config.bookmarks[idx];
                 app.confirm_state = Some(ConfirmState::new(bookmark));
                 app.screen = Screen::DeleteConfirm(idx);
+            } else if let Some(group_idx) = app.selected_group_index() {
+                let group = &app.config.groups[group_idx];
+                app.confirm_state = Some(ConfirmState::new_group(group));
+                app.screen = Screen::DeleteConfirm(GROUP_INDEX_MARKER + group_idx);
             }
         }
         KeyCode::Char('f') => {
             if let Some(idx) = app.selected_bookmark_index() {
                 app.browse_request = Some(idx);
+            } else if let Some(group_idx) = app.selected_group_index() {
+                app.browse_request = Some(GROUP_INDEX_MARKER + group_idx);
             }
         }
 
@@ -1020,9 +1085,10 @@ fn handle_session_list_key(app: &mut App, key: KeyEvent) {
         // Connect to selected session
         KeyCode::Enter => {
             if let Some((group_idx, session_idx)) = app.selected_session {
-                // Encode as a single index for the connect_request
-                // group_idx * 10000 + session_idx (assuming < 10000 sessions per group)
-                let encoded = group_idx * 10000 + session_idx;
+                // Encode as: (group_idx+1)*10000 + (session_idx+1)
+                // The +1 offset ensures (0,0) encodes to 10001, always >= 10000
+                // so it's never confused with a bookmark index.
+                let encoded = (group_idx + 1) * 10000 + (session_idx + 1);
                 app.connect_request = Some(encoded);
             }
         }
@@ -1165,7 +1231,10 @@ fn handle_unified_form_key(app: &mut App, key: KeyEvent) {
         KeyCode::Right if form.focused() == FIELD_ENV => form.cycle_env_right(),
         KeyCode::Left if form.focused() == FIELD_PROFILE => form.cycle_profile_left(),
         KeyCode::Right if form.focused() == FIELD_PROFILE => form.cycle_profile_right(),
+        KeyCode::Left => form.move_cursor_left(),
+        KeyCode::Right => form.move_cursor_right(),
         KeyCode::Backspace => form.delete_char(),
+        KeyCode::Delete => form.delete_char_forward(),
         KeyCode::Char('o') if key.modifiers.contains(KeyModifiers::CONTROL) => {
             // Ctrl+O: add a new session line
             tracing::debug!("add_session_line via Ctrl+O (Char+mod)");
@@ -1194,7 +1263,7 @@ fn handle_unified_form_key(app: &mut App, key: KeyEvent) {
             app.help_source = Some(app.screen.clone());
             app.screen = Screen::Help;
         }
-        KeyCode::Char(c) => form.insert_char(c),
+        KeyCode::Char(c) if !c.is_control() => form.insert_char(c),
         _ => {}
     }
 }
@@ -1203,10 +1272,12 @@ fn handle_unified_form_key(app: &mut App, key: KeyEvent) {
 /// Try to validate and save the unified form. Handles both bookmark and group mode.
 fn try_save_unified_form(app: &mut App) {
     let Some(ref mut form) = app.form_state else {
+        tracing::debug!("try_save: no form_state");
         return;
     };
 
     let is_group = form.inner().is_group();
+    tracing::debug!("try_save: is_group={}", is_group);
 
     if is_group {
         match form.validate_and_build_group(&app.config) {
@@ -1218,6 +1289,25 @@ fn try_save_unified_form(app: &mut App) {
                     }
                     Screen::EditForm(EditTarget::Group, idx) => {
                         app.config.groups[idx] = group;
+                    }
+                    Screen::EditForm(EditTarget::Bookmark, idx) => {
+                        // Bookmark was edited and gained sessions → became a group.
+                        // Migrate password if the name changed.
+                        let orig_name = app.config.bookmarks[idx].name.clone();
+                        if orig_name != name {
+                            if let Ok(Some(pw)) = keychain::get_password(&orig_name) {
+                                if let Err(e) = keychain::set_password(&name, &pw) {
+                                    app.set_status(format!("Warning: failed to migrate password: {e}"));
+                                }
+                                if let Err(e) = keychain::delete_password(&orig_name) {
+                                    app.set_status(format!(
+                                        "Warning: failed to remove old keychain entry: {e}"
+                                    ));
+                                }
+                            }
+                        }
+                        app.config.bookmarks.remove(idx);
+                        app.config.groups.push(group);
                     }
                     _ => {}
                 }
@@ -1231,6 +1321,7 @@ fn try_save_unified_form(app: &mut App) {
                 app.refilter();
             }
             Err(e) => {
+                tracing::debug!(error = %e, "try_save: validate_and_build_group failed");
                 app.status_message = Some((e.to_string(), Instant::now()));
             }
         }
@@ -1253,23 +1344,46 @@ fn try_save_unified_form(app: &mut App) {
                     None
                 };
 
+                tracing::debug!(screen = ?app.screen, name = %name, "try_save: bookmark path");
                 match app.screen {
                     Screen::AddForm => {
+                        tracing::debug!("try_save: AddForm, pushing bookmark");
                         app.config.bookmarks.push(bookmark);
                     }
                     Screen::EditForm(EditTarget::Bookmark, idx) => {
+                        tracing::debug!(idx, "try_save: EditForm Bookmark, updating");
                         let original = &app.config.bookmarks[idx];
                         let mut updated = bookmark;
                         updated.last_connected = original.last_connected;
                         updated.connect_count = original.connect_count;
                         app.config.bookmarks[idx] = updated;
                     }
+                    Screen::EditForm(EditTarget::Group, idx) => {
+                        // Group was edited and lost all sessions → became a bookmark.
+                        let orig_name = app.config.groups[idx].name.clone();
+                        if orig_name != name {
+                            if let Ok(Some(pw)) = keychain::get_password(&orig_name) {
+                                if let Err(e) = keychain::set_password(&name, &pw) {
+                                    app.set_status(format!("Warning: failed to migrate password: {e}"));
+                                }
+                                if let Err(e) = keychain::delete_password(&orig_name) {
+                                    app.set_status(format!(
+                                        "Warning: failed to remove old keychain entry: {e}"
+                                    ));
+                                }
+                            }
+                        }
+                        app.config.groups.remove(idx);
+                        app.config.bookmarks.push(bookmark);
+                    }
                     _ => {}
                 }
 
                 if let Err(e) = app.save_config() {
+                    tracing::debug!(error = %e, "try_save: save_config failed");
                     app.set_status(format!("Error saving config: {e}"));
                 } else {
+                    tracing::debug!(name = %name, "try_save: save_config ok");
                     app.set_status(format!("Bookmark '{name}' saved"));
                 }
 
@@ -1307,6 +1421,7 @@ fn try_save_unified_form(app: &mut App) {
                 app.status_message = Some(("Unexpected group entry in bookmark path".to_string(), Instant::now()));
             }
             Err(e) => {
+                tracing::debug!(error = %e, "try_save: validate_and_build failed");
                 app.status_message = Some((e.to_string(), Instant::now()));
             }
         }
@@ -1372,7 +1487,7 @@ fn handle_confirm_key(app: &mut App, key: KeyEvent) {
         KeyCode::Backspace if state.is_production => {
             state.delete_char();
         }
-        KeyCode::Char(c) if state.is_production => {
+        KeyCode::Char(c) if state.is_production && !c.is_control() => {
             state.insert_char(c);
         }
         _ => {}
@@ -1929,7 +2044,13 @@ mod tests {
         let config = AppConfig {
             settings: Settings::default(),
             profiles: vec![],
-            bookmarks: vec![],
+            bookmarks: vec![
+                sample_bookmark("prod-web-01", "production"),
+                sample_bookmark("staging-api", "staging"),
+                sample_bookmark("dev-worker", "development"),
+                sample_bookmark("local-docker", "local"),
+                sample_bookmark("test-runner", "testing"),
+            ],
             groups,
         };
         App::new(config)
@@ -1947,130 +2068,93 @@ mod tests {
         assert!(app.selected_session.is_none());
     }
 
+    // Unified list tests (bookmarks + groups in same list)
     #[test]
-    fn test_move_session_selection_down() {
+    fn test_unified_list_navigation() {
         let mut app = app_with_groups(vec![sample_group()]);
-        // Start at (0, 0)
-        assert_eq!(app.selected_session, Some((0, 0)));
+        // filtered_indices has bookmarks + groups
+        // With sample bookmarks (5) + 1 group = 6 items
+        assert!(app.filtered_indices.len() >= 6);
 
         // Move down
         let down = KeyEvent::new(KeyCode::Down, KeyModifiers::NONE);
         handle_key_event(&mut app, down);
-        assert_eq!(app.selected_session, Some((0, 1)));
+        assert_eq!(app.selected_index, 1);
 
-        // Move down again
-        let down = KeyEvent::new(KeyCode::Down, KeyModifiers::NONE);
-        handle_key_event(&mut app, down);
-        assert_eq!(app.selected_session, Some((0, 2)));
-
-        // At the end — should stay
-        let down = KeyEvent::new(KeyCode::Down, KeyModifiers::NONE);
-        handle_key_event(&mut app, down);
-        assert_eq!(app.selected_session, Some((0, 2)));
-    }
-
-    #[test]
-    fn test_move_session_selection_up() {
-        let mut app = app_with_groups(vec![sample_group()]);
-        // Start at (0, 0) — already at top
+        // Move up
         let up = KeyEvent::new(KeyCode::Up, KeyModifiers::NONE);
         handle_key_event(&mut app, up);
-        assert_eq!(app.selected_session, Some((0, 0)));
-
-        // Move to (0, 2) first
-        app.selected_session = Some((0, 2));
-        let up = KeyEvent::new(KeyCode::Up, KeyModifiers::NONE);
-        handle_key_event(&mut app, up);
-        assert_eq!(app.selected_session, Some((0, 1)));
-
-        let up = KeyEvent::new(KeyCode::Up, KeyModifiers::NONE);
-        handle_key_event(&mut app, up);
-        assert_eq!(app.selected_session, Some((0, 0)));
+        assert_eq!(app.selected_index, 0);
     }
 
     #[test]
-    fn test_move_session_across_groups() {
-        let mut app = app_with_groups(vec![sample_group(), sample_group2()]);
-        // Start at (0, 0) — first session in first group
-        assert_eq!(app.selected_session, Some((0, 0)));
-
-        // Navigate down: (0,0) -> (0,1) -> (0,2) -> (1,0)
-        for _ in 0..3 {
-            let down = KeyEvent::new(KeyCode::Down, KeyModifiers::NONE);
-            handle_key_event(&mut app, down);
-        }
-        assert_eq!(app.selected_session, Some((1, 0)));
-
-        // One more down: (1,0) -> (1,1)
-        let down = KeyEvent::new(KeyCode::Down, KeyModifiers::NONE);
-        handle_key_event(&mut app, down);
-        assert_eq!(app.selected_session, Some((1, 1)));
-    }
-
-    #[test]
-    fn test_toggle_group_collapse() {
+    fn test_unified_list_enter_on_group() {
         let mut app = app_with_groups(vec![sample_group()]);
-        assert_eq!(app.selected_session, Some((0, 0)));
-        assert!(app.collapsed_groups.is_empty());
-
-        // Press space to toggle collapse
-        let space = KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE);
-        handle_key_event(&mut app, space);
-        assert!(app.collapsed_groups.contains(&0));
-
-        // Press space again to expand
-        let space = KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE);
-        handle_key_event(&mut app, space);
-        assert!(!app.collapsed_groups.contains(&0));
-    }
-
-    #[test]
-    fn test_navigation_skips_collapsed_group_sessions() {
-        let mut app = app_with_groups(vec![sample_group(), sample_group2()]);
-        // Collapse group 0
-        app.collapsed_groups.insert(0);
-        // Select first session of group 0 (even though it's collapsed)
-        app.selected_session = Some((0, 0));
-
-        // Move down — (0,0) is not visible, so current_pos falls to 0
-        // which is (1,0). Then down moves to (1,1).
-        let down = KeyEvent::new(KeyCode::Down, KeyModifiers::NONE);
-        handle_key_event(&mut app, down);
-        // Since (0,0) is not in visible list, position defaults to 0 = (1,0)
-        // Then +1 delta goes to (1,1)
-        assert_eq!(app.selected_session, Some((1, 1)));
-    }
-
-    #[test]
-    fn test_enter_triggers_connect_request() {
-        let mut app = app_with_groups(vec![sample_group()]);
-        assert_eq!(app.selected_session, Some((0, 0)));
+        // Move to the group (last item in filtered_indices)
+        app.selected_index = app.filtered_indices.len() - 1;
+        assert!(App::is_group_index(app.filtered_indices[app.selected_index]));
 
         let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
         handle_key_event(&mut app, enter);
-        // connect_request is encoded as group_idx * 10000 + session_idx
-        assert_eq!(app.connect_request, Some(0));
+        // Should connect to first session of the group: (0+1)*10000 + (0+1) = 10001
+        assert_eq!(app.connect_request, Some(10001));
     }
 
     #[test]
-    fn test_home_moves_to_first_session() {
-        let mut app = app_with_groups(vec![sample_group(), sample_group2()]);
-        // Move to last session
-        app.selected_session = Some((1, 1));
+    fn test_unified_list_enter_on_bookmark() {
+        let mut app = app_with_groups(vec![sample_group()]);
+        app.selected_index = 0; // First bookmark
+        assert!(!App::is_group_index(app.filtered_indices[0]));
+
+        let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+        handle_key_event(&mut app, enter);
+        // Should connect to the bookmark directly
+        assert_eq!(app.connect_request, Some(app.filtered_indices[0]));
+    }
+
+    #[test]
+    fn test_unified_list_edit_group() {
+        let mut app = app_with_groups(vec![sample_group()]);
+        // Move to the group
+        app.selected_index = app.filtered_indices.len() - 1;
+
+        let e = KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE);
+        handle_key_event(&mut app, e);
+        assert!(matches!(app.screen, Screen::EditForm(EditTarget::Group, _)));
+    }
+
+    #[test]
+    fn test_unified_list_edit_bookmark() {
+        let mut app = app_with_groups(vec![sample_group()]);
+        app.selected_index = 0;
+
+        let e = KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE);
+        handle_key_event(&mut app, e);
+        assert!(matches!(app.screen, Screen::EditForm(EditTarget::Bookmark, _)));
+    }
+
+    #[test]
+    fn test_unified_list_delete_group() {
+        let mut app = app_with_groups(vec![sample_group()]);
+        app.selected_index = app.filtered_indices.len() - 1;
+
+        let d = KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE);
+        handle_key_event(&mut app, d);
+        assert!(matches!(app.screen, Screen::DeleteConfirm(_)));
+    }
+
+    #[test]
+    fn test_unified_list_home_end() {
+        let mut app = app_with_groups(vec![sample_group()]);
+        app.selected_index = app.filtered_indices.len() / 2;
 
         let g = KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE);
         handle_key_event(&mut app, g);
-        assert_eq!(app.selected_session, Some((0, 0)));
-    }
-
-    #[test]
-    fn test_end_moves_to_last_session() {
-        let mut app = app_with_groups(vec![sample_group(), sample_group2()]);
-        app.selected_session = Some((0, 0));
+        assert_eq!(app.selected_index, 0);
 
         let end = KeyEvent::new(KeyCode::End, KeyModifiers::NONE);
         handle_key_event(&mut app, end);
-        assert_eq!(app.selected_session, Some((1, 1)));
+        assert_eq!(app.selected_index, app.filtered_indices.len() - 1);
     }
 
     #[test]

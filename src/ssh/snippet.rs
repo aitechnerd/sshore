@@ -584,7 +584,7 @@ pub fn show_save_bookmark_form(
                         session_info,
                     )?;
                 }
-                KeyCode::Char(c) => {
+                KeyCode::Char(c) if !c.is_control() => {
                     match BOOKMARK_FIELDS[field_idx] {
                         BookmarkField::Name => name.push(c),
                         BookmarkField::Tags => tags.push(c),

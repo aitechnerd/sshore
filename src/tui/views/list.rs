@@ -17,19 +17,16 @@ const LEFT_PANE_WIDTH: u16 = 30;
 pub fn render_list(frame: &mut Frame, area: Rect, app: &App) {
     let tc = &app.theme;
 
-    // If we have groups, use split-pane layout
-    if !app.config.groups.is_empty() {
-        render_split_layout(frame, area, app);
-        return;
-    }
+    // Check if we have any items to show (bookmarks or groups)
+    let has_items = !app.config.bookmarks.is_empty() || !app.config.groups.is_empty();
+    let has_filtered = !app.filtered_indices.is_empty();
 
-    // No groups — fall back to bookmark-only layout
-    if app.config.bookmarks.is_empty() {
+    if !has_items {
         render_empty_state(frame, area, tc);
         return;
     }
 
-    if app.filtered_indices.is_empty() {
+    if !has_filtered {
         render_no_matches(frame, area, tc);
         return;
     }
@@ -209,7 +206,7 @@ fn render_terminal_pane(frame: &mut Frame, area: Rect, app: &App) {
     frame.render_widget(paragraph, area);
 }
 
-/// Render the bookmark table (used when no groups exist).
+/// Render the unified bookmark+group table.
 fn render_bookmark_table(frame: &mut Frame, area: Rect, app: &App) {
     let tc = &app.theme;
 
@@ -227,58 +224,77 @@ fn render_bookmark_table(frame: &mut Frame, area: Rect, app: &App) {
         .filtered_indices
         .iter()
         .enumerate()
-        .map(|(display_idx, &bookmark_idx)| {
-            let bookmark = &app.config.bookmarks[bookmark_idx];
+        .map(|(display_idx, &filtered_idx)| {
             let is_selected = display_idx == app.selected_index;
 
-            let env_span = env_badge::env_badge_span(&bookmark.env, &app.config.settings);
-            let env_cell = Cell::from(Line::from(vec![env_span]));
-
-            // Tunnel indicator: "T" if this bookmark has an active tunnel
-            let tunnel_cell = if app.tunnel_bookmarks.contains(&bookmark.name) {
-                Cell::from(Span::styled(
-                    "T",
-                    Style::default().fg(tc.accent).add_modifier(Modifier::BOLD),
-                ))
+            // Check if this is a group (filtered_idx >= GROUP_INDEX_MARKER)
+            if filtered_idx >= crate::tui::GROUP_INDEX_MARKER {
+                let group_idx = filtered_idx - crate::tui::GROUP_INDEX_MARKER;
+                let group = &app.config.groups[group_idx];
+                let env_span = env_badge::env_badge_span(&group.env, &app.config.settings);
+                let env_cell = Cell::from(Line::from(vec![env_span]));
+                let tunnel_cell = if app.tunnel_bookmarks.contains(&group.name) {
+                    Cell::from(Span::styled("T", Style::default().fg(tc.accent).add_modifier(Modifier::BOLD)))
+                } else {
+                    Cell::from("")
+                };
+                let name_style = if is_selected {
+                    Style::default().add_modifier(Modifier::BOLD).fg(tc.fg).bg(tc.highlight)
+                } else {
+                    Style::default().fg(tc.fg)
+                };
+                let session_indicator = format!(" ({} sessions)", group.sessions.len());
+                let name_display = format!("{}{}", group.name, session_indicator);
+                let name_cell = Cell::from(name_display).style(name_style);
+                let host_style = if is_selected {
+                    Style::default().fg(tc.fg).bg(tc.highlight)
+                } else {
+                    Style::default().fg(tc.fg)
+                };
+                let host_cell = Cell::from(group.host.as_str()).style(host_style);
+                let tags_text = if group.tags.is_empty() { String::new() } else { group.tags.join(", ") };
+                let tags_style = if is_selected {
+                    Style::default().fg(tc.fg_dim).bg(tc.highlight)
+                } else {
+                    Style::default().fg(tc.fg_muted)
+                };
+                let tags_cell = Cell::from(tags_text).style(tags_style);
+                Row::new(vec![env_cell, tunnel_cell, name_cell, host_cell, tags_cell])
             } else {
-                Cell::from("")
-            };
-
-            let name_style = if is_selected {
-                Style::default()
-                    .add_modifier(Modifier::BOLD)
-                    .fg(tc.fg)
-                    .bg(tc.highlight)
-            } else {
-                Style::default().fg(tc.fg)
-            };
-            let name_display = format_name_display(
-                &bookmark.name,
-                bookmark.profile.as_deref(),
-                bookmark.snippets.len(),
-            );
-            let name_cell = Cell::from(name_display).style(name_style);
-
-            let host_style = if is_selected {
-                Style::default().fg(tc.fg).bg(tc.highlight)
-            } else {
-                Style::default().fg(tc.fg)
-            };
-            let host_cell = Cell::from(bookmark.host.as_str()).style(host_style);
-
-            let tags_text = if bookmark.tags.is_empty() {
-                String::new()
-            } else {
-                bookmark.tags.join(", ")
-            };
-            let tags_style = if is_selected {
-                Style::default().fg(tc.fg_dim).bg(tc.highlight)
-            } else {
-                Style::default().fg(tc.fg_muted)
-            };
-            let tags_cell = Cell::from(tags_text).style(tags_style);
-
-            Row::new(vec![env_cell, tunnel_cell, name_cell, host_cell, tags_cell])
+                let bookmark = &app.config.bookmarks[filtered_idx];
+                let env_span = env_badge::env_badge_span(&bookmark.env, &app.config.settings);
+                let env_cell = Cell::from(Line::from(vec![env_span]));
+                let tunnel_cell = if app.tunnel_bookmarks.contains(&bookmark.name) {
+                    Cell::from(Span::styled("T", Style::default().fg(tc.accent).add_modifier(Modifier::BOLD)))
+                } else {
+                    Cell::from("")
+                };
+                let name_style = if is_selected {
+                    Style::default().add_modifier(Modifier::BOLD).fg(tc.fg).bg(tc.highlight)
+                } else {
+                    Style::default().fg(tc.fg)
+                };
+                let name_display = format_name_display(
+                    &bookmark.name,
+                    bookmark.profile.as_deref(),
+                    bookmark.snippets.len(),
+                );
+                let name_cell = Cell::from(name_display).style(name_style);
+                let host_style = if is_selected {
+                    Style::default().fg(tc.fg).bg(tc.highlight)
+                } else {
+                    Style::default().fg(tc.fg)
+                };
+                let host_cell = Cell::from(bookmark.host.as_str()).style(host_style);
+                let tags_text = if bookmark.tags.is_empty() { String::new() } else { bookmark.tags.join(", ") };
+                let tags_style = if is_selected {
+                    Style::default().fg(tc.fg_dim).bg(tc.highlight)
+                } else {
+                    Style::default().fg(tc.fg_muted)
+                };
+                let tags_cell = Cell::from(tags_text).style(tags_style);
+                Row::new(vec![env_cell, tunnel_cell, name_cell, host_cell, tags_cell])
+            }
         })
         .collect();
 

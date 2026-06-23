@@ -48,6 +48,59 @@ const FIELD_ON_CONNECT: usize = 9;
 const FIELD_PASSWORD: usize = 10;
 pub(crate) const FIELD_PROFILE: usize = 11;
 
+fn cursor_positions_at_end(fields: &[String; FIELD_COUNT]) -> [usize; FIELD_COUNT] {
+    std::array::from_fn(|i| fields[i].len())
+}
+
+fn prev_char_boundary(s: &str, pos: usize) -> usize {
+    s[..pos].char_indices().last().map_or(0, |(idx, _)| idx)
+}
+
+fn next_char_boundary(s: &str, pos: usize) -> usize {
+    s[pos..]
+        .char_indices()
+        .nth(1)
+        .map_or(s.len(), |(idx, _)| pos + idx)
+}
+
+fn insert_at_cursor(
+    fields: &mut [String; FIELD_COUNT],
+    cursor_positions: &mut [usize; FIELD_COUNT],
+    focused: usize,
+    c: char,
+) {
+    let pos = cursor_positions[focused].min(fields[focused].len());
+    fields[focused].insert(pos, c);
+    cursor_positions[focused] = pos + c.len_utf8();
+}
+
+fn delete_before_cursor(
+    fields: &mut [String; FIELD_COUNT],
+    cursor_positions: &mut [usize; FIELD_COUNT],
+    focused: usize,
+) {
+    let pos = cursor_positions[focused].min(fields[focused].len());
+    if pos == 0 {
+        return;
+    }
+    let prev = prev_char_boundary(&fields[focused], pos);
+    fields[focused].drain(prev..pos);
+    cursor_positions[focused] = prev;
+}
+
+fn delete_at_cursor(
+    fields: &mut [String; FIELD_COUNT],
+    cursor_positions: &mut [usize; FIELD_COUNT],
+    focused: usize,
+) {
+    let pos = cursor_positions[focused].min(fields[focused].len());
+    if pos == fields[focused].len() {
+        return;
+    }
+    let next = next_char_boundary(&fields[focused], pos);
+    fields[focused].drain(pos..next);
+}
+
 /// Target type for editing: a bookmark or a group.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum EditTarget {
@@ -83,6 +136,8 @@ impl EditableItem for BookmarkGroup {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UnifiedForm {
     pub fields: [String; FIELD_COUNT],
+    /// Cursor byte offset for each editable field.
+    pub cursor_positions: [usize; FIELD_COUNT],
     pub focused: usize,
     pub env_index: usize,
     /// Index into `profile_options` for the profile cycle selector.
@@ -110,6 +165,8 @@ pub struct UnifiedForm {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BookmarkForm {
     pub fields: [String; FIELD_COUNT],
+    /// Cursor byte offset for each editable field.
+    pub cursor_positions: [usize; FIELD_COUNT],
     pub focused: usize,
     pub env_index: usize,
     /// Index into `profile_options` for the profile cycle selector.
@@ -131,6 +188,8 @@ pub struct BookmarkForm {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GroupForm {
     pub fields: [String; FIELD_COUNT],
+    /// Cursor byte offset for each editable field.
+    pub cursor_positions: [usize; FIELD_COUNT],
     pub focused: usize,
     pub env_index: usize,
     pub profile_index: usize,
@@ -169,6 +228,7 @@ impl BookmarkForm {
         let profile_options = build_profile_options(profile_names);
 
         Self {
+            cursor_positions: cursor_positions_at_end(&fields),
             fields,
             focused: FIELD_NAME,
             env_index: 0,     // (none)
@@ -217,6 +277,7 @@ impl BookmarkForm {
             .is_some();
 
         Self {
+            cursor_positions: cursor_positions_at_end(&fields),
             fields,
             focused: FIELD_NAME,
             env_index,
@@ -290,7 +351,7 @@ impl BookmarkForm {
         if self.focused == FIELD_ENV || self.focused == FIELD_PROFILE {
             return;
         }
-        self.fields[self.focused].push(c);
+        insert_at_cursor(&mut self.fields, &mut self.cursor_positions, self.focused, c);
         self.error = None;
 
         if self.focused == FIELD_PASSWORD {
@@ -308,7 +369,7 @@ impl BookmarkForm {
         if self.focused == FIELD_ENV || self.focused == FIELD_PROFILE {
             return;
         }
-        self.fields[self.focused].pop();
+        delete_before_cursor(&mut self.fields, &mut self.cursor_positions, self.focused);
         self.error = None;
 
         if self.focused == FIELD_PASSWORD {
@@ -431,6 +492,7 @@ impl UnifiedForm {
         let profile_options = build_profile_options(profile_names);
 
         Self {
+            cursor_positions: cursor_positions_at_end(&fields),
             fields,
             focused: FIELD_NAME,
             env_index: 0,     // (none)
@@ -479,6 +541,7 @@ impl UnifiedForm {
             .is_some();
 
         Self {
+            cursor_positions: cursor_positions_at_end(&fields),
             fields,
             focused: FIELD_NAME,
             env_index,
@@ -528,6 +591,7 @@ impl UnifiedForm {
         };
 
         Self {
+            cursor_positions: cursor_positions_at_end(&fields),
             fields,
             focused: FIELD_NAME,
             env_index,
@@ -669,7 +733,7 @@ impl UnifiedForm {
             self.error = None;
             return;
         }
-        self.fields[self.focused].push(c);
+        insert_at_cursor(&mut self.fields, &mut self.cursor_positions, self.focused, c);
         self.error = None;
 
         if self.focused == FIELD_PASSWORD {
@@ -702,7 +766,7 @@ impl UnifiedForm {
             self.error = None;
             return;
         }
-        self.fields[self.focused].pop();
+        delete_before_cursor(&mut self.fields, &mut self.cursor_positions, self.focused);
         self.error = None;
 
         if self.focused == FIELD_PASSWORD {
@@ -952,6 +1016,7 @@ impl GroupForm {
         let profile_options = build_profile_options(profile_names);
 
         Self {
+            cursor_positions: cursor_positions_at_end(&fields),
             fields,
             focused: FIELD_NAME,
             env_index: 0,     // (none)
@@ -999,6 +1064,7 @@ impl GroupForm {
         };
 
         Self {
+            cursor_positions: cursor_positions_at_end(&fields),
             fields,
             focused: FIELD_NAME,
             env_index,
@@ -1072,7 +1138,7 @@ impl GroupForm {
         if self.focused == FIELD_ENV || self.focused == FIELD_PROFILE {
             return;
         }
-        self.fields[self.focused].push(c);
+        insert_at_cursor(&mut self.fields, &mut self.cursor_positions, self.focused, c);
         self.error = None;
 
         // Auto-detect env when name or host changes
@@ -1086,7 +1152,7 @@ impl GroupForm {
         if self.focused == FIELD_ENV || self.focused == FIELD_PROFILE {
             return;
         }
-        self.fields[self.focused].pop();
+        delete_before_cursor(&mut self.fields, &mut self.cursor_positions, self.focused);
         self.error = None;
 
         if self.focused == FIELD_NAME || self.focused == FIELD_HOST {
@@ -1309,6 +1375,49 @@ impl FormState {
             Self::Add(f) => f.delete_char(),
             Self::Edit(_, _, f) => f.delete_char(),
         }
+    }
+
+    /// Delete the character at the cursor from the current field.
+    pub fn delete_char_forward(&mut self) {
+        let f = match self {
+            Self::Add(f) => f,
+            Self::Edit(_, _, f) => f,
+        };
+        if f.focused == FIELD_ENV || f.focused == FIELD_PROFILE || f.focused >= FIELD_COUNT {
+            return;
+        }
+        delete_at_cursor(&mut f.fields, &mut f.cursor_positions, f.focused);
+        f.error = None;
+        if f.focused == FIELD_PASSWORD {
+            f.password_modified = true;
+        }
+        if f.focused == FIELD_NAME || f.focused == FIELD_HOST {
+            f.auto_detect_env();
+        }
+    }
+
+    pub fn move_cursor_left(&mut self) {
+        let f = match self {
+            Self::Add(f) => f,
+            Self::Edit(_, _, f) => f,
+        };
+        if f.focused == FIELD_ENV || f.focused == FIELD_PROFILE || f.focused >= FIELD_COUNT {
+            return;
+        }
+        let pos = f.cursor_positions[f.focused].min(f.fields[f.focused].len());
+        f.cursor_positions[f.focused] = prev_char_boundary(&f.fields[f.focused], pos);
+    }
+
+    pub fn move_cursor_right(&mut self) {
+        let f = match self {
+            Self::Add(f) => f,
+            Self::Edit(_, _, f) => f,
+        };
+        if f.focused == FIELD_ENV || f.focused == FIELD_PROFILE || f.focused >= FIELD_COUNT {
+            return;
+        }
+        let pos = f.cursor_positions[f.focused].min(f.fields[f.focused].len());
+        f.cursor_positions[f.focused] = next_char_boundary(&f.fields[f.focused], pos);
     }
 
     /// Get the selected environment string.
@@ -1539,9 +1648,10 @@ fn render_unified_form(
     if !form.sessions_collapsed && !form.sessions.is_empty() {
         // Sessions header
         constraints.push(Constraint::Length(1));
-        // Session lines (2 per session: name + command)
+        // Session lines (2 per session: name + command, each Length(1))
         for _ in 0..form.sessions.len() {
-            constraints.push(Constraint::Length(2));
+            constraints.push(Constraint::Length(1)); // name line
+            constraints.push(Constraint::Length(1)); // cmd line
         }
     }
 
@@ -2049,6 +2159,7 @@ fn render_bookmark_form(
 /// Trait for shared form field access (used by render functions).
 trait FormFields {
     fn fields(&self) -> &[String; FIELD_COUNT];
+    fn cursor_positions(&self) -> &[usize; FIELD_COUNT];
     fn focused(&self) -> usize;
     fn env_index(&self) -> usize;
     fn profile_index(&self) -> usize;
@@ -2061,6 +2172,7 @@ trait FormFields {
 
 impl FormFields for BookmarkForm {
     fn fields(&self) -> &[String; FIELD_COUNT] { &self.fields }
+    fn cursor_positions(&self) -> &[usize; FIELD_COUNT] { &self.cursor_positions }
     fn focused(&self) -> usize { self.focused }
     fn env_index(&self) -> usize { self.env_index }
     fn profile_index(&self) -> usize { self.profile_index }
@@ -2073,6 +2185,7 @@ impl FormFields for BookmarkForm {
 
 impl FormFields for GroupForm {
     fn fields(&self) -> &[String; FIELD_COUNT] { &self.fields }
+    fn cursor_positions(&self) -> &[usize; FIELD_COUNT] { &self.cursor_positions }
     fn focused(&self) -> usize { self.focused }
     fn env_index(&self) -> usize { self.env_index }
     fn profile_index(&self) -> usize { self.profile_index }
@@ -2085,6 +2198,7 @@ impl FormFields for GroupForm {
 
 impl FormFields for UnifiedForm {
     fn fields(&self) -> &[String; FIELD_COUNT] { &self.fields }
+    fn cursor_positions(&self) -> &[usize; FIELD_COUNT] { &self.cursor_positions }
     fn focused(&self) -> usize { self.focused }
     fn env_index(&self) -> usize { self.env_index }
     fn profile_index(&self) -> usize { self.profile_index }
@@ -2093,6 +2207,26 @@ impl FormFields for UnifiedForm {
     fn error(&self) -> Option<String> { self.error.clone() }
     fn has_stored_password(&self) -> bool { self.has_stored_password }
     fn password_modified(&self) -> bool { self.password_modified }
+}
+
+fn text_field_line(
+    prefix: &str,
+    value: &str,
+    cursor_pos: usize,
+    is_focused: bool,
+    style: Style,
+) -> Line<'static> {
+    if !is_focused {
+        return Line::from(Span::styled(format!("{prefix}{value}"), style));
+    }
+    let pos = cursor_pos.min(value.len());
+    let (before, after) = value.split_at(pos);
+    Line::from(vec![
+        Span::styled(prefix.to_string(), style),
+        Span::styled(before.to_string(), style),
+        Span::styled("_".to_string(), style),
+        Span::styled(after.to_string(), style),
+    ])
 }
 
 /// Render a single form field (label + value).
@@ -2139,7 +2273,6 @@ fn render_field(
     } else if field_idx == FIELD_PROXY {
         render_proxy_jump_field(frame, input_area, form, is_focused, tc);
     } else {
-        let cursor = if is_focused { "_" } else { "" };
         let value = &form.fields()[field_idx];
         let input_style = if is_focused {
             Style::default().fg(tc.fg)
@@ -2147,10 +2280,7 @@ fn render_field(
             Style::default().fg(tc.fg_muted)
         };
         let prefix = if is_focused { "  > " } else { "    " };
-        let line = Line::from(Span::styled(
-            format!("{prefix}{value}{cursor}"),
-            input_style,
-        ));
+        let line = text_field_line(prefix, value, form.cursor_positions()[field_idx], is_focused, input_style);
         frame.render_widget(Paragraph::new(line), input_area);
     }
 }
@@ -2252,10 +2382,9 @@ fn render_proxy_jump_field(
 ) {
     let prefix = if is_focused { "  > " } else { "    " };
     let value = &form.fields()[FIELD_PROXY];
-    let cursor = if is_focused { "_" } else { "" };
-
     let line = if value.is_empty() {
         let style = Style::default().fg(tc.fg_dim);
+        let cursor = if is_focused { "_" } else { "" };
         Line::from(Span::styled(
             format!("{prefix}{PROXY_JUMP_PLACEHOLDER}{cursor}"),
             style,
@@ -2266,7 +2395,7 @@ fn render_proxy_jump_field(
         } else {
             Style::default().fg(tc.fg_muted)
         };
-        Line::from(Span::styled(format!("{prefix}{value}{cursor}"), style))
+        text_field_line(prefix, value, form.cursor_positions()[FIELD_PROXY], is_focused, style)
     };
 
     frame.render_widget(Paragraph::new(line), area);
@@ -2284,14 +2413,14 @@ fn render_password_field(
     let value = &form.fields()[FIELD_PASSWORD];
 
     let line = if !value.is_empty() {
-        let dots: String = "●".repeat(value.len());
-        let cursor = if is_focused { "_" } else { "" };
+        let dots: String = "●".repeat(value.chars().count());
+        let cursor_chars = value[..form.cursor_positions()[FIELD_PASSWORD].min(value.len())].chars().count();
         let style = if is_focused {
             Style::default().fg(tc.fg)
         } else {
             Style::default().fg(tc.fg_muted)
         };
-        Line::from(Span::styled(format!("{prefix}{dots}{cursor}"), style))
+        text_field_line(prefix, &dots, cursor_chars * "●".len(), is_focused, style)
     } else if form.has_stored_password() && !form.password_modified() {
         let style = Style::default().fg(tc.fg_dim);
         let cursor = if is_focused { "_" } else { "" };
@@ -3499,6 +3628,37 @@ mod tests {
             assert!(f.sessions[0].name.is_empty());
         } else {
             panic!("Expected GroupAdd variant");
+        }
+    }
+
+    #[test]
+    fn test_form_state_cursor_editing_inserts_and_deletes_in_middle() {
+        let settings = Settings::default();
+        let mut state = FormState::new_add(&settings, &[]);
+
+        for c in "ac".chars() {
+            state.insert_char(c);
+        }
+        state.move_cursor_left();
+        state.insert_char('b');
+
+        if let FormState::Add(f) = &state {
+            assert_eq!(f.fields[FIELD_NAME], "abc");
+            assert_eq!(f.cursor_positions[FIELD_NAME], 2);
+        } else {
+            panic!("Expected Add variant");
+        }
+
+        state.delete_char();
+        if let FormState::Add(f) = &state {
+            assert_eq!(f.fields[FIELD_NAME], "ac");
+            assert_eq!(f.cursor_positions[FIELD_NAME], 1);
+        }
+
+        state.delete_char_forward();
+        if let FormState::Add(f) = &state {
+            assert_eq!(f.fields[FIELD_NAME], "a");
+            assert_eq!(f.cursor_positions[FIELD_NAME], 1);
         }
     }
 }

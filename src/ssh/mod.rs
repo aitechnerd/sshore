@@ -866,8 +866,9 @@ pub async fn connect_session(
     encoded_index: usize,
     cfg_override: Option<&str>,
 ) -> Result<()> {
-    let group_idx = encoded_index / 10000;
-    let session_idx = encoded_index % 10000;
+    // Decode: (group_idx+1)*10000 + (session_idx+1)
+    let group_idx = encoded_index / 10000 - 1;
+    let session_idx = encoded_index % 10000 - 1;
 
     let group = &config.groups[group_idx];
     let session = &group.sessions[session_idx];

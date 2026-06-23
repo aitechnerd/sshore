@@ -16,3 +16,4 @@ crates/*/Cargo.lock
 .claude/agent-memory-local/
 .pi/
 .planning/
+.memory/

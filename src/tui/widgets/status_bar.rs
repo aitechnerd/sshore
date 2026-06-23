@@ -74,7 +74,7 @@ fn unified_form_hints(theme: &ThemeColors) -> Line<'static> {
     let mut spans = Vec::new();
     spans.extend(hint_pair("Tab/\u{2193}", "Next field", theme));
     spans.extend(hint_pair("S-Tab/\u{2191}", "Prev field", theme));
-    spans.extend(hint_pair("Ctrl+Enter", "Add session", theme));
+    spans.extend(hint_pair("Alt+Enter", "Add session", theme));
     spans.extend(hint_pair("-", "Remove session", theme));
     spans.extend(hint_pair("Enter", "Save", theme));
     spans.extend(hint_pair("Esc", "Cancel", theme));

@@ -168,7 +168,7 @@ fn build_form_sections(lines: &mut Vec<Line<'static>>, theme: &ThemeColors) {
     lines.push(Line::from(""));
 
     section_header(lines, "Session Management", theme);
-    key_hint(lines, "Ctrl+Enter", "Add new session line", theme);
+    key_hint(lines, "Alt+Enter", "Add new session line", theme);
     key_hint(lines, "-", "Remove current session line", theme);
     lines.push(Line::from(""));
 

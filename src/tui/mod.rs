@@ -1172,6 +1172,10 @@ fn handle_unified_form_key(app: &mut App, key: KeyEvent) {
             // Ctrl+O sent as raw control character by some terminals
             form.add_session_line();
         }
+        KeyCode::F(2) => {
+            // F2: add a new session line (works on all terminals)
+            form.add_session_line();
+        }
         KeyCode::Enter => {
             // Attempt to save
             try_save_unified_form(app);

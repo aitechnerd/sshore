@@ -26,7 +26,7 @@ use crate::ssh;
 use crate::tui::theme::{ThemeColors, resolve_theme};
 use crate::tui::views::browser::truncate_name;
 use crate::tui::views::confirm::{ConfirmState, ConfirmTarget};
-use crate::tui::views::form::{EditTarget, FIELD_ENV, FIELD_PROFILE, FormState, UnifiedEntry};
+use crate::tui::views::form::{EditTarget, FIELD_COUNT, FIELD_ENV, FIELD_PROFILE, FormState, UnifiedEntry};
 use crate::tui::views::{confirm, form, help, import_wizard, list};
 use crate::tui::widgets::{search_bar, status_bar};
 
@@ -1185,8 +1185,8 @@ fn handle_unified_form_key(app: &mut App, key: KeyEvent) {
             // Attempt to save
             try_save_unified_form(app);
         }
-        KeyCode::Char('-') => {
-            // Remove current session line
+        KeyCode::Char('-') if form.focused() >= FIELD_COUNT => {
+            // Remove current session line (only when focused on a session)
             form.remove_session_line();
         }
         KeyCode::Char('?') => {
@@ -2143,6 +2143,13 @@ mod tests {
             form.add_session_line();
         }
 
+        // Navigate to the session (Tab through all fields to reach sessions)
+        if let Some(ref mut form) = app.form_state {
+            for _ in 0..13 {
+                form.next_field();
+            }
+        }
+
         // Simulate - key
         let key = KeyEvent {
             code: KeyCode::Char('-'),
@@ -2167,6 +2174,13 @@ mod tests {
             app.config.profiles.iter().map(|p| p.name.clone()).collect();
         app.form_state = Some(FormState::new_group_add(&app.config.settings, &profile_names));
         app.screen = Screen::AddForm;
+
+        // Navigate to the session
+        if let Some(ref mut form) = app.form_state {
+            for _ in 0..13 {
+                form.next_field();
+            }
+        }
 
         // Simulate - key on form with only 1 session
         let key = KeyEvent {

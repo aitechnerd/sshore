@@ -19,7 +19,7 @@ use crate::tui::theme::ThemeColors;
 use crate::tui::widgets::env_badge;
 
 /// Number of editable fields in the form.
-const FIELD_COUNT: usize = 12;
+pub(crate) const FIELD_COUNT: usize = 12;
 
 /// Environment options for the cycle selector.
 const ENV_OPTIONS: &[&str] = &[

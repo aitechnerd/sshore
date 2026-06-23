@@ -25,7 +25,7 @@ const SHELL_METACHARACTERS: &[char] = &[
 ];
 
 /// Characters allowed in bookmark names beyond alphanumeric.
-const BOOKMARK_NAME_EXTRA_CHARS: &[char] = &['-', '_', '.', ' ', '(', ')'];
+const BOOKMARK_NAME_EXTRA_CHARS: &[char] = &['-', '_', '.', ' ', '(', ')', '/'];
 
 /// Map of environment name to color configuration.
 pub type EnvColorMap = BTreeMap<String, EnvColor>;
@@ -639,7 +639,7 @@ pub fn validate_bookmark_name(name: &str) -> Result<()> {
         .all(|c| c.is_alphanumeric() || BOOKMARK_NAME_EXTRA_CHARS.contains(&c))
     {
         bail!(
-            "Bookmark name '{}' contains invalid characters (allowed: alphanumeric, -, _, ., space, (, ))",
+            "Bookmark name '{}' contains invalid characters (allowed: alphanumeric, -, _, ., space, (, ), /)",
             name
         );
     }
@@ -995,7 +995,12 @@ mod tests {
         assert!(validate_bookmark_name("").is_err());
         assert!(validate_bookmark_name("host;rm -rf").is_err());
         assert!(validate_bookmark_name("test@host").is_err());
-        assert!(validate_bookmark_name("a/b").is_err());
+    }
+
+    #[test]
+    fn test_validate_bookmark_name_with_slash() {
+        assert!(validate_bookmark_name("a/b").is_ok());
+        assert!(validate_bookmark_name("new-bookmark Mac/test").is_ok());
     }
 
     #[test]

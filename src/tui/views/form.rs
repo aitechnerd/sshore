@@ -64,7 +64,7 @@ pub enum UnifiedEntry {
 
 /// Trait for items that can be edited in the form.
 /// Allows passing either a Bookmark or BookmarkGroup to FormState::new_edit.
-pub(crate) trait EditableItem {
+pub trait EditableItem {
     fn as_bookmark(&self) -> Option<&Bookmark>;
     fn as_group(&self) -> Option<&BookmarkGroup>;
 }

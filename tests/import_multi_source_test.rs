@@ -33,7 +33,7 @@ fn test_putty_end_to_end() {
     assert!(names.contains(&"prod-web-01"));
     assert!(names.contains(&"prod-db-01"));
     assert!(names.contains(&"staging-api"));
-    assert!(names.contains(&"My-Dev-Server"));
+    assert!(names.contains(&"My Dev Server"));
     assert!(!names.contains(&"dev-telnet")); // telnet skipped
     assert!(!names.contains(&"Default-Settings")); // empty host skipped
 

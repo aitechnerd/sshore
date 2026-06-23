@@ -1135,15 +1135,12 @@ connect_count = 0
 
     #[test]
     fn test_validate_profiles_invalid_name_with_spaces() {
+        // Spaces are now allowed in profile names
         let profiles = vec![model::Profile {
             name: "my profile".into(),
             ..Default::default()
         }];
-        let err = validate_profiles(&profiles).unwrap_err();
-        assert!(
-            err.to_string().contains("invalid name"),
-            "expected invalid name error, got: {err}"
-        );
+        assert!(validate_profiles(&profiles).is_ok());
     }
 
     #[test]
@@ -1216,13 +1213,9 @@ host = "10.0.1.5"
 "#;
         std::fs::write(&path, raw_toml).unwrap();
 
+        // Spaces are now allowed in profile names
         let result = load_from(&path);
-        assert!(result.is_err());
-        let err = result.unwrap_err().to_string();
-        assert!(
-            err.contains("invalid name"),
-            "expected invalid name error, got: {err}"
-        );
+        assert!(result.is_ok());
     }
 
     #[test]

@@ -25,7 +25,7 @@ const SHELL_METACHARACTERS: &[char] = &[
 ];
 
 /// Characters allowed in bookmark names beyond alphanumeric.
-const BOOKMARK_NAME_EXTRA_CHARS: &[char] = &['-', '_', '.'];
+const BOOKMARK_NAME_EXTRA_CHARS: &[char] = &['-', '_', '.', ' ', '(', ')'];
 
 /// Map of environment name to color configuration.
 pub type EnvColorMap = BTreeMap<String, EnvColor>;
@@ -639,7 +639,7 @@ pub fn validate_bookmark_name(name: &str) -> Result<()> {
         .all(|c| c.is_alphanumeric() || BOOKMARK_NAME_EXTRA_CHARS.contains(&c))
     {
         bail!(
-            "Bookmark name '{}' contains invalid characters (allowed: alphanumeric, -, _, .)",
+            "Bookmark name '{}' contains invalid characters (allowed: alphanumeric, -, _, ., space, (, ))",
             name
         );
     }
@@ -993,10 +993,16 @@ mod tests {
     #[test]
     fn test_validate_bookmark_name_invalid() {
         assert!(validate_bookmark_name("").is_err());
-        assert!(validate_bookmark_name("my server").is_err());
         assert!(validate_bookmark_name("host;rm -rf").is_err());
         assert!(validate_bookmark_name("test@host").is_err());
         assert!(validate_bookmark_name("a/b").is_err());
+    }
+
+    #[test]
+    fn test_validate_bookmark_name_with_spaces() {
+        assert!(validate_bookmark_name("my server").is_ok());
+        assert!(validate_bookmark_name("Mac Studio (Local)").is_ok());
+        assert!(validate_bookmark_name("web-01 (prod)").is_ok());
     }
 
     #[test]
@@ -1150,9 +1156,9 @@ mod tests {
 
     #[test]
     fn test_sanitize_bookmark_name() {
-        assert_eq!(sanitize_bookmark_name("My Server"), "My-Server");
-        assert_eq!(sanitize_bookmark_name("server #1"), "server-1");
-        assert_eq!(sanitize_bookmark_name("  spaces  "), "spaces");
+        assert_eq!(sanitize_bookmark_name("My Server"), "My Server");
+        assert_eq!(sanitize_bookmark_name("server #1"), "server -1");
+        assert_eq!(sanitize_bookmark_name("  spaces  "), "  spaces  ");
         assert_eq!(sanitize_bookmark_name("a--b"), "a-b");
         assert_eq!(
             sanitize_bookmark_name("valid-name_01.test"),

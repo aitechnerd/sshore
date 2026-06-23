@@ -309,8 +309,8 @@ mod tests {
 "#;
         let bookmarks = parse_putty_reg(content, None, &[]).unwrap();
         assert_eq!(bookmarks.len(), 1);
-        // "My Server #1" → sanitized to "My-Server-1"
-        assert_eq!(bookmarks[0].name, "My-Server-1");
+        // "My Server #1" → sanitized to "My Server -1" (space preserved, # replaced with -)
+        assert_eq!(bookmarks[0].name, "My Server -1");
     }
 
     #[test]
@@ -420,9 +420,9 @@ mod tests {
 
     #[test]
     fn test_sanitize_bookmark_name() {
-        assert_eq!(sanitize_bookmark_name("My Server"), "My-Server");
-        assert_eq!(sanitize_bookmark_name("server #1"), "server-1");
-        assert_eq!(sanitize_bookmark_name("  spaces  "), "spaces");
+        assert_eq!(sanitize_bookmark_name("My Server"), "My Server");
+        assert_eq!(sanitize_bookmark_name("server #1"), "server -1");
+        assert_eq!(sanitize_bookmark_name("  spaces  "), "  spaces  ");
         assert_eq!(sanitize_bookmark_name("a--b"), "a-b");
         assert_eq!(
             sanitize_bookmark_name("valid-name_01.test"),

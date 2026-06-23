@@ -653,10 +653,18 @@ impl UnifiedForm {
         if self.focused == FIELD_ENV || self.focused == FIELD_PROFILE {
             return;
         }
-        // If focused on a session, insert into session name
+        // If focused on a session, insert into session name or on_connect
         if self.focused >= FIELD_COUNT {
             if self.session_cursor < self.sessions.len() {
-                self.sessions[self.session_cursor].name.push(c);
+                let session = &mut self.sessions[self.session_cursor];
+                if self.focused == FIELD_COUNT {
+                    session.name.push(c);
+                } else if self.focused == FIELD_COUNT + 1 {
+                    if session.on_connect.is_none() {
+                        session.on_connect = Some(String::new());
+                    }
+                    session.on_connect.as_mut().unwrap().push(c);
+                }
             }
             self.error = None;
             return;
@@ -679,10 +687,17 @@ impl UnifiedForm {
         if self.focused == FIELD_ENV || self.focused == FIELD_PROFILE {
             return;
         }
-        // If focused on a session, delete from session name
+        // If focused on a session, delete from session name or on_connect
         if self.focused >= FIELD_COUNT {
             if self.session_cursor < self.sessions.len() {
-                self.sessions[self.session_cursor].name.pop();
+                let session = &mut self.sessions[self.session_cursor];
+                if self.focused == FIELD_COUNT {
+                    session.name.pop();
+                } else if self.focused == FIELD_COUNT + 1 {
+                    if let Some(ref mut cmd) = session.on_connect {
+                        cmd.pop();
+                    }
+                }
             }
             self.error = None;
             return;
@@ -1580,15 +1595,22 @@ fn render_unified_form(
         // Session lines
         for (i, session) in form.sessions.iter().enumerate() {
             let is_current = i == form.session_cursor;
+            let editing_name = is_current && form.focused == FIELD_COUNT;
+            let editing_cmd = is_current && form.focused == FIELD_COUNT + 1;
             let prefix = if is_current { "  > " } else { "    " };
-            let cursor = if is_current { "_" } else { "" };
+            let name_cursor = if editing_name { "_" } else { "" };
+            let cmd_cursor = if editing_cmd { "_" } else { "" };
 
-            let name_style = if is_current {
+            let name_style = if editing_name {
                 Style::default().fg(tc.accent).add_modifier(Modifier::BOLD)
+            } else if is_current {
+                Style::default().fg(tc.fg)
             } else {
                 Style::default().fg(tc.fg)
             };
-            let cmd_style = if is_current {
+            let cmd_style = if editing_cmd {
+                Style::default().fg(tc.accent).add_modifier(Modifier::BOLD)
+            } else if is_current {
                 Style::default().fg(tc.fg)
             } else {
                 Style::default().fg(tc.fg_muted)
@@ -1606,7 +1628,7 @@ fn render_unified_form(
             let name_line = Line::from(vec![
                 Span::raw(format!("{}{}: ", prefix, i + 1)),
                 Span::styled(name_display, name_style),
-                Span::styled(cursor, name_style),
+                Span::styled(name_cursor, name_style),
             ]);
             frame.render_widget(Paragraph::new(name_line), chunks[chunk_idx]);
             chunk_idx += 1;
@@ -1615,6 +1637,7 @@ fn render_unified_form(
             let cmd_line = Line::from(vec![
                 Span::raw("     "),
                 Span::styled(format!("cmd: {}", on_connect_display), cmd_style),
+                Span::styled(cmd_cursor, cmd_style),
             ]);
             frame.render_widget(Paragraph::new(cmd_line), chunks[chunk_idx]);
             chunk_idx += 1;

@@ -242,7 +242,7 @@ pub fn render_mux_layout(frame: &mut Frame, area: Rect, app: &App, group_idx: us
 }
 
 /// Render the session list in the left pane of mux mode.
-fn render_mux_session_list(frame: &mut Frame, area: Rect, app: &App, group_idx: usize, group: &crate::config::model::BookmarkGroup) {
+fn render_mux_session_list(frame: &mut Frame, area: Rect, app: &App, _group_idx: usize, group: &crate::config::model::BookmarkGroup) {
     let tc = &app.theme;
 
     if group.sessions.is_empty() {
@@ -291,7 +291,7 @@ fn render_mux_session_list(frame: &mut Frame, area: Rect, app: &App, group_idx: 
 }
 
 /// Render the terminal placeholder in the right pane of mux mode.
-fn render_mux_terminal_pane(frame: &mut Frame, area: Rect, app: &App, group_idx: usize, group: &crate::config::model::BookmarkGroup) {
+fn render_mux_terminal_pane(frame: &mut Frame, area: Rect, app: &App, _group_idx: usize, group: &crate::config::model::BookmarkGroup) {
     let tc = &app.theme;
 
     // Determine selected session index

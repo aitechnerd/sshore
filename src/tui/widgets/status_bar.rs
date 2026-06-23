@@ -26,7 +26,8 @@ fn build_hints<'a>(screen: &Screen, search_active: bool, theme: &ThemeColors) ->
     }
 
     match screen {
-        Screen::List | Screen::GroupMux(_) => list_hints(theme),
+        Screen::List => list_hints(theme),
+        Screen::GroupMux(_) => mux_hints(theme),
         Screen::Help => help_hints(theme),
         Screen::AddForm | Screen::EditForm(_, _) => unified_form_hints(theme),
         Screen::DeleteConfirm(_) => delete_hints(theme),
@@ -92,5 +93,13 @@ fn help_hints(theme: &ThemeColors) -> Line<'static> {
     let mut spans = Vec::new();
     spans.extend(hint_pair("Esc/?", "Close", theme));
     spans.extend(hint_pair("q", "Quit", theme));
+    Line::from(spans)
+}
+
+fn mux_hints(theme: &ThemeColors) -> Line<'static> {
+    let mut spans = Vec::new();
+    spans.extend(hint_pair("j/k", "Navigate", theme));
+    spans.extend(hint_pair("Enter", "Connect", theme));
+    spans.extend(hint_pair("q", "Exit", theme));
     Line::from(spans)
 }

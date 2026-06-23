@@ -26,7 +26,7 @@ fn build_hints<'a>(screen: &Screen, search_active: bool, theme: &ThemeColors) ->
     }
 
     match screen {
-        Screen::List => list_hints(theme),
+        Screen::List | Screen::GroupMux(_) => list_hints(theme),
         Screen::Help => help_hints(theme),
         Screen::AddForm | Screen::EditForm(_, _) => unified_form_hints(theme),
         Screen::DeleteConfirm(_) => delete_hints(theme),

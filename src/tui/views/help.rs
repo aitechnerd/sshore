@@ -87,6 +87,10 @@ fn build_help_sections(
             build_list_sections(&mut lines, theme);
             "List"
         }
+        Screen::GroupMux(_) => {
+            build_list_sections(&mut lines, theme);
+            "Mux"
+        }
     };
 
     (lines, label)

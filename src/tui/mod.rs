@@ -67,6 +67,7 @@ pub enum Screen {
     EditForm(EditTarget, usize),
     DeleteConfirm(usize),
     Help,
+    GroupMux(usize),
 }
 
 /// Map number keys to environment filter values.
@@ -121,6 +122,9 @@ pub struct App {
     /// Currently selected session as (group_index, session_index) within the group.
     /// `None` means no session selected (e.g., only bookmarks or empty config).
     pub selected_session: Option<(usize, usize)>,
+    /// Selected session index within the mux (session index within the group).
+    /// `None` means no session selected yet (e.g., empty group).
+    pub mux_session: Option<usize>,
     matcher: SkimMatcherV2,
 }
 
@@ -165,6 +169,7 @@ impl App {
             config_path_override: None,
             collapsed_groups: HashSet::new(),
             selected_session,
+            mux_session: None,
             matcher,
         }
     }
@@ -926,7 +931,7 @@ fn draw(frame: &mut ratatui::Frame, app: &App) {
                 confirm::render_confirm(frame, frame.area(), state, &app.config.settings, theme);
             }
         }
-        Screen::List => {}
+        Screen::List | Screen::GroupMux(_) => {}
     }
 }
 
@@ -945,6 +950,7 @@ fn handle_key_event(app: &mut App, key: KeyEvent) {
         Screen::List => handle_list_key(app, key),
         Screen::AddForm | Screen::EditForm(_, _) => handle_unified_form_key(app, key),
         Screen::DeleteConfirm(_) => handle_confirm_key(app, key),
+        Screen::GroupMux(_) => handle_list_key(app, key),
     }
 }
 

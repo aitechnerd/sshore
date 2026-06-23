@@ -870,11 +870,6 @@ fn draw(frame: &mut ratatui::Frame, app: &App) {
                 form::render_form(frame, frame.area(), state, &app.config.settings, theme);
             }
         }
-        Screen::AddForm | Screen::EditForm(EditTarget::Group, _) => {
-            if let Some(ref state) = app.form_state {
-                form::render_form(frame, frame.area(), state, &app.config.settings, theme);
-            }
-        }
         Screen::DeleteConfirm(_) => {
             if let Some(ref state) = app.confirm_state {
                 confirm::render_confirm(frame, frame.area(), state, &app.config.settings, theme);
@@ -897,7 +892,6 @@ fn handle_key_event(app: &mut App, key: KeyEvent) {
         Screen::List if app.search_active => handle_search_key(app, key),
         Screen::List => handle_list_key(app, key),
         Screen::AddForm | Screen::EditForm(_, _) => handle_unified_form_key(app, key),
-        Screen::AddForm | Screen::EditForm(EditTarget::Group, _) => handle_unified_form_key(app, key),
         Screen::DeleteConfirm(_) => handle_confirm_key(app, key),
     }
 }

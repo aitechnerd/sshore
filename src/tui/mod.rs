@@ -1152,6 +1152,8 @@ fn handle_unified_form_key(app: &mut App, key: KeyEvent) {
         return;
     };
 
+    tracing::debug!("handle_unified_form_key: code={:?} modifiers={:?}", key.code, key.modifiers);
+
     match key.code {
         KeyCode::Esc => {
             app.form_state = None;
@@ -1166,14 +1168,17 @@ fn handle_unified_form_key(app: &mut App, key: KeyEvent) {
         KeyCode::Backspace => form.delete_char(),
         KeyCode::Char('o') if key.modifiers.contains(KeyModifiers::CONTROL) => {
             // Ctrl+O: add a new session line
+            tracing::debug!("add_session_line via Ctrl+O (Char+mod)");
             form.add_session_line();
         }
         KeyCode::Char(c) if c == '\x0f' => {
             // Ctrl+O sent as raw control character by some terminals
+            tracing::debug!("add_session_line via raw \x0f");
             form.add_session_line();
         }
         KeyCode::F(2) => {
             // F2: add a new session line (works on all terminals)
+            tracing::debug!("add_session_line via F2");
             form.add_session_line();
         }
         KeyCode::Enter => {

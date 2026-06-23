@@ -546,6 +546,31 @@ impl UnifiedForm {
 
     /// Move focus to the next field.
     pub fn next_field(&mut self) {
+        if !self.sessions.is_empty() && !self.sessions_collapsed {
+            // If on last field, move to first session name
+            if self.focused == FIELD_COUNT - 1 {
+                self.session_cursor = 0;
+                self.focused = FIELD_COUNT; // sentinel: editing session name
+                return;
+            }
+            // If editing session name, move to on_connect
+            if self.focused == FIELD_COUNT {
+                self.focused = FIELD_COUNT + 1; // editing session on_connect
+                return;
+            }
+            // If editing session on_connect, move to next session or wrap
+            if self.focused == FIELD_COUNT + 1 {
+                if self.session_cursor < self.sessions.len() - 1 {
+                    self.session_cursor += 1;
+                    self.focused = FIELD_COUNT; // next session name
+                } else {
+                    self.session_cursor = 0;
+                    self.focused = 0; // wrap to first field
+                }
+                return;
+            }
+        }
+        // Normal field navigation
         if self.focused < FIELD_COUNT - 1 {
             self.focused += 1;
         }
@@ -553,6 +578,30 @@ impl UnifiedForm {
 
     /// Move focus to the previous field.
     pub fn prev_field(&mut self) {
+        if !self.sessions.is_empty() && !self.sessions_collapsed {
+            // If editing session on_connect, move to session name
+            if self.focused == FIELD_COUNT + 1 {
+                self.focused = FIELD_COUNT; // session name
+                return;
+            }
+            // If editing session name, move to previous session or last field
+            if self.focused == FIELD_COUNT {
+                if self.session_cursor > 0 {
+                    self.session_cursor -= 1;
+                    self.focused = FIELD_COUNT + 1; // previous session on_connect
+                } else {
+                    self.focused = FIELD_COUNT - 1; // last field
+                }
+                return;
+            }
+            // If on first field, move to last session on_connect
+            if self.focused == 0 {
+                self.session_cursor = self.sessions.len() - 1;
+                self.focused = FIELD_COUNT + 1; // last session on_connect
+                return;
+            }
+        }
+        // Normal field navigation
         if self.focused > 0 {
             self.focused -= 1;
         }
@@ -604,6 +653,14 @@ impl UnifiedForm {
         if self.focused == FIELD_ENV || self.focused == FIELD_PROFILE {
             return;
         }
+        // If focused on a session, insert into session name
+        if self.focused >= FIELD_COUNT {
+            if self.session_cursor < self.sessions.len() {
+                self.sessions[self.session_cursor].name.push(c);
+            }
+            self.error = None;
+            return;
+        }
         self.fields[self.focused].push(c);
         self.error = None;
 
@@ -620,6 +677,14 @@ impl UnifiedForm {
     /// Delete last character from the current field.
     pub fn delete_char(&mut self) {
         if self.focused == FIELD_ENV || self.focused == FIELD_PROFILE {
+            return;
+        }
+        // If focused on a session, delete from session name
+        if self.focused >= FIELD_COUNT {
+            if self.session_cursor < self.sessions.len() {
+                self.sessions[self.session_cursor].name.pop();
+            }
+            self.error = None;
             return;
         }
         self.fields[self.focused].pop();

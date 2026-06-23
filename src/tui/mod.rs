@@ -1010,11 +1010,9 @@ fn handle_list_key(app: &mut App, key: KeyEvent) {
             if let Some(idx) = app.selected_bookmark_index() {
                 app.connect_request = Some(idx);
             } else if let Some(group_idx) = app.selected_group_index() {
-                // Connect to the group's first session
-                if !app.config.groups[group_idx].sessions.is_empty() {
-                    let encoded = (group_idx + 1) * 10000 + 1;
-                    app.connect_request = Some(encoded);
-                }
+                // Enter mux mode for the group
+                app.mux_session = Some(0);
+                app.screen = Screen::GroupMux(group_idx);
             }
         }
         KeyCode::Char('a') => {
@@ -2177,8 +2175,9 @@ mod tests {
 
         let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
         handle_key_event(&mut app, enter);
-        // Should connect to first session of the group: (0+1)*10000 + (0+1) = 10001
-        assert_eq!(app.connect_request, Some(10001));
+        // Should enter mux mode for the group
+        assert_eq!(app.screen, Screen::GroupMux(0));
+        assert_eq!(app.mux_session, Some(0));
     }
 
     #[test]

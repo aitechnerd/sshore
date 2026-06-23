@@ -28,8 +28,8 @@ fn build_hints<'a>(screen: &Screen, search_active: bool, theme: &ThemeColors) ->
     match screen {
         Screen::List => list_hints(theme),
         Screen::Help => help_hints(theme),
-        Screen::AddForm | Screen::EditForm(_) => form_hints(theme),
-        Screen::GroupAddForm | Screen::GroupEditForm(_) => group_form_hints(theme),
+        Screen::AddForm | Screen::EditForm(_, _) => form_hints(theme),
+        Screen::AddForm | Screen::EditForm(_, _) => group_form_hints(theme),
         Screen::DeleteConfirm(_) => delete_hints(theme),
     }
 }

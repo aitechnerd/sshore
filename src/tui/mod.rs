@@ -64,11 +64,9 @@ const PAGE_JUMP: usize = 10;
 pub enum Screen {
     List,
     AddForm,
-    EditForm(usize),
+    EditForm(EditTarget, usize),
     DeleteConfirm(usize),
     Help,
-    GroupAddForm,
-    GroupEditForm(usize),
 }
 
 /// Map number keys to environment filter values.
@@ -867,12 +865,12 @@ fn draw(frame: &mut ratatui::Frame, app: &App) {
                 app.help_scroll,
             );
         }
-        Screen::AddForm | Screen::EditForm(_) => {
+        Screen::AddForm | Screen::EditForm(_, _) => {
             if let Some(ref state) = app.form_state {
                 form::render_form(frame, frame.area(), state, &app.config.settings, theme);
             }
         }
-        Screen::GroupAddForm | Screen::GroupEditForm(_) => {
+        Screen::AddForm | Screen::EditForm(EditTarget::Group, _) => {
             if let Some(ref state) = app.form_state {
                 form::render_form(frame, frame.area(), state, &app.config.settings, theme);
             }
@@ -898,8 +896,8 @@ fn handle_key_event(app: &mut App, key: KeyEvent) {
         Screen::Help => handle_help_key(app, key),
         Screen::List if app.search_active => handle_search_key(app, key),
         Screen::List => handle_list_key(app, key),
-        Screen::AddForm | Screen::EditForm(_) => handle_form_key(app, key),
-        Screen::GroupAddForm | Screen::GroupEditForm(_) => handle_group_form_key(app, key),
+        Screen::AddForm | Screen::EditForm(_, _) => handle_unified_form_key(app, key),
+        Screen::AddForm | Screen::EditForm(EditTarget::Group, _) => handle_unified_form_key(app, key),
         Screen::DeleteConfirm(_) => handle_confirm_key(app, key),
     }
 }
@@ -969,7 +967,7 @@ fn handle_list_key(app: &mut App, key: KeyEvent) {
             let profile_names: Vec<String> =
                 app.config.profiles.iter().map(|p| p.name.clone()).collect();
             app.form_state = Some(FormState::new_group_add(&app.config.settings, &profile_names));
-            app.screen = Screen::GroupAddForm;
+            app.screen = Screen::AddForm;
         }
         KeyCode::Char('e') => {
             if let Some(idx) = app.selected_bookmark_index() {
@@ -977,7 +975,7 @@ fn handle_list_key(app: &mut App, key: KeyEvent) {
                     app.config.profiles.iter().map(|p| p.name.clone()).collect();
                 let bookmark = &app.config.bookmarks[idx];
                 app.form_state = Some(FormState::new_edit(idx, EditTarget::Bookmark, bookmark, &profile_names));
-                app.screen = Screen::EditForm(idx);
+                app.screen = Screen::EditForm(EditTarget::Bookmark, idx);
             }
         }
         KeyCode::Char('d') => {
@@ -1052,7 +1050,7 @@ fn handle_session_list_key(app: &mut App, key: KeyEvent) {
             let profile_names: Vec<String> =
                 app.config.profiles.iter().map(|p| p.name.clone()).collect();
             app.form_state = Some(FormState::new_group_add(&app.config.settings, &profile_names));
-            app.screen = Screen::GroupAddForm;
+            app.screen = Screen::AddForm;
         }
 
         // Add bookmark form (lowercase a)
@@ -1070,7 +1068,7 @@ fn handle_session_list_key(app: &mut App, key: KeyEvent) {
                     app.config.profiles.iter().map(|p| p.name.clone()).collect();
                 let group = &app.config.groups[group_idx];
                 app.form_state = Some(FormState::new_group_edit(group_idx, group, &profile_names));
-                app.screen = Screen::GroupEditForm(group_idx);
+                app.screen = Screen::EditForm(EditTarget::Group, group_idx);
             }
         }
 
@@ -1153,40 +1151,8 @@ fn toggle_group_collapse(app: &mut App) {
 }
 
 /// Handle key events in the add/edit form.
-fn handle_form_key(app: &mut App, key: KeyEvent) {
-    let Some(ref mut form) = app.form_state else {
-        app.screen = Screen::List;
-        return;
-    };
-
-    match key.code {
-        KeyCode::Esc => {
-            app.form_state = None;
-            app.screen = Screen::List;
-        }
-        KeyCode::Tab | KeyCode::Down => form.next_field(),
-        KeyCode::BackTab | KeyCode::Up => form.prev_field(),
-        KeyCode::Left if form.focused() == FIELD_ENV => form.cycle_env_left(),
-        KeyCode::Right if form.focused() == FIELD_ENV => form.cycle_env_right(),
-        KeyCode::Left if form.focused() == FIELD_PROFILE => form.cycle_profile_left(),
-        KeyCode::Right if form.focused() == FIELD_PROFILE => form.cycle_profile_right(),
-        KeyCode::Backspace => form.delete_char(),
-        KeyCode::Enter => {
-            // Attempt to save
-            try_save_form(app);
-        }
-        KeyCode::Char('?') => {
-            app.help_scroll = 0;
-            app.help_source = Some(app.screen.clone());
-            app.screen = Screen::Help;
-        }
-        KeyCode::Char(c) => form.insert_char(c),
-        _ => {}
-    }
-}
-
-/// Handle key events in the group add/edit form.
-fn handle_group_form_key(app: &mut App, key: KeyEvent) {
+/// Handle key events in the unified form (handles both bookmark and group mode).
+fn handle_unified_form_key(app: &mut App, key: KeyEvent) {
     let Some(ref mut form) = app.form_state else {
         app.screen = Screen::List;
         return;
@@ -1210,7 +1176,7 @@ fn handle_group_form_key(app: &mut App, key: KeyEvent) {
         }
         KeyCode::Enter => {
             // Attempt to save
-            try_save_group_form(app);
+            try_save_unified_form(app);
         }
         KeyCode::Char('-') => {
             // Remove current session line
@@ -1227,125 +1193,111 @@ fn handle_group_form_key(app: &mut App, key: KeyEvent) {
 }
 
 /// Try to validate and save the form. On success, return to list. On failure, show error.
-fn try_save_form(app: &mut App) {
+/// Try to validate and save the unified form. Handles both bookmark and group mode.
+fn try_save_unified_form(app: &mut App) {
     let Some(ref mut form) = app.form_state else {
         return;
     };
 
-    match form.validate_and_build(&app.config) {
-        Ok(bookmark) => {
-            let name = bookmark.name.clone();
-            let password_value = form.password().to_string();
-            let password_modified = form.password_modified();
-            let has_stored = form.has_stored_password();
+    let is_group = form.inner().is_group();
 
-            // Handle keychain rename: if editing and name changed, migrate password
-            let old_name = if let Screen::EditForm(idx) = app.screen {
-                let orig = &app.config.bookmarks[idx].name;
-                if orig != &name {
-                    Some(orig.clone())
+    if is_group {
+        match form.validate_and_build_group(&app.config) {
+            Ok(group) => {
+                let name = group.name.clone();
+                match app.screen {
+                    Screen::AddForm => {
+                        app.config.groups.push(group);
+                    }
+                    Screen::EditForm(EditTarget::Group, idx) => {
+                        app.config.groups[idx] = group;
+                    }
+                    _ => {}
+                }
+                if let Err(e) = app.save_config() {
+                    app.set_status(format!("Error saving config: {e}"));
+                } else {
+                    app.set_status(format!("Group '{name}' saved"));
+                }
+                app.form_state = None;
+                app.screen = Screen::List;
+                app.refilter();
+            }
+            Err(e) => {
+                app.status_message = Some((e.to_string(), Instant::now()));
+            }
+        }
+    } else {
+        match form.validate_and_build(&app.config) {
+            Ok(bookmark) => {
+                let name = bookmark.name.clone();
+                let password_value = form.password().to_string();
+                let password_modified = form.password_modified();
+                let has_stored = form.has_stored_password();
+
+                let old_name = if let Screen::EditForm(EditTarget::Bookmark, idx) = app.screen {
+                    let orig = &app.config.bookmarks[idx].name;
+                    if orig != &name {
+                        Some(orig.clone())
+                    } else {
+                        None
+                    }
                 } else {
                     None
-                }
-            } else {
-                None
-            };
+                };
 
-            match app.screen {
-                Screen::AddForm => {
-                    app.config.bookmarks.push(bookmark);
-                }
-                Screen::EditForm(idx) => {
-                    // Preserve last_connected and connect_count from the original
-                    let original = &app.config.bookmarks[idx];
-                    let mut updated = bookmark;
-                    updated.last_connected = original.last_connected;
-                    updated.connect_count = original.connect_count;
-                    app.config.bookmarks[idx] = updated;
-                }
-                _ => {}
-            }
-
-            // Save to disk
-            if let Err(e) = app.save_config() {
-                app.set_status(format!("Error saving config: {e}"));
-            } else {
-                app.set_status(format!("Bookmark '{name}' saved"));
-            }
-
-            // Handle keychain operations after successful config save
-            if let Some(ref old) = old_name {
-                // Rename: migrate keychain entry from old name to new name
-                if let Ok(Some(pw)) = keychain::get_password(old) {
-                    if let Err(e) = keychain::set_password(&name, &pw) {
-                        app.set_status(format!("Warning: failed to migrate password: {e}"));
+                match app.screen {
+                    Screen::AddForm => {
+                        app.config.bookmarks.push(bookmark);
                     }
-                    if let Err(e) = keychain::delete_password(old) {
-                        app.set_status(format!(
-                            "Warning: failed to remove old keychain entry: {e}"
-                        ));
+                    Screen::EditForm(EditTarget::Bookmark, idx) => {
+                        let original = &app.config.bookmarks[idx];
+                        let mut updated = bookmark;
+                        updated.last_connected = original.last_connected;
+                        updated.connect_count = original.connect_count;
+                        app.config.bookmarks[idx] = updated;
+                    }
+                    _ => {}
+                }
+
+                if let Err(e) = app.save_config() {
+                    app.set_status(format!("Error saving config: {e}"));
+                } else {
+                    app.set_status(format!("Bookmark '{name}' saved"));
+                }
+
+                if let Some(ref old) = old_name {
+                    if let Ok(Some(pw)) = keychain::get_password(old) {
+                        if let Err(e) = keychain::set_password(&name, &pw) {
+                            app.set_status(format!("Warning: failed to migrate password: {e}"));
+                        }
+                        if let Err(e) = keychain::delete_password(old) {
+                            app.set_status(format!(
+                                "Warning: failed to remove old keychain entry: {e}"
+                            ));
+                        }
                     }
                 }
-            }
 
-            if password_modified {
-                if !password_value.is_empty() {
-                    // User typed a new password — save to keychain
-                    if let Err(e) = keychain::set_password(&name, &password_value) {
-                        app.set_status(format!("Warning: failed to save password: {e}"));
-                    }
-                } else if has_stored {
-                    // User cleared the password field — remove from keychain
-                    if let Err(e) = keychain::delete_password(&name) {
-                        app.set_status(format!("Warning: failed to remove password: {e}"));
+                if password_modified {
+                    if !password_value.is_empty() {
+                        if let Err(e) = keychain::set_password(&name, &password_value) {
+                            app.set_status(format!("Warning: failed to save password: {e}"));
+                        }
+                    } else if has_stored {
+                        if let Err(e) = keychain::delete_password(&name) {
+                            app.set_status(format!("Warning: failed to remove password: {e}"));
+                        }
                     }
                 }
+
+                app.form_state = None;
+                app.screen = Screen::List;
+                app.refilter();
             }
-
-            app.form_state = None;
-            app.screen = Screen::List;
-            app.refilter();
-        }
-        Err(e) => {
-            // Route validation errors to the main status bar for consistency
-            app.status_message = Some((e.to_string(), Instant::now()));
-        }
-    }
-}
-
-/// Try to validate and save the group form. On success, return to list. On failure, show error.
-fn try_save_group_form(app: &mut App) {
-    let Some(ref mut form) = app.form_state else {
-        return;
-    };
-
-    match form.validate_and_build_group(&app.config) {
-        Ok(group) => {
-            let name = group.name.clone();
-
-            match app.screen {
-                Screen::GroupAddForm => {
-                    app.config.groups.push(group);
-                }
-                Screen::GroupEditForm(idx) => {
-                    app.config.groups[idx] = group;
-                }
-                _ => {}
+            Err(e) => {
+                app.status_message = Some((e.to_string(), Instant::now()));
             }
-
-            // Save to disk
-            if let Err(e) = app.save_config() {
-                app.set_status(format!("Error saving config: {e}"));
-            } else {
-                app.set_status(format!("Group '{name}' saved"));
-            }
-
-            app.form_state = None;
-            app.screen = Screen::List;
-            app.refilter();
-        }
-        Err(e) => {
-            app.status_message = Some((e.to_string(), Instant::now()));
         }
     }
 }
@@ -1674,7 +1626,7 @@ mod tests {
     }
 
     #[test]
-    fn test_try_save_form_validation_error_goes_to_status() {
+    fn test_try_save_unified_form_validation_error_goes_to_status() {
         let mut app = sample_app();
         // Set up a form with invalid data: empty name triggers validation error
         let profile_names: Vec<String> =
@@ -1682,7 +1634,7 @@ mod tests {
         app.form_state = Some(FormState::new_add(&app.config.settings, &profile_names));
         app.screen = Screen::AddForm;
 
-        try_save_form(&mut app);
+        try_save_unified_form(&mut app);
 
         // Validation error should go to the status bar, not form.error
         assert!(
@@ -1721,7 +1673,7 @@ mod tests {
                 app.config.profiles.iter().map(|p| p.name.clone()).collect();
             let bookmark = app.config.bookmarks[idx].clone();
             app.form_state = Some(FormState::new_edit(idx, EditTarget::Bookmark, &bookmark, &profile_names));
-            app.screen = Screen::EditForm(idx);
+            app.screen = Screen::EditForm(EditTarget::Bookmark, idx);
             assert!(app.form_state.is_some());
         }
     }
@@ -2138,9 +2090,9 @@ mod tests {
         let profile_names: Vec<String> =
             app.config.profiles.iter().map(|p| p.name.clone()).collect();
         app.form_state = Some(FormState::new_group_add(&app.config.settings, &profile_names));
-        app.screen = Screen::GroupAddForm;
+        app.screen = Screen::AddForm;
         assert!(app.form_state.is_some());
-        assert_eq!(app.screen, Screen::GroupAddForm);
+        assert_eq!(app.screen, Screen::AddForm);
     }
 
     #[test]
@@ -2149,7 +2101,7 @@ mod tests {
         let profile_names: Vec<String> =
             app.config.profiles.iter().map(|p| p.name.clone()).collect();
         app.form_state = Some(FormState::new_group_add(&app.config.settings, &profile_names));
-        app.screen = Screen::GroupAddForm;
+        app.screen = Screen::AddForm;
 
         // Simulate Ctrl+Enter
         let key = KeyEvent {
@@ -2158,7 +2110,7 @@ mod tests {
             kind: crossterm::event::KeyEventKind::Press,
             state: crossterm::event::KeyEventState::empty(),
         };
-        handle_group_form_key(&mut app, key);
+        handle_unified_form_key(&mut app, key);
 
         if let Some(FormState::Add(f)) = &app.form_state {
             assert_eq!(f.sessions.len(), 2);
@@ -2173,7 +2125,7 @@ mod tests {
         let profile_names: Vec<String> =
             app.config.profiles.iter().map(|p| p.name.clone()).collect();
         app.form_state = Some(FormState::new_group_add(&app.config.settings, &profile_names));
-        app.screen = Screen::GroupAddForm;
+        app.screen = Screen::AddForm;
 
         // Add an extra session first
         if let Some(ref mut form) = app.form_state {
@@ -2187,7 +2139,7 @@ mod tests {
             kind: crossterm::event::KeyEventKind::Press,
             state: crossterm::event::KeyEventState::empty(),
         };
-        handle_group_form_key(&mut app, key);
+        handle_unified_form_key(&mut app, key);
 
         if let Some(FormState::Add(f)) = &app.form_state {
             // Started with 1, added 1 (cursor at index 1), removed current (index 1) = 1 left
@@ -2203,7 +2155,7 @@ mod tests {
         let profile_names: Vec<String> =
             app.config.profiles.iter().map(|p| p.name.clone()).collect();
         app.form_state = Some(FormState::new_group_add(&app.config.settings, &profile_names));
-        app.screen = Screen::GroupAddForm;
+        app.screen = Screen::AddForm;
 
         // Simulate - key on form with only 1 session
         let key = KeyEvent {
@@ -2212,7 +2164,7 @@ mod tests {
             kind: crossterm::event::KeyEventKind::Press,
             state: crossterm::event::KeyEventState::empty(),
         };
-        handle_group_form_key(&mut app, key);
+        handle_unified_form_key(&mut app, key);
 
         if let Some(FormState::Add(f)) = &app.form_state {
             // Last session removed, reverts to bookmark mode (0 sessions)
@@ -2229,7 +2181,7 @@ mod tests {
         let profile_names: Vec<String> =
             app.config.profiles.iter().map(|p| p.name.clone()).collect();
         app.form_state = Some(FormState::new_group_add(&app.config.settings, &profile_names));
-        app.screen = Screen::GroupAddForm;
+        app.screen = Screen::AddForm;
 
         let key = KeyEvent {
             code: KeyCode::Esc,
@@ -2237,7 +2189,7 @@ mod tests {
             kind: crossterm::event::KeyEventKind::Press,
             state: crossterm::event::KeyEventState::empty(),
         };
-        handle_group_form_key(&mut app, key);
+        handle_unified_form_key(&mut app, key);
 
         assert!(app.form_state.is_none());
         assert_eq!(app.screen, Screen::List);
@@ -2251,7 +2203,7 @@ mod tests {
         let profile_names: Vec<String> =
             app.config.profiles.iter().map(|p| p.name.clone()).collect();
         app.form_state = Some(FormState::new_group_add(&app.config.settings, &profile_names));
-        app.screen = Screen::GroupAddForm;
+        app.screen = Screen::AddForm;
 
         // Fill in the form fields
         if let Some(FormState::Add(f)) = &mut app.form_state {
@@ -2267,7 +2219,7 @@ mod tests {
         }
 
         // Save the form
-        try_save_group_form(&mut app);
+        try_save_unified_form(&mut app);
 
         // Verify the group was added
         assert_eq!(app.screen, Screen::List);
@@ -2304,7 +2256,7 @@ mod tests {
             app.config.profiles.iter().map(|p| p.name.clone()).collect();
         let group = app.config.groups[0].clone();
         app.form_state = Some(FormState::new_group_edit(0, &group, &profile_names));
-        app.screen = Screen::GroupEditForm(0);
+        app.screen = Screen::EditForm(EditTarget::Group, 0);
 
         // Modify the session
         if let Some(FormState::Edit(_, EditTarget::Group, f)) = &mut app.form_state {
@@ -2369,7 +2321,7 @@ mod tests {
         }
 
         // Save
-        try_save_form(&mut app);
+        try_save_unified_form(&mut app);
 
         // Verify the bookmark was added
         assert_eq!(app.config.bookmarks.len(), initial_count + 1);

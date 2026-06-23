@@ -5,6 +5,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 
 use crate::tui::Screen;
+use crate::tui::views::form::EditTarget;
 use crate::tui::theme::ThemeColors;
 
 /// Render a centered help overlay with keybindings filtered by source screen.
@@ -73,11 +74,11 @@ fn build_help_sections(
             build_list_sections(&mut lines, theme);
             "List"
         }
-        Screen::AddForm | Screen::EditForm(_) => {
+        Screen::AddForm | Screen::EditForm(_, _) => {
             build_form_sections(&mut lines, theme);
             "Form"
         }
-        Screen::GroupAddForm | Screen::GroupEditForm(_) => {
+        Screen::AddForm | Screen::EditForm(_, _) => {
             build_group_form_sections(&mut lines, theme);
             "Group Form"
         }
@@ -408,7 +409,7 @@ mod tests {
         let theme = default_theme();
         let (add_sections, add_label) = build_help_sections(&Screen::AddForm, false, None, &theme);
         let (edit_sections, edit_label) =
-            build_help_sections(&Screen::EditForm(0), false, None, &theme);
+            build_help_sections(&Screen::EditForm(EditTarget::Bookmark, 0), false, None, &theme);
         assert_eq!(add_label, "Form");
         assert_eq!(edit_label, "Form");
         assert_eq!(
@@ -499,7 +500,7 @@ mod tests {
             (Screen::List, false, None),
             (Screen::List, true, None),
             (Screen::AddForm, false, None),
-            (Screen::EditForm(0), false, None),
+            (Screen::EditForm(EditTarget::Bookmark, 0), false, None),
             (Screen::DeleteConfirm(0), false, Some(false)),
             (Screen::DeleteConfirm(0), false, Some(true)),
             (Screen::Help, false, None),

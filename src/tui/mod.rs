@@ -26,7 +26,7 @@ use crate::ssh;
 use crate::tui::theme::{ThemeColors, resolve_theme};
 use crate::tui::views::browser::truncate_name;
 use crate::tui::views::confirm::{ConfirmState, ConfirmTarget};
-use crate::tui::views::form::{EditTarget, FIELD_ENV, FIELD_PROFILE, FormState};
+use crate::tui::views::form::{EditTarget, FIELD_ENV, FIELD_PROFILE, FormState, UnifiedEntry};
 use crate::tui::views::{confirm, form, help, import_wizard, list};
 use crate::tui::widgets::{search_bar, status_bar};
 
@@ -1229,7 +1229,7 @@ fn try_save_unified_form(app: &mut App) {
         }
     } else {
         match form.validate_and_build(&app.config) {
-            Ok(bookmark) => {
+            Ok(UnifiedEntry::Bookmark(bookmark)) => {
                 let name = bookmark.name.clone();
                 let password_value = form.password().to_string();
                 let password_modified = form.password_modified();
@@ -1294,6 +1294,10 @@ fn try_save_unified_form(app: &mut App) {
                 app.form_state = None;
                 app.screen = Screen::List;
                 app.refilter();
+            }
+            Ok(UnifiedEntry::Group(_)) => {
+                // Should not happen in bookmark path (is_group check above)
+                app.status_message = Some(("Unexpected group entry in bookmark path".to_string(), Instant::now()));
             }
             Err(e) => {
                 app.status_message = Some((e.to_string(), Instant::now()));

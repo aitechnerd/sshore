@@ -55,6 +55,13 @@ pub enum EditTarget {
     Group,
 }
 
+/// Unified entry type for form output: either a bookmark or a group.
+#[derive(Debug, Clone)]
+pub enum UnifiedEntry {
+    Bookmark(Bookmark),
+    Group(BookmarkGroup),
+}
+
 /// Trait for items that can be edited in the form.
 /// Allows passing either a Bookmark or BookmarkGroup to FormState::new_edit.
 pub(crate) trait EditableItem {
@@ -679,6 +686,16 @@ impl UnifiedForm {
     /// Check if this form represents a bookmark (no sessions).
     pub fn is_bookmark(&self) -> bool {
         self.sessions.is_empty()
+    }
+
+    /// Validate and build the appropriate entry type based on sessions.
+    /// Returns Bookmark if sessions is empty, BookmarkGroup otherwise.
+    pub fn validate_and_build(&mut self, config: &AppConfig) -> Result<UnifiedEntry> {
+        if self.is_group() {
+            self.validate_and_build_group(config).map(UnifiedEntry::Group)
+        } else {
+            self.validate_and_build_bookmark(config).map(UnifiedEntry::Bookmark)
+        }
     }
 
     /// Validate and build a Bookmark (when sessions is empty).
@@ -1351,10 +1368,10 @@ impl FormState {
         form.validate_and_build_group(config)
     }
 
-    /// Validate and build a Bookmark (for bookmark mode forms).
-    pub fn validate_and_build(&mut self, config: &AppConfig) -> Result<Bookmark> {
+    /// Validate and build the appropriate entry type based on sessions.
+    pub fn validate_and_build(&mut self, config: &AppConfig) -> Result<UnifiedEntry> {
         let form = self.inner_mut();
-        form.validate_and_build_bookmark(config)
+        form.validate_and_build(config)
     }
 }
 
@@ -2451,6 +2468,134 @@ mod tests {
         form.remove_session_line();
         assert!(form.is_bookmark());
         assert!(!form.is_group());
+    }
+
+    // ─── UnifiedEntry validation tests ───
+
+    #[test]
+    fn test_validate_and_build_returns_bookmark_for_zero_sessions() {
+        let config = AppConfig::default();
+        let settings = Settings::default();
+        let mut form = UnifiedForm::new_add(&settings, &[]);
+        form.fields[FIELD_NAME] = "test-server".into();
+        form.fields[FIELD_HOST] = "10.0.1.5".into();
+
+        let entry = form.validate_and_build(&config).unwrap();
+        match entry {
+            UnifiedEntry::Bookmark(b) => {
+                assert_eq!(b.name, "test-server");
+                assert_eq!(b.host, "10.0.1.5");
+            }
+            UnifiedEntry::Group(_) => panic!("Expected Bookmark"),
+        }
+    }
+
+    #[test]
+    fn test_validate_and_build_returns_group_for_sessions() {
+        let config = AppConfig::default();
+        let settings = Settings::default();
+        let mut form = UnifiedForm::new_add(&settings, &[]);
+        form.fields[FIELD_NAME] = "my-group".into();
+        form.fields[FIELD_HOST] = "10.0.1.5".into();
+        form.add_session_line();
+        form.sessions[0].name = "session-1".into();
+
+        let entry = form.validate_and_build(&config).unwrap();
+        match entry {
+            UnifiedEntry::Group(g) => {
+                assert_eq!(g.name, "my-group");
+                assert_eq!(g.host, "10.0.1.5");
+                assert_eq!(g.sessions.len(), 1);
+            }
+            UnifiedEntry::Bookmark(_) => panic!("Expected Group"),
+        }
+    }
+
+    #[test]
+    fn test_cross_type_name_conflict_bookmark_vs_group() {
+        let mut config = AppConfig::default();
+        config.groups.push(BookmarkGroup {
+            name: "existing".into(),
+            host: "10.0.0.1".into(),
+            ..BookmarkGroup::default()
+        });
+        let settings = Settings::default();
+        let mut form = UnifiedForm::new_add(&settings, &[]);
+        form.fields[FIELD_NAME] = "existing".into();
+        form.fields[FIELD_HOST] = "10.0.1.5".into();
+
+        let result = form.validate_and_build_bookmark(&config);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("already exists"));
+    }
+
+    #[test]
+    fn test_cross_type_name_conflict_group_vs_bookmark() {
+        let mut config = AppConfig::default();
+        config.bookmarks.push(sample_bookmark());
+        let settings = Settings::default();
+        let mut form = UnifiedForm::new_add(&settings, &[]);
+        form.fields[FIELD_NAME] = "prod-web-01".into(); // Same name as sample_bookmark
+        form.fields[FIELD_HOST] = "10.0.1.5".into();
+        form.add_session_line();
+        form.sessions[0].name = "s1".into();
+
+        let result = form.validate_and_build_group(&config);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("already exists"));
+    }
+
+    #[test]
+    fn test_edit_bookmark_preserves_type() {
+        let bookmark = sample_bookmark();
+        let mut form = UnifiedForm::new_edit_bookmark(&bookmark, &[]);
+        let config = AppConfig::default();
+
+        // Should build as bookmark (no sessions)
+        let entry = form.validate_and_build(&config).unwrap();
+        match entry {
+            UnifiedEntry::Bookmark(b) => {
+                assert_eq!(b.name, "prod-web-01");
+            }
+            UnifiedEntry::Group(_) => panic!("Expected Bookmark"),
+        }
+    }
+
+    #[test]
+    fn test_edit_group_preserves_type() {
+        let group = BookmarkGroup {
+            name: "test-group".into(),
+            host: "10.0.1.5".into(),
+            user: None,
+            port: 22,
+            env: String::new(),
+            tags: vec![],
+            identity_file: None,
+            proxy_jump: None,
+            notes: None,
+            profile: None,
+            on_connect: None,
+            on_connect_prompt_pattern: None,
+            snippets: vec![],
+            connect_timeout_secs: None,
+            ssh_options: std::collections::BTreeMap::new(),
+            sessions: vec![Session {
+                name: "s1".into(),
+                ..Session::default()
+            }],
+        };
+        let mut form = UnifiedForm::new_edit_group(&group, &[]);
+        let config = AppConfig::default();
+
+        // Should build as group (has sessions)
+        let entry = form.validate_and_build(&config).unwrap();
+        match entry {
+            UnifiedEntry::Group(g) => {
+                assert_eq!(g.name, "test-group");
+                assert_eq!(g.sessions.len(), 1);
+            }
+            UnifiedEntry::Bookmark(_) => panic!("Expected Group"),
+        }
     }
 
     // ─── BookmarkForm tests ───

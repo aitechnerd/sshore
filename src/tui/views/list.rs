@@ -206,6 +206,137 @@ fn render_terminal_pane(frame: &mut Frame, area: Rect, app: &App) {
     frame.render_widget(paragraph, area);
 }
 
+/// Render the mux layout: session list on left (30%), terminal placeholder on right (70%).
+///
+/// Called when `Screen::GroupMux(group_idx)` is active.
+pub fn render_mux_layout(frame: &mut Frame, area: Rect, app: &App, group_idx: usize) {
+    let tc = &app.theme;
+
+    // Guard against invalid group index
+    if group_idx >= app.config.groups.len() {
+        let text = Text::from(vec![
+            Line::from(""),
+            Line::from(Span::styled(
+                "Invalid group.",
+                Style::default().fg(tc.warning).add_modifier(Modifier::BOLD),
+            )),
+        ]);
+        let paragraph = Paragraph::new(text).alignment(Alignment::Center);
+        frame.render_widget(paragraph, area);
+        return;
+    }
+
+    let group = &app.config.groups[group_idx];
+
+    let layout = ratatui::layout::Layout::horizontal([
+        Constraint::Percentage(LEFT_PANE_WIDTH),
+        Constraint::Percentage(100 - LEFT_PANE_WIDTH),
+    ])
+    .split(area);
+
+    // Left pane: session list
+    render_mux_session_list(frame, layout[0], app, group_idx, group);
+
+    // Right pane: terminal placeholder with session info
+    render_mux_terminal_pane(frame, layout[1], app, group_idx, group);
+}
+
+/// Render the session list in the left pane of mux mode.
+fn render_mux_session_list(frame: &mut Frame, area: Rect, app: &App, group_idx: usize, group: &crate::config::model::BookmarkGroup) {
+    let tc = &app.theme;
+
+    if group.sessions.is_empty() {
+        let text = Text::from(vec![
+            Line::from(""),
+            Line::from(Span::styled(
+                "No sessions",
+                Style::default().fg(tc.fg_dim),
+            )),
+        ]);
+        let paragraph = Paragraph::new(text).alignment(Alignment::Center);
+        frame.render_widget(paragraph, area);
+        return;
+    }
+
+    // Determine selected session index
+    let selected = app.mux_session.unwrap_or(0);
+    // Clamp to valid range
+    let selected = selected.min(group.sessions.len().saturating_sub(1));
+
+    let rows: Vec<Row> = group.sessions.iter().enumerate().map(|(idx, session)| {
+        let is_selected = idx == selected;
+        let prefix = if is_selected { ">" } else { " " };
+        let session_display = format!("{} {}", prefix, session.name);
+
+        let style = if is_selected {
+            Style::default()
+                .fg(tc.fg)
+                .bg(tc.highlight)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(tc.fg)
+        };
+
+        Row::new(vec![Cell::from(session_display).style(style)])
+    }).collect();
+
+    let table = Table::new(rows, [Constraint::Min(1)]).row_highlight_style(
+        Style::default(), // We handle highlighting per-cell
+    );
+
+    let mut state = TableState::default();
+    state.select(Some(selected));
+
+    frame.render_stateful_widget(table, area, &mut state);
+}
+
+/// Render the terminal placeholder in the right pane of mux mode.
+fn render_mux_terminal_pane(frame: &mut Frame, area: Rect, app: &App, group_idx: usize, group: &crate::config::model::BookmarkGroup) {
+    let tc = &app.theme;
+
+    // Determine selected session index
+    let selected = app.mux_session.unwrap_or(0);
+    let selected = selected.min(group.sessions.len().saturating_sub(1));
+
+    let content = if group.sessions.is_empty() {
+        Text::from(vec![
+            Line::from(""),
+            Line::from(Span::styled(
+                "No sessions in this group.",
+                Style::default().fg(tc.fg_dim),
+            )),
+        ])
+    } else {
+        let session = &group.sessions[selected];
+        let display_name = session.display_name(group);
+        let command = session.on_connect.as_ref()
+            .or(group.on_connect.as_ref())
+            .map(|c| c.as_str())
+            .unwrap_or("shell");
+
+        Text::from(vec![
+            Line::from(""),
+            Line::from(Span::styled(
+                display_name,
+                Style::default().fg(tc.accent).add_modifier(Modifier::BOLD),
+            )),
+            Line::from(""),
+            Line::from(Span::styled(
+                format!("Command: {}", command),
+                Style::default().fg(tc.fg_dim),
+            )),
+            Line::from(""),
+            Line::from(Span::styled(
+                "Press Enter to connect.",
+                Style::default().fg(tc.fg_muted),
+            )),
+        ])
+    };
+
+    let paragraph = Paragraph::new(content).alignment(Alignment::Center);
+    frame.render_widget(paragraph, area);
+}
+
 /// Render the unified bookmark+group table.
 fn render_bookmark_table(frame: &mut Frame, area: Rect, app: &App) {
     let tc = &app.theme;

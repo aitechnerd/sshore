@@ -867,10 +867,17 @@ fn draw(frame: &mut ratatui::Frame, app: &App) {
         chunk_idx += 1;
     }
 
-    // Main content area — always render the list as background
+    // Main content area
     let content_area = chunks[chunk_idx];
     chunk_idx += 1;
-    list::render_list(frame, content_area, app);
+    match app.screen {
+        Screen::GroupMux(group_idx) => {
+            list::render_mux_layout(frame, content_area, app, group_idx);
+        }
+        _ => {
+            list::render_list(frame, content_area, app);
+        }
+    }
 
     // Status message
     if let Some((ref msg, _)) = app.status_message

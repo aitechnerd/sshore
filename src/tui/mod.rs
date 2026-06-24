@@ -3,6 +3,7 @@ pub mod views;
 pub mod widgets;
 
 use std::collections::{HashMap, HashSet};
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use std::sync::atomic::Ordering;
@@ -80,6 +81,8 @@ pub struct MuxConnection {
     pub output: Vec<String>,
     /// Current state of the connection.
     pub state: MuxState,
+    /// Active mux channel (keeps the reader task alive).
+    channel: Option<std::sync::Arc<ssh::mux::MuxChannel>>,
 }
 
 impl MuxConnection {
@@ -88,6 +91,7 @@ impl MuxConnection {
         Self {
             output: Vec::new(),
             state: MuxState::Idle,
+            channel: None,
         }
     }
 
@@ -132,6 +136,37 @@ const ENV_FILTER_MAP: &[&str] = &[
     "local",       // 4
     "testing",     // 5
 ];
+
+/// Action to perform for mux persistent session (set by key handler, processed by event loop).
+enum MuxAction {
+    /// Open a shell connection for the given session.
+    OpenShell { group_idx: usize, session_idx: usize },
+    /// Send a command to the existing connection.
+    SendCommand { group_idx: usize, command: String },
+    /// Close the connection for the given group.
+    Close { group_idx: usize },
+}
+
+/// Result from a spawned mux task, sent back to the event loop.
+enum MuxResult {
+    /// Shell opened successfully with channel and output receiver.
+    ShellOpened {
+        group_idx: usize,
+        channel: ssh::mux::MuxChannel,
+        output_rx: tokio::sync::mpsc::Receiver<String>,
+    },
+    /// Shell open failed.
+    ShellError {
+        group_idx: usize,
+        error: String,
+    },
+    /// Command sent successfully.
+    CommandSent { group_idx: usize },
+    /// Command send failed.
+    CommandError { group_idx: usize, error: String },
+    /// Connection closed.
+    ConnectionClosed { group_idx: usize },
+}
 
 /// Action returned by the event loop to signal leaving the TUI for SSH or SFTP.
 enum LoopAction {
@@ -179,7 +214,17 @@ pub struct App {
     /// `None` means no session selected yet (e.g., empty group).
     pub mux_session: Option<usize>,
     /// Persistent SSH connections per group (group_idx → connection).
-    pub mux_connections: HashMap<usize, MuxConnection>,
+    /// Wrapped in Mutex so spawned tasks can update it.
+    pub mux_connections: Mutex<HashMap<usize, MuxConnection>>,
+    /// Output receivers for active mux connections (group_idx → receiver).
+    /// Drained by the event loop to update mux_connections.
+    pub mux_output_rx: HashMap<usize, tokio::sync::mpsc::Receiver<String>>,
+    /// Pending mux action to be processed by the event loop.
+    mux_action: Option<MuxAction>,
+    /// Receiver for results from spawned mux tasks.
+    mux_result_rx: tokio::sync::mpsc::Receiver<MuxResult>,
+    /// Sender paired with mux_result_rx (kept alive for spawning new tasks).
+    mux_result_tx: Option<tokio::sync::mpsc::Sender<MuxResult>>,
     matcher: SkimMatcherV2,
 }
 
@@ -203,6 +248,9 @@ impl App {
             .find(|(_, g)| !g.sessions.is_empty())
             .map(|(group_idx, _)| (group_idx, 0));
 
+        // Initialize mux result channel
+        let (mux_result_tx, mux_result_rx) = tokio::sync::mpsc::channel(16);
+
         Self {
             config,
             theme,
@@ -225,7 +273,11 @@ impl App {
             collapsed_groups: HashSet::new(),
             selected_session,
             mux_session: None,
-            mux_connections: HashMap::new(),
+            mux_connections: Mutex::new(HashMap::new()),
+            mux_output_rx: HashMap::new(),
+            mux_action: None,
+            mux_result_rx,
+            mux_result_tx: Some(mux_result_tx),
             matcher,
         }
     }
@@ -668,6 +720,135 @@ fn event_loop(
 
         if app.should_quit || crate::SHUTDOWN_REQUESTED.load(Ordering::Relaxed) {
             return Ok(LoopAction::Quit);
+        }
+
+        // Process pending mux actions (open shell / send command / close)
+        if let Some(action) = app.mux_action.take() {
+            let tx = app.mux_result_tx.clone();
+            match action {
+                MuxAction::OpenShell { group_idx, session_idx } => {
+                    let config = app.config.clone();
+                    // Set state to Connecting immediately
+                    app.mux_connections.lock().unwrap().insert(
+                        group_idx,
+                        MuxConnection {
+                            output: Vec::new(),
+                            state: MuxState::Connecting,
+                            channel: None,
+                        },
+                    );
+                    // Spawn async task to open the shell
+                    if let Some(tx) = tx {
+                        tokio::spawn(async move {
+                            match ssh::mux::mux_open_shell(&config, group_idx, session_idx).await {
+                                Ok((mux_channel, output_rx)) => {
+                                    if tx.send(MuxResult::ShellOpened {
+                                        group_idx,
+                                        channel: mux_channel,
+                                        output_rx,
+                                    }).await.is_err() {
+                                        tracing::debug!("mux result channel closed");
+                                    }
+                                }
+                                Err(e) => {
+                                    tracing::debug!(error = %e, "mux open shell failed");
+                                    if tx.send(MuxResult::ShellError {
+                                        group_idx,
+                                        error: e.to_string(),
+                                    }).await.is_err() {
+                                        tracing::debug!("mux result channel closed");
+                                    }
+                                }
+                            }
+                        });
+                    }
+                }
+                MuxAction::SendCommand { group_idx, command } => {
+                    // Get a clone of the Arc channel
+                    let channel = {
+                        let mut conns = app.mux_connections.lock().unwrap();
+                        if let Some(conn) = conns.get_mut(&group_idx) {
+                            conn.state = MuxState::Running;
+                            conn.channel.clone()
+                        } else {
+                            None
+                        }
+                    };
+                    // Spawn task to send command
+                    if let Some(channel) = channel {
+                        let arc = channel.clone();
+                        let tx = tx.clone();
+                        tokio::spawn(async move {
+                            match arc.send_command(&command).await {
+                                Ok(()) => {
+                                    if let Some(tx) = tx {
+                                        let _ = tx.send(MuxResult::CommandSent { group_idx }).await;
+                                    }
+                                }
+                                Err(e) => {
+                                    if let Some(tx) = tx {
+                                        let _ = tx.send(MuxResult::CommandError {
+                                            group_idx,
+                                            error: e.to_string(),
+                                        }).await;
+                                    }
+                                }
+                            }
+                        });
+                    }
+                }
+                MuxAction::Close { group_idx } => {
+                    app.mux_connections.lock().unwrap().remove(&group_idx);
+                    app.mux_output_rx.remove(&group_idx);
+                }
+            }
+        }
+
+        // Drain mux result channel
+        while let Ok(result) = app.mux_result_rx.try_recv() {
+            match result {
+                MuxResult::ShellOpened { group_idx, channel, output_rx } => {
+                    app.mux_output_rx.insert(group_idx, output_rx);
+                    if let Some(conn) = app.mux_connections.lock().unwrap().get_mut(&group_idx) {
+                        conn.state = MuxState::Ready;
+                        conn.channel = Some(std::sync::Arc::new(channel));
+                    }
+                    needs_redraw = true;
+                }
+                MuxResult::ShellError { group_idx, error } => {
+                    if let Some(conn) = app.mux_connections.lock().unwrap().get_mut(&group_idx) {
+                        conn.state = MuxState::Error(error);
+                    }
+                    needs_redraw = true;
+                }
+                MuxResult::CommandSent { group_idx } => {
+                    if let Some(conn) = app.mux_connections.lock().unwrap().get_mut(&group_idx) {
+                        conn.state = MuxState::Ready;
+                    }
+                    needs_redraw = true;
+                }
+                MuxResult::CommandError { group_idx, error } => {
+                    if let Some(conn) = app.mux_connections.lock().unwrap().get_mut(&group_idx) {
+                        conn.state = MuxState::Error(error);
+                    }
+                    needs_redraw = true;
+                }
+                MuxResult::ConnectionClosed { group_idx } => {
+                    app.mux_connections.lock().unwrap().remove(&group_idx);
+                    app.mux_output_rx.remove(&group_idx);
+                    needs_redraw = true;
+                }
+            }
+        }
+
+        // Drain mux output receivers
+        for (&group_idx, rx) in app.mux_output_rx.iter_mut() {
+            while let Ok(line) = rx.try_recv() {
+                if let Some(conn) = app.mux_connections.lock().unwrap().get_mut(&group_idx) {
+                    conn.append_line(line);
+                    needs_redraw = true;
+                }
+            }
         }
 
         if let Some(idx) = app.connect_request.take() {
@@ -1235,6 +1416,10 @@ fn handle_mux_key(app: &mut App, key: KeyEvent) {
     match key.code {
         // Quit mux, return to main list
         KeyCode::Esc | KeyCode::Char('q') => {
+            // Close connection if active
+            if app.mux_connections.lock().unwrap().contains_key(&group_idx) {
+                app.mux_action = Some(MuxAction::Close { group_idx });
+            }
             app.screen = Screen::List;
             app.mux_session = None;
         }
@@ -1265,15 +1450,62 @@ fn handle_mux_key(app: &mut App, key: KeyEvent) {
             app.mux_session = Some(new);
         }
 
-        // Connect to selected session
+        // Persistent session: open shell / send command
         KeyCode::Enter => {
             if session_count == 0 {
                 return;
             }
             let session_idx = app.mux_session.unwrap_or(0);
-            // Encode as: (group_idx+1)*10000 + (session_idx+1)
-            let encoded = (group_idx + 1) * 10000 + (session_idx + 1);
-            app.connect_request = Some(encoded);
+            // Check current connection state
+            let state = {
+                let conns = app.mux_connections.lock().unwrap();
+                conns.get(&group_idx).map(|c| c.state.clone())
+            };
+            match state {
+                Some(MuxState::Running) => {
+                    // Command already running, wait
+                    return;
+                }
+                Some(MuxState::Connecting) => {
+                    // Already connecting, wait
+                    return;
+                }
+                Some(MuxState::Error(_)) => {
+                    // Retry: close existing and reconnect
+                    app.mux_connections.lock().unwrap().remove(&group_idx);
+                    // Fall through to open shell
+                }
+                _ => {} // Idle, Ready, or no connection
+            }
+
+            // Resolve the session's on_connect command
+            let group = app.config.groups[group_idx].clone();
+            let session = group.sessions[session_idx].clone();
+            let command = session.effective_on_connect(&group, &app.config.profiles);
+
+            // Check if there's an existing connection for command sending
+            let has_ready_conn = {
+                let conns = app.mux_connections.lock().unwrap();
+                conns.get(&group_idx)
+                    .map(|c| matches!(c.state, MuxState::Ready))
+                    .unwrap_or(false)
+            };
+            // Decide: send command or open shell
+            if has_ready_conn {
+                if let Some(cmd) = command {
+                    app.mux_action = Some(MuxAction::SendCommand {
+                        group_idx,
+                        command: cmd,
+                    });
+                }
+                return;
+            }
+
+            // No connection or needs reconnect — open shell
+            app.mux_action = Some(MuxAction::OpenShell {
+                group_idx,
+                session_idx,
+            });
         }
 
         _ => {}
@@ -2659,8 +2891,8 @@ mod tests {
 
         let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
         handle_key_event(&mut app, enter);
-        // Encoded: (group_idx+1)*10000 + (session_idx+1) = (0+1)*10000 + (1+1) = 10002
-        assert_eq!(app.connect_request, Some(10002));
+        // Should set mux_action to OpenShell
+        assert!(matches!(app.mux_action, Some(MuxAction::OpenShell { .. })));
     }
 
     #[test]
@@ -2671,8 +2903,8 @@ mod tests {
 
         let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
         handle_key_event(&mut app, enter);
-        // Encoded: (0+1)*10000 + (0+1) = 10001
-        assert_eq!(app.connect_request, Some(10001));
+        // Should set mux_action to OpenShell
+        assert!(matches!(app.mux_action, Some(MuxAction::OpenShell { .. })));
     }
 
     #[test]

@@ -308,112 +308,116 @@ fn render_mux_terminal_pane(frame: &mut Frame, area: Rect, app: &App, group_idx:
         ])
     } else {
         // Check if there's an active mux connection for this group
-        if let Some(conn) = app.mux_connections.get(&group_idx) {
-            match &conn.state {
-                MuxState::Idle => {
-                    // Show session info with prompt to connect
-                    let session = &group.sessions[selected];
-                    let display_name = session.display_name(group);
-                    let command = session.effective_on_connect(group, &app.config.profiles)
-                        .map(|c| c.as_str().to_string())
-                        .unwrap_or_else(|| "shell".into());
+        let content = {
+            let conns = app.mux_connections.lock().unwrap();
+            if let Some(conn) = conns.get(&group_idx) {
+                match &conn.state {
+                    MuxState::Idle => {
+                        // Show session info with prompt to connect
+                        let session = &group.sessions[selected];
+                        let display_name = session.display_name(group);
+                        let command = session.effective_on_connect(group, &app.config.profiles)
+                            .map(|c| c.as_str().to_string())
+                            .unwrap_or_else(|| "shell".into());
 
-                    Text::from(vec![
-                        Line::from(""),
-                        Line::from(Span::styled(
-                            display_name,
-                            Style::default().fg(tc.accent).add_modifier(Modifier::BOLD),
-                        )),
-                        Line::from(""),
-                        Line::from(Span::styled(
-                            format!("Command: {}", command),
-                            Style::default().fg(tc.fg_dim),
-                        )),
-                        Line::from(""),
-                        Line::from(Span::styled(
-                            "Press Enter to connect.",
-                            Style::default().fg(tc.fg_muted),
-                        )),
-                    ])
-                }
-                MuxState::Connecting => {
-                    Text::from(vec![
-                        Line::from(""),
-                        Line::from(Span::styled(
-                            "Connecting...",
-                            Style::default().fg(tc.warning).add_modifier(Modifier::BOLD),
-                        )),
-                    ])
-                }
-                MuxState::Ready => {
-                    let lines: Vec<Line> = if conn.output.is_empty() {
-                        vec![
+                        Text::from(vec![
                             Line::from(""),
                             Line::from(Span::styled(
-                                "Ready — press Enter to send command",
+                                display_name,
+                                Style::default().fg(tc.accent).add_modifier(Modifier::BOLD),
+                            )),
+                            Line::from(""),
+                            Line::from(Span::styled(
+                                format!("Command: {}", command),
+                                Style::default().fg(tc.fg_dim),
+                            )),
+                            Line::from(""),
+                            Line::from(Span::styled(
+                                "Press Enter to connect.",
                                 Style::default().fg(tc.fg_muted),
                             )),
-                        ]
-                    } else {
-                        // Show output lines (capped to pane height)
-                        let max_lines = area.height as usize;
-                        let output_lines = conn.lines_capped(max_lines);
-                        output_lines.iter().map(|l| Line::from(l.as_str())).collect()
-                    };
-                    Text::from(lines)
+                        ])
+                    }
+                    MuxState::Connecting => {
+                        Text::from(vec![
+                            Line::from(""),
+                            Line::from(Span::styled(
+                                "Connecting...",
+                                Style::default().fg(tc.warning).add_modifier(Modifier::BOLD),
+                            )),
+                        ])
+                    }
+                    MuxState::Ready => {
+                        let lines: Vec<Line> = if conn.output.is_empty() {
+                            vec![
+                                Line::from(""),
+                                Line::from(Span::styled(
+                                    "Ready — press Enter to send command",
+                                    Style::default().fg(tc.fg_muted),
+                                )),
+                            ]
+                        } else {
+                            conn.lines_capped(area.height as usize)
+                                .iter()
+                                .map(|l| Line::from(l.clone()))
+                                .collect()
+                        };
+                        Text::from(lines)
+                    }
+                    MuxState::Running => {
+                        let mut lines: Vec<Line> = conn.lines_capped(area.height as usize)
+                            .iter()
+                            .map(|l| Line::from(l.clone()))
+                            .collect();
+                        lines.push(Line::from(Span::styled(
+                            "Running...",
+                            Style::default().fg(tc.warning),
+                        )));
+                        Text::from(lines)
+                    }
+                    MuxState::Error(msg) => {
+                        Text::from(vec![
+                            Line::from(""),
+                            Line::from(Span::styled(
+                                format!("Error: {}", msg),
+                                Style::default().fg(tc.error).add_modifier(Modifier::BOLD),
+                            )),
+                            Line::from(""),
+                            Line::from(Span::styled(
+                                "Press Enter to retry.",
+                                Style::default().fg(tc.fg_muted),
+                            )),
+                        ])
+                    }
                 }
-                MuxState::Running => {
-                    let mut lines: Vec<Line> = conn.lines_capped(area.height as usize)
-                        .iter()
-                        .map(|l| Line::from(l.as_str()))
-                        .collect();
-                    lines.push(Line::from(Span::styled(
-                        "Running...",
-                        Style::default().fg(tc.warning),
-                    )));
-                    Text::from(lines)
-                }
-                MuxState::Error(msg) => {
-                    Text::from(vec![
-                        Line::from(""),
-                        Line::from(Span::styled(
-                            format!("Error: {}", msg),
-                            Style::default().fg(tc.error).add_modifier(Modifier::BOLD),
-                        )),
-                        Line::from(""),
-                        Line::from(Span::styled(
-                            "Press Enter to retry.",
-                            Style::default().fg(tc.fg_muted),
-                        )),
-                    ])
-                }
-            }
-        } else {
-            // No connection yet — show session info
-            let session = &group.sessions[selected];
-            let display_name = session.display_name(group);
-            let command = session.effective_on_connect(group, &app.config.profiles)
-                .map(|c| c.as_str().to_string())
-                .unwrap_or_else(|| "shell".into());
+            } else {
+                // No connection yet — show session info
+                let session = &group.sessions[selected];
+                let display_name = session.display_name(group);
+                let command = session.effective_on_connect(group, &app.config.profiles)
+                    .map(|c| c.as_str().to_string())
+                    .unwrap_or_else(|| "shell".into());
 
-            Text::from(vec![
-                Line::from(""),
-                Line::from(Span::styled(
-                    display_name,
-                    Style::default().fg(tc.accent).add_modifier(Modifier::BOLD),
-                )),
-                Line::from(""),
-                Line::from(Span::styled(
-                    format!("Command: {}", command),
-                    Style::default().fg(tc.fg_dim),
-                )),
-                Line::from(""),
-                Line::from(Span::styled(
-                    "Press Enter to connect.",
-                    Style::default().fg(tc.fg_muted),
-                )),
-            ])
-        }
+                Text::from(vec![
+                    Line::from(""),
+                    Line::from(Span::styled(
+                        display_name,
+                        Style::default().fg(tc.accent).add_modifier(Modifier::BOLD),
+                    )),
+                    Line::from(""),
+                    Line::from(Span::styled(
+                        format!("Command: {}", command),
+                        Style::default().fg(tc.fg_dim),
+                    )),
+                    Line::from(""),
+                    Line::from(Span::styled(
+                        "Press Enter to connect.",
+                        Style::default().fg(tc.fg_muted),
+                    )),
+                ])
+            }
+        };
+        content
     };
 
     let paragraph = Paragraph::new(content).alignment(Alignment::Center);

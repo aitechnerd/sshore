@@ -2,7 +2,7 @@ pub mod theme;
 pub mod views;
 pub mod widgets;
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
 use std::sync::atomic::Ordering;
@@ -58,6 +58,59 @@ const DRAIN_EVENTS_LIMIT: usize = 64;
 
 /// Number of items to jump with Page Up/Down.
 const PAGE_JUMP: usize = 10;
+
+/// State of a persistent mux SSH connection.
+#[derive(Debug, Clone, PartialEq)]
+pub enum MuxState {
+    /// No connection yet.
+    Idle,
+    /// Connection in progress.
+    Connecting,
+    /// Connected and ready to accept commands.
+    Ready,
+    /// A command is currently executing.
+    Running,
+    /// Connection failed with an error message.
+    Error(String),
+}
+
+/// Persistent SSH connection state for a mux group.
+pub struct MuxConnection {
+    /// Buffered output lines from the remote session.
+    pub output: Vec<String>,
+    /// Current state of the connection.
+    pub state: MuxState,
+}
+
+impl MuxConnection {
+    /// Create a new idle connection.
+    pub fn new() -> Self {
+        Self {
+            output: Vec::new(),
+            state: MuxState::Idle,
+        }
+    }
+
+    /// Append a line to the output buffer.
+    pub fn append_line(&mut self, line: String) {
+        self.output.push(line);
+    }
+
+    /// Get the last N lines (capped by pane height).
+    pub fn lines_capped(&self, max_lines: usize) -> &[String] {
+        if self.output.len() <= max_lines {
+            &self.output
+        } else {
+            &self.output[self.output.len() - max_lines..]
+        }
+    }
+}
+
+impl Default for MuxConnection {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 /// TUI screen states.
 #[derive(Debug, Clone, PartialEq)]
@@ -125,6 +178,8 @@ pub struct App {
     /// Selected session index within the mux (session index within the group).
     /// `None` means no session selected yet (e.g., empty group).
     pub mux_session: Option<usize>,
+    /// Persistent SSH connections per group (group_idx → connection).
+    pub mux_connections: HashMap<usize, MuxConnection>,
     matcher: SkimMatcherV2,
 }
 
@@ -170,6 +225,7 @@ impl App {
             collapsed_groups: HashSet::new(),
             selected_session,
             mux_session: None,
+            mux_connections: HashMap::new(),
             matcher,
         }
     }

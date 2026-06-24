@@ -15,7 +15,7 @@ use self::shortcuts::ProgressBar;
 
 /// Open an interactive SFTP session to a bookmark.
 pub async fn open_session(config: &AppConfig, bookmark_index: usize) -> Result<()> {
-    let session = ssh::establish_session(config, bookmark_index).await?;
+    let session = ssh::establish_session(config, bookmark_index, false).await?;
 
     // Apply terminal theming with SFTP-specific title
     let bookmark = &config.bookmarks[bookmark_index];

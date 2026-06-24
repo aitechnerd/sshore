@@ -737,11 +737,15 @@ fn event_loop(
                             channel: None,
                         },
                     );
-                    // Spawn async task to open the shell
+                    // Spawn async task to open the shell (with timeout)
                     if let Some(tx) = tx {
                         tokio::spawn(async move {
-                            match ssh::mux::mux_open_shell(&config, group_idx, session_idx).await {
-                                Ok((mux_channel, output_rx)) => {
+                            let result = tokio::time::timeout(
+                                std::time::Duration::from_secs(30),
+                                ssh::mux::mux_open_shell(&config, group_idx, session_idx),
+                            ).await;
+                            match result {
+                                Ok(Ok((mux_channel, output_rx))) => {
                                     if tx.send(MuxResult::ShellOpened {
                                         group_idx,
                                         channel: mux_channel,
@@ -750,11 +754,20 @@ fn event_loop(
                                         tracing::debug!("mux result channel closed");
                                     }
                                 }
-                                Err(e) => {
+                                Ok(Err(e)) => {
                                     tracing::debug!(error = %e, "mux open shell failed");
                                     if tx.send(MuxResult::ShellError {
                                         group_idx,
                                         error: e.to_string(),
+                                    }).await.is_err() {
+                                        tracing::debug!("mux result channel closed");
+                                    }
+                                }
+                                Err(_) => {
+                                    // Timeout
+                                    if tx.send(MuxResult::ShellError {
+                                        group_idx,
+                                        error: "Connection timed out (30s). Check credentials or network.".into(),
                                     }).await.is_err() {
                                         tracing::debug!("mux result channel closed");
                                     }

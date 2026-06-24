@@ -93,7 +93,7 @@ async fn open_ssh_and_sftp(
     bookmark_name: &str,
 ) -> Result<(russh::client::Handle<SshoreHandler>, SftpSession, usize)> {
     let index = find_bookmark_index(config, bookmark_name)?;
-    let session = ssh::establish_session(config, index).await?;
+    let session = ssh::establish_session(config, index, false).await?;
 
     // Apply theming
     let bookmark = &config.bookmarks[index];

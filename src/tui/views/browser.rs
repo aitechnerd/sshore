@@ -4396,7 +4396,7 @@ async fn start_copy_transfer(
                         "second_conn:start opening at +{:.1}s",
                         conn_setup_start.elapsed().as_secs_f64(),
                     );
-                    match crate::ssh::establish_session(&reconnect_config, reconnect_index).await {
+                    match crate::ssh::establish_session(&reconnect_config, reconnect_index, false).await {
                         Ok(second_handle) => {
                             let conn_ms = conn_start.elapsed().as_millis();
                             tracing::debug!(

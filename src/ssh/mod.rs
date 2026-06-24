@@ -336,11 +336,12 @@ fn build_ssh_config() -> Arc<russh::client::Config> {
 /// Establish an authenticated SSH session to a bookmark.
 /// Returns the session handle for opening channels (shell, SFTP, etc.).
 ///
-/// If the bookmark has a proxy_jump configured, connects through the jump host
-/// first (ProxyJump / -J semantics), then establishes the SSH session to the target.
+/// If `non_interactive` is true, skip password prompts (keychain-only auth).
+/// Used for mux mode where the TUI owns the terminal.
 pub async fn establish_session(
     config: &AppConfig,
     bookmark_index: usize,
+    non_interactive: bool,
 ) -> Result<russh::client::Handle<SshoreHandler>> {
     let bookmark = &config.bookmarks[bookmark_index];
     let settings = &config.settings;
@@ -393,6 +394,7 @@ pub async fn establish_session(
         bookmark_name: Some(&bookmark.name),
         env: Some(&bookmark.env),
         has_identity_file: bookmark.effective_identity_file(profiles).is_some(),
+        non_interactive,
     };
     let authenticated = authenticate(&mut session, &user, &keys, &ctx).await?;
     if !authenticated {
@@ -504,6 +506,7 @@ async fn connect_through_proxy(
         bookmark_name: None, // Don't use bookmark keychain for jump host
         env: None,
         has_identity_file: false, // Jump hosts use default keys; always allow password fallback
+        non_interactive: false,
     };
     let jump_authenticated = authenticate_with_jump_keychain(
         &mut jump_session,
@@ -729,6 +732,7 @@ pub async fn establish_tunnel_session(
         bookmark_name: Some(&bookmark.name),
         env: Some(&bookmark.env),
         has_identity_file: bookmark.effective_identity_file(profiles).is_some(),
+        non_interactive: false,
     };
     let authenticated = authenticate(&mut session, &user, &keys, &ctx).await?;
     if !authenticated {
@@ -745,7 +749,7 @@ pub async fn connect(
     bookmark_index: usize,
     cfg_override: Option<&str>,
 ) -> Result<()> {
-    let session = Arc::new(establish_session(config, bookmark_index).await?);
+    let session = Arc::new(establish_session(config, bookmark_index, false).await?);
 
     // Apply terminal theming
     terminal_theme::apply_theme(&config.bookmarks[bookmark_index], &config.settings);
@@ -937,7 +941,7 @@ pub async fn exec_command(
     bookmark_index: usize,
     command: &str,
 ) -> Result<ExecResult> {
-    let session = establish_session(config, bookmark_index).await?;
+    let session = establish_session(config, bookmark_index, false).await?;
 
     let channel = session
         .channel_open_session()
@@ -1057,7 +1061,7 @@ async fn exec_command_quiet(
     bookmark_index: usize,
     command: &str,
 ) -> Result<ExecResult> {
-    let session = establish_session(config, bookmark_index).await?;
+    let session = establish_session(config, bookmark_index, false).await?;
 
     let channel = session
         .channel_open_session()
@@ -1247,6 +1251,9 @@ struct AuthContext<'a> {
     /// When true, the bookmark has an explicit identity_file configured.
     /// Password auth should not be attempted as a fallback.
     has_identity_file: bool,
+    /// When true, skip interactive password prompt (keychain-only auth).
+    /// Used for mux mode where the TUI owns the terminal.
+    non_interactive: bool,
 }
 
 /// Try to authenticate using available keys, then keychain password, then user prompt.
@@ -1306,7 +1313,11 @@ async fn authenticate(
         }
     }
 
-    // 3. Prompt user for password
+    // 3. Prompt user for password (skip in non-interactive mode)
+    if ctx.non_interactive {
+        tracing::debug!("non-interactive mode, skipping password prompt");
+        return Ok(false);
+    }
     tracing::debug!("prompting for password");
     let password = prompt_password(user)?;
     match session.authenticate_password(user, password.as_str()).await {

@@ -39,7 +39,7 @@ impl SftpBackend {
     /// Create a new SFTP backend connected to a bookmark.
     pub async fn new(config: &AppConfig, bookmark_index: usize) -> Result<Self> {
         let bookmark = &config.bookmarks[bookmark_index];
-        let session = ssh::establish_session(config, bookmark_index).await?;
+        let session = ssh::establish_session(config, bookmark_index, false).await?;
 
         let channel = session
             .channel_open_session()
@@ -372,7 +372,7 @@ impl SftpBackend {
         let index = self
             .bookmark_index
             .context("No bookmark index stored for reconnection")?;
-        ssh::establish_session(config, index).await
+        ssh::establish_session(config, index, false).await
     }
 
     /// Get the reconnection info (config + bookmark index) for spawning

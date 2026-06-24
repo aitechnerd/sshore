@@ -95,7 +95,7 @@ pub async fn mux_open_shell(
     temp_config.bookmarks.push(bookmark);
 
     let session_handle = Arc::new(
-        crate::ssh::establish_session(&temp_config, bm_idx).await?,
+        crate::ssh::establish_session(&temp_config, bm_idx, true).await?,
     );
 
     // Open session channel

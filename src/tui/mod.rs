@@ -139,7 +139,7 @@ const ENV_FILTER_MAP: &[&str] = &[
 
 /// Action to perform for mux persistent session (set by key handler, processed by event loop).
 enum MuxAction {
-    /// Open a shell connection for the given session.
+    /// Open a shell connection for the given session (non-interactive auth).
     OpenShell { group_idx: usize, session_idx: usize },
     /// Send a command to the existing connection.
     SendCommand { group_idx: usize, command: String },
@@ -221,6 +221,8 @@ pub struct App {
     pub mux_output_rx: HashMap<usize, tokio::sync::mpsc::Receiver<String>>,
     /// Pending mux action to be processed by the event loop.
     mux_action: Option<MuxAction>,
+    /// Return to mux mode after interactive connect completes.
+    mux_return_after_connect: Option<usize>, // group_idx
     /// Receiver for results from spawned mux tasks.
     mux_result_rx: tokio::sync::mpsc::Receiver<MuxResult>,
     /// Sender paired with mux_result_rx (kept alive for spawning new tasks).
@@ -276,6 +278,7 @@ impl App {
             mux_connections: Mutex::new(HashMap::new()),
             mux_output_rx: HashMap::new(),
             mux_action: None,
+            mux_return_after_connect: None,
             mux_result_rx,
             mux_result_tx: Some(mux_result_tx),
             matcher,
@@ -559,6 +562,12 @@ pub async fn run(config: &mut AppConfig, cfg_override: Option<&str>) -> Result<(
                 }
                 tracing::debug!("returned to TUI after browse");
             }
+        }
+
+        // Return to mux mode after interactive connect (if requested)
+        if let Some(group_idx) = app.mux_return_after_connect.take() {
+            app.screen = Screen::GroupMux(group_idx);
+            app.mux_session = Some(0);
         }
     }
 
@@ -1484,9 +1493,13 @@ fn handle_mux_key(app: &mut App, key: KeyEvent) {
                     return;
                 }
                 Some(MuxState::Error(_)) => {
-                    // Retry: close existing and reconnect
+                    // Auth failed in non-interactive mode — fall back to interactive
+                    let encoded = (group_idx + 1) * 10000 + (session_idx + 1);
+                    app.mux_return_after_connect = Some(group_idx);
                     app.mux_connections.lock().unwrap().remove(&group_idx);
-                    // Fall through to open shell
+                    app.mux_output_rx.remove(&group_idx);
+                    app.connect_request = Some(encoded);
+                    return;
                 }
                 _ => {} // Idle, Ready, or no connection
             }
@@ -3114,9 +3127,10 @@ mod tests {
 
         let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
         handle_key_event(&mut app, enter);
-        // Should remove error connection and set OpenShell
+        // Should fall back to interactive auth
         assert!(app.mux_connections.lock().unwrap().is_empty());
-        assert!(matches!(app.mux_action, Some(MuxAction::OpenShell { .. })));
+        assert_eq!(app.connect_request, Some(10001)); // (0+1)*10000 + (0+1)
+        assert_eq!(app.mux_return_after_connect, Some(0));
     }
 
     #[test]

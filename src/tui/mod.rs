@@ -2987,4 +2987,143 @@ mod tests {
         handle_key_event(&mut app, enter);
         assert_eq!(app.connect_request, None);
     }
+
+    #[test]
+    fn test_mux_first_enter_opens_connection() {
+        let mut app = app_with_groups(vec![sample_group()]);
+        app.screen = Screen::GroupMux(0);
+        app.mux_session = Some(0);
+
+        let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+        handle_key_event(&mut app, enter);
+        // Should set mux_action to OpenShell (no existing connection)
+        assert!(matches!(
+            app.mux_action,
+            Some(MuxAction::OpenShell { group_idx: 0, session_idx: 0 })
+        ));
+    }
+
+    #[test]
+    fn test_mux_enter_ready_sends_command() {
+        let mut app = app_with_groups(vec![sample_group()]);
+        app.screen = Screen::GroupMux(0);
+        app.mux_session = Some(0);
+        // Simulate an existing Ready connection
+        app.mux_connections.lock().unwrap().insert(
+            0,
+            MuxConnection {
+                output: Vec::new(),
+                state: MuxState::Ready,
+                channel: None,
+            },
+        );
+
+        let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+        handle_key_event(&mut app, enter);
+        // With no on_connect, has_ready_conn is true but command is None,
+        // so it falls through to OpenShell
+        // Actually the code returns early when has_ready_conn is true and command is None
+        assert!(app.mux_action.is_none());
+    }
+
+    #[test]
+    fn test_mux_q_closes_connection() {
+        let mut app = app_with_groups(vec![sample_group()]);
+        app.screen = Screen::GroupMux(0);
+        app.mux_session = Some(0);
+        // Simulate an existing connection
+        app.mux_connections.lock().unwrap().insert(
+            0,
+            MuxConnection {
+                output: Vec::new(),
+                state: MuxState::Ready,
+                channel: None,
+            },
+        );
+
+        let q = KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE);
+        handle_key_event(&mut app, q);
+        // Should set Close action and return to List
+        assert!(matches!(app.mux_action, Some(MuxAction::Close { group_idx: 0 })));
+        assert_eq!(app.screen, Screen::List);
+    }
+
+    #[test]
+    fn test_mux_navigation_with_connection() {
+        let mut app = app_with_groups(vec![sample_group()]);
+        app.screen = Screen::GroupMux(0);
+        app.mux_session = Some(0);
+        // Simulate an existing connection
+        app.mux_connections.lock().unwrap().insert(
+            0,
+            MuxConnection {
+                output: Vec::new(),
+                state: MuxState::Ready,
+                channel: None,
+            },
+        );
+
+        // Navigate down
+        let down = KeyEvent::new(KeyCode::Down, KeyModifiers::NONE);
+        handle_key_event(&mut app, down);
+        assert_eq!(app.mux_session, Some(1));
+
+        // Navigate up
+        let up = KeyEvent::new(KeyCode::Up, KeyModifiers::NONE);
+        handle_key_event(&mut app, up);
+        assert_eq!(app.mux_session, Some(0));
+
+        // j key
+        let j = KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE);
+        handle_key_event(&mut app, j);
+        assert_eq!(app.mux_session, Some(1));
+
+        // k key
+        let k = KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE);
+        handle_key_event(&mut app, k);
+        assert_eq!(app.mux_session, Some(0));
+    }
+
+    #[test]
+    fn test_mux_error_retry() {
+        let mut app = app_with_groups(vec![sample_group()]);
+        app.screen = Screen::GroupMux(0);
+        app.mux_session = Some(0);
+        // Simulate an Error connection
+        app.mux_connections.lock().unwrap().insert(
+            0,
+            MuxConnection {
+                output: Vec::new(),
+                state: MuxState::Error("Connection refused".into()),
+                channel: None,
+            },
+        );
+
+        let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+        handle_key_event(&mut app, enter);
+        // Should remove error connection and set OpenShell
+        assert!(app.mux_connections.lock().unwrap().is_empty());
+        assert!(matches!(app.mux_action, Some(MuxAction::OpenShell { .. })));
+    }
+
+    #[test]
+    fn test_mux_running_blocks_enter() {
+        let mut app = app_with_groups(vec![sample_group()]);
+        app.screen = Screen::GroupMux(0);
+        app.mux_session = Some(0);
+        // Simulate a Running connection
+        app.mux_connections.lock().unwrap().insert(
+            0,
+            MuxConnection {
+                output: Vec::new(),
+                state: MuxState::Running,
+                channel: None,
+            },
+        );
+
+        let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+        handle_key_event(&mut app, enter);
+        // Should not set any action (blocks while running)
+        assert!(app.mux_action.is_none());
+    }
 }

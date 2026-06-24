@@ -1,5 +1,6 @@
 pub mod client;
 pub mod known_hosts;
+pub mod mux;
 pub mod password;
 pub mod snippet;
 pub mod stdin_reader;

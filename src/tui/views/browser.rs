@@ -3383,7 +3383,9 @@ fn spawn_worker(
             let open_start = std::time::Instant::now();
             let handle_str = match file_handle {
                 Some(h) => h,
-                None => match open_target_handle(&raw, &target, pool.direction, &pool.created_dirs).await {
+                None => match open_target_handle(&raw, &target, pool.direction, &pool.created_dirs)
+                    .await
+                {
                     Ok(h) => h,
                     Err(e) => {
                         // If the session is dead, stop the worker entirely.
@@ -3684,7 +3686,11 @@ async fn sftp_mkdir_all(
     created_dirs: &std::sync::Mutex<std::collections::HashSet<String>>,
 ) -> Option<String> {
     // Ensure path is absolute (prepend / if missing)
-    let path = if path.starts_with('/') { path.to_string() } else { format!("/{}", path) };
+    let path = if path.starts_with('/') {
+        path.to_string()
+    } else {
+        format!("/{}", path)
+    };
     // Check if we already created this exact path
     {
         let dirs = created_dirs.lock().unwrap();
@@ -3705,7 +3711,10 @@ async fn sftp_mkdir_all(
         if created_dirs.lock().unwrap().contains(&current) {
             continue;
         }
-        if let Err(e) = sftp.mkdir(&current, russh_sftp::protocol::FileAttributes::default()).await {
+        if let Err(e) = sftp
+            .mkdir(&current, russh_sftp::protocol::FileAttributes::default())
+            .await
+        {
             // Capture first error for reporting, but continue (mkdir -p style)
             if first_error.is_none() {
                 first_error = Some(format!("{}: {}", current, e));
@@ -4304,7 +4313,11 @@ async fn start_copy_transfer(
                 .map(|(src, name, is_dir, size)| {
                     let cwd = dst_cwd.trim_end_matches('/');
                     // Ensure absolute path for SFTP (prepend / if missing)
-                    let base = if cwd.starts_with('/') { cwd.to_string() } else { format!("/{}", cwd) };
+                    let base = if cwd.starts_with('/') {
+                        cwd.to_string()
+                    } else {
+                        format!("/{}", cwd)
+                    };
                     TransferTarget {
                         src_path: src.clone(),
                         dst_path: format!("{}/{}", base, name),
@@ -4396,7 +4409,9 @@ async fn start_copy_transfer(
                         "second_conn:start opening at +{:.1}s",
                         conn_setup_start.elapsed().as_secs_f64(),
                     );
-                    match crate::ssh::establish_session(&reconnect_config, reconnect_index, false).await {
+                    match crate::ssh::establish_session(&reconnect_config, reconnect_index, false)
+                        .await
+                    {
                         Ok(second_handle) => {
                             let conn_ms = conn_start.elapsed().as_millis();
                             tracing::debug!(

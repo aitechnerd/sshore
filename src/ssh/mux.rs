@@ -16,6 +16,7 @@ use crate::ssh::client::SshoreHandler;
 /// and a sender for streaming output lines back to the TUI.
 pub struct MuxChannel {
     /// The authenticated SSH session handle.
+    #[allow(dead_code)]
     session: Arc<russh::client::Handle<SshoreHandler>>,
     /// Channel write half for sending data (commands).
     channel_tx: russh::ChannelWriteHalf<russh::client::Msg>,
@@ -65,8 +66,8 @@ pub async fn mux_open_shell(
     let port = session.effective_port(group);
     let identity_file = session.effective_identity_file(group, &config.profiles);
     let proxy_jump = session.effective_proxy_jump(group, &config.profiles);
-    let connect_timeout_secs = session
-        .effective_connect_timeout(group, &config.settings, &config.profiles);
+    let connect_timeout_secs =
+        session.effective_connect_timeout(group, &config.settings, &config.profiles);
 
     // Build synthetic bookmark for connection
     let bookmark = crate::config::model::Bookmark {
@@ -94,9 +95,7 @@ pub async fn mux_open_shell(
     let bm_idx = temp_config.bookmarks.len();
     temp_config.bookmarks.push(bookmark);
 
-    let session_handle = Arc::new(
-        crate::ssh::establish_session(&temp_config, bm_idx, true).await?,
-    );
+    let session_handle = Arc::new(crate::ssh::establish_session(&temp_config, bm_idx, true).await?);
 
     // Open session channel
     let channel = session_handle
@@ -144,12 +143,9 @@ async fn reader_task(
     let mut buf = String::new();
     loop {
         // Use timeout to allow checking if output_tx is closed
-        let item = tokio::time::timeout(
-            std::time::Duration::from_millis(100),
-            channel_rx.wait(),
-        )
-        .await
-        .ok();
+        let item = tokio::time::timeout(std::time::Duration::from_millis(100), channel_rx.wait())
+            .await
+            .ok();
 
         match item {
             Some(Some(russh::ChannelMsg::Data { ref data })) => {

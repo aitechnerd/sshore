@@ -253,7 +253,7 @@ fn split_directive(line: &str) -> Option<(&str, &str)> {
     } else {
         let mut parts = line.splitn(2, char::is_whitespace);
         let directive = parts.next()?.trim();
-        let value = parts.next().map(|v| v.trim()).unwrap_or("");
+        let value = parts.next().map_or("", |v| v.trim());
         (directive, value)
     };
 

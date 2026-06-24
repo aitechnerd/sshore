@@ -45,11 +45,7 @@ pub fn config_dir() -> PathBuf {
             .unwrap_or(false);
     let base = dirs::config_dir().unwrap_or_else(|| PathBuf::from(".config"));
     // Use a separate directory for dev builds to protect production data
-    let dir_name = if is_dev {
-        "sshore-dev"
-    } else {
-        "sshore"
-    };
+    let dir_name = if is_dev { "sshore-dev" } else { "sshore" };
     base.join(dir_name)
 }
 
@@ -322,10 +318,7 @@ fn validate_groups(groups: &[BookmarkGroup], profiles: &[Profile]) -> Result<()>
 
         // Validate group-level on_connect
         if let Some(ref cmd) = g.on_connect {
-            validate_on_connect(
-                cmd,
-                &format!("Group '{}'", sanitize_for_display(&g.name)),
-            )?;
+            validate_on_connect(cmd, &format!("Group '{}'", sanitize_for_display(&g.name)))?;
         }
 
         // Validate session-level on_connect
@@ -343,14 +336,14 @@ fn validate_groups(groups: &[BookmarkGroup], profiles: &[Profile]) -> Result<()>
         }
 
         // Warn on dangling profile reference (soft warning)
-        if let Some(ref profile_name) = g.profile {
-            if !profile_names.contains(profile_name.as_str()) {
-                eprintln!(
-                    "Warning: group '{}' references profile '{}' which does not exist",
-                    sanitize_for_display(&g.name),
-                    sanitize_for_display(profile_name)
-                );
-            }
+        if let Some(ref profile_name) = g.profile
+            && !profile_names.contains(profile_name.as_str())
+        {
+            eprintln!(
+                "Warning: group '{}' references profile '{}' which does not exist",
+                sanitize_for_display(&g.name),
+                sanitize_for_display(profile_name)
+            );
         }
     }
 
@@ -1639,7 +1632,7 @@ profile = "deleted-profile"
             env: "production".into(),
             tags: vec!["web".into()],
             identity_file: None, // falls to profile
-            proxy_jump: None, // falls to profile
+            proxy_jump: None,    // falls to profile
             notes: None,
             profile: Some("corp".into()),
             connect_timeout_secs: None, // falls to profile
@@ -1658,10 +1651,10 @@ profile = "deleted-profile"
             sessions: vec![model::Session {
                 name: "project-a".into(),
                 on_connect: Some("tmux attach -t proj-a".into()), // overrides
-                user: Some("admin".into()), // overrides
-                identity_file: None, // falls to group -> profile
-                proxy_jump: None, // falls to group -> profile
-                connect_timeout_secs: Some(10), // overrides
+                user: Some("admin".into()),                       // overrides
+                identity_file: None,                              // falls to group -> profile
+                proxy_jump: None,                                 // falls to group -> profile
+                connect_timeout_secs: Some(10),                   // overrides
                 ssh_options: {
                     let mut m = std::collections::BTreeMap::new();
                     m.insert("Compression".into(), "no".into()); // overrides group
@@ -1681,7 +1674,10 @@ profile = "deleted-profile"
         let session = &group.sessions[0];
 
         // Session overrides
-        assert_eq!(session.effective_user(&group, &settings, &profiles), "admin");
+        assert_eq!(
+            session.effective_user(&group, &settings, &profiles),
+            "admin"
+        );
         assert_eq!(
             session.effective_on_connect(&group, &profiles),
             Some("tmux attach -t proj-a".into())
@@ -1731,7 +1727,11 @@ profile = "deleted-profile"
                 identity_file: Some("~/.ssh/corp_key".into()),
                 ..model::Profile::default()
             }],
-            bookmarks: vec![sample_bookmark("prod-web", "production", vec!["web".into()])],
+            bookmarks: vec![sample_bookmark(
+                "prod-web",
+                "production",
+                vec!["web".into()],
+            )],
             groups: vec![model::BookmarkGroup {
                 name: "prod-servers".into(),
                 host: "10.0.1.5".into(),

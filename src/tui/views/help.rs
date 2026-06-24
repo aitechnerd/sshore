@@ -5,7 +5,6 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 
 use crate::tui::Screen;
-use crate::tui::views::form::EditTarget;
 use crate::tui::theme::ThemeColors;
 
 /// Render a centered help overlay with keybindings filtered by source screen.
@@ -258,6 +257,7 @@ fn centered_rect_with_height(percent_x: u16, height: u16, area: Rect) -> Rect {
 mod tests {
     use super::*;
     use crate::tui::theme::resolve_theme;
+    use crate::tui::views::form::EditTarget;
 
     /// Flatten all Line spans into a single string for easy content checks.
     fn lines_to_string(lines: &[Line<'_>]) -> String {
@@ -381,8 +381,12 @@ mod tests {
     fn test_edit_form_help_same_as_add() {
         let theme = default_theme();
         let (add_sections, add_label) = build_help_sections(&Screen::AddForm, false, None, &theme);
-        let (edit_sections, edit_label) =
-            build_help_sections(&Screen::EditForm(EditTarget::Bookmark, 0), false, None, &theme);
+        let (edit_sections, edit_label) = build_help_sections(
+            &Screen::EditForm(EditTarget::Bookmark, 0),
+            false,
+            None,
+            &theme,
+        );
         assert_eq!(add_label, "Form");
         assert_eq!(edit_label, "Form");
         assert_eq!(

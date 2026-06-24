@@ -6,9 +6,8 @@
 /// - Editing existing bookmark/group
 /// - Removing last session reverts to bookmark mode
 /// - Name conflict across bookmark/group types
-
-use sshore::config::model::{AppConfig, Bookmark, BookmarkGroup, Settings, Session};
-use sshore::tui::views::form::{EditTarget, FormState, UnifiedForm, UnifiedEntry};
+use sshore::config::model::{AppConfig, Bookmark, BookmarkGroup, Session, Settings};
+use sshore::tui::views::form::{EditTarget, FormState, UnifiedEntry, UnifiedForm};
 
 fn sample_bookmark() -> Bookmark {
     Bookmark {
@@ -69,7 +68,7 @@ fn unified_form_add_saves_as_bookmark() {
     let settings = Settings::default();
     let mut form = UnifiedForm::new_add(&settings, &[]);
     form.fields[0] = "new-server".into(); // NAME
-    form.fields[1] = "10.0.1.5".into();   // HOST
+    form.fields[1] = "10.0.1.5".into(); // HOST
 
     // No sessions added - should save as bookmark
     let entry = form.validate_and_build(&config).unwrap();
@@ -87,8 +86,8 @@ fn unified_form_add_with_sessions_saves_as_group() {
     let config = AppConfig::default();
     let settings = Settings::default();
     let mut form = UnifiedForm::new_add(&settings, &[]);
-    form.fields[0] = "new-group".into();  // NAME
-    form.fields[1] = "10.0.1.5".into();   // HOST
+    form.fields[0] = "new-group".into(); // NAME
+    form.fields[1] = "10.0.1.5".into(); // HOST
 
     // Add session via Ctrl+Enter simulation
     form.add_session_line();
@@ -170,10 +169,7 @@ fn unified_form_name_conflict_bookmark_vs_group() {
     // Should fail due to name conflict
     let result = form.validate_and_build_bookmark(&config);
     assert!(result.is_err());
-    assert!(result
-        .unwrap_err()
-        .to_string()
-        .contains("already exists"));
+    assert!(result.unwrap_err().to_string().contains("already exists"));
 }
 
 #[test]
@@ -191,10 +187,7 @@ fn unified_form_name_conflict_group_vs_bookmark() {
     // Should fail due to name conflict
     let result = form.validate_and_build_group(&config);
     assert!(result.is_err());
-    assert!(result
-        .unwrap_err()
-        .to_string()
-        .contains("already exists"));
+    assert!(result.unwrap_err().to_string().contains("already exists"));
 }
 
 #[test]

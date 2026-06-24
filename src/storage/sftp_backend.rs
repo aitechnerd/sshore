@@ -55,10 +55,12 @@ impl SftpBackend {
             .await
             .context("Failed to initialize SFTP session")?;
 
-        let cwd = ensure_absolute(&sftp
-            .canonicalize(".")
-            .await
-            .unwrap_or_else(|_| "/".to_string()));
+        let cwd = ensure_absolute(
+            &sftp
+                .canonicalize(".")
+                .await
+                .unwrap_or_else(|_| "/".to_string()),
+        );
 
         let display_name = format!("{} (SFTP)", bookmark.name);
 

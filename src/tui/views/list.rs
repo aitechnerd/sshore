@@ -4,10 +4,10 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Cell, Paragraph, Row, Table, TableState};
 
-use crate::tui::{App, MuxState};
 use crate::tui::theme;
 use crate::tui::theme::ThemeColors;
 use crate::tui::widgets::env_badge;
+use crate::tui::{App, MuxState};
 
 /// Width ratio for the left pane (group/session list) in the split layout.
 const LEFT_PANE_WIDTH: u16 = 30;
@@ -35,8 +35,8 @@ pub fn render_list(frame: &mut Frame, area: Rect, app: &App) {
 }
 
 /// Render the split-pane layout: group/session tree on left, terminal on right.
+#[allow(dead_code)]
 fn render_split_layout(frame: &mut Frame, area: Rect, app: &App) {
-
     let layout = ratatui::layout::Layout::horizontal([
         Constraint::Percentage(LEFT_PANE_WIDTH),
         Constraint::Percentage(100 - LEFT_PANE_WIDTH),
@@ -54,6 +54,7 @@ fn render_split_layout(frame: &mut Frame, area: Rect, app: &App) {
 ///
 /// Shows groups as collapsible headers with sessions nested underneath.
 /// Falls back to bookmark list when no groups exist.
+#[allow(dead_code)]
 fn render_group_session_tree(frame: &mut Frame, area: Rect, app: &App) {
     let tc = &app.theme;
 
@@ -94,9 +95,7 @@ fn render_group_session_tree(frame: &mut Frame, area: Rect, app: &App) {
                 .fg(tc.fg)
                 .bg(tc.highlight)
         } else {
-            Style::default()
-                .fg(tc.accent)
-                .add_modifier(Modifier::BOLD)
+            Style::default().fg(tc.accent).add_modifier(Modifier::BOLD)
         };
 
         let header_line = Line::from(vec![
@@ -105,13 +104,12 @@ fn render_group_session_tree(frame: &mut Frame, area: Rect, app: &App) {
         ]);
 
         rows.push(Row::new(vec![Cell::from(header_line)]));
-        display_indices.push(group_idx * 1000 + 0); // group header marker
+        display_indices.push(group_idx * 1000); // group header marker
 
         // Session rows (only if not collapsed)
         if !is_collapsed {
             for (session_idx, session) in group.sessions.iter().enumerate() {
-                let is_selected =
-                    app.selected_session == Some((group_idx, session_idx));
+                let is_selected = app.selected_session == Some((group_idx, session_idx));
 
                 let session_style = if is_selected {
                     Style::default()
@@ -124,10 +122,7 @@ fn render_group_session_tree(frame: &mut Frame, area: Rect, app: &App) {
 
                 // Session display: "  └─ session-name" with env badge
                 let session_display = format!("  └─ {}", session.name);
-                let session_line = Line::from(vec![Span::styled(
-                    session_display,
-                    session_style,
-                )]);
+                let session_line = Line::from(vec![Span::styled(session_display, session_style)]);
 
                 rows.push(Row::new(vec![Cell::from(session_line)]));
                 display_indices.push(group_idx * 1000 + 1 + session_idx); // session marker
@@ -165,6 +160,7 @@ fn render_group_session_tree(frame: &mut Frame, area: Rect, app: &App) {
 /// Render the right pane (terminal area).
 ///
 /// Shows a placeholder when no session is connected, or the active session info.
+#[allow(dead_code)]
 fn render_terminal_pane(frame: &mut Frame, area: Rect, app: &App) {
     let tc = &app.theme;
 
@@ -191,15 +187,13 @@ fn render_terminal_pane(frame: &mut Frame, area: Rect, app: &App) {
                 )),
             ])
         }
-        None => {
-            Text::from(vec![
-                Line::from(""),
-                Line::from(Span::styled(
-                    "Select a session to connect.",
-                    Style::default().fg(tc.fg_dim),
-                )),
-            ])
-        }
+        None => Text::from(vec![
+            Line::from(""),
+            Line::from(Span::styled(
+                "Select a session to connect.",
+                Style::default().fg(tc.fg_dim),
+            )),
+        ]),
     };
 
     let paragraph = Paragraph::new(content).alignment(Alignment::Center);
@@ -242,16 +236,19 @@ pub fn render_mux_layout(frame: &mut Frame, area: Rect, app: &App, group_idx: us
 }
 
 /// Render the session list in the left pane of mux mode.
-fn render_mux_session_list(frame: &mut Frame, area: Rect, app: &App, _group_idx: usize, group: &crate::config::model::BookmarkGroup) {
+fn render_mux_session_list(
+    frame: &mut Frame,
+    area: Rect,
+    app: &App,
+    _group_idx: usize,
+    group: &crate::config::model::BookmarkGroup,
+) {
     let tc = &app.theme;
 
     if group.sessions.is_empty() {
         let text = Text::from(vec![
             Line::from(""),
-            Line::from(Span::styled(
-                "No sessions",
-                Style::default().fg(tc.fg_dim),
-            )),
+            Line::from(Span::styled("No sessions", Style::default().fg(tc.fg_dim))),
         ]);
         let paragraph = Paragraph::new(text).alignment(Alignment::Center);
         frame.render_widget(paragraph, area);
@@ -263,22 +260,27 @@ fn render_mux_session_list(frame: &mut Frame, area: Rect, app: &App, _group_idx:
     // Clamp to valid range
     let selected = selected.min(group.sessions.len().saturating_sub(1));
 
-    let rows: Vec<Row> = group.sessions.iter().enumerate().map(|(idx, session)| {
-        let is_selected = idx == selected;
-        let prefix = if is_selected { ">" } else { " " };
-        let session_display = format!("{} {}", prefix, session.name);
+    let rows: Vec<Row> = group
+        .sessions
+        .iter()
+        .enumerate()
+        .map(|(idx, session)| {
+            let is_selected = idx == selected;
+            let prefix = if is_selected { ">" } else { " " };
+            let session_display = format!("{} {}", prefix, session.name);
 
-        let style = if is_selected {
-            Style::default()
-                .fg(tc.fg)
-                .bg(tc.highlight)
-                .add_modifier(Modifier::BOLD)
-        } else {
-            Style::default().fg(tc.fg)
-        };
+            let style = if is_selected {
+                Style::default()
+                    .fg(tc.fg)
+                    .bg(tc.highlight)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(tc.fg)
+            };
 
-        Row::new(vec![Cell::from(session_display).style(style)])
-    }).collect();
+            Row::new(vec![Cell::from(session_display).style(style)])
+        })
+        .collect();
 
     let table = Table::new(rows, [Constraint::Min(1)]).row_highlight_style(
         Style::default(), // We handle highlighting per-cell
@@ -291,7 +293,13 @@ fn render_mux_session_list(frame: &mut Frame, area: Rect, app: &App, _group_idx:
 }
 
 /// Render the terminal output in the right pane of mux mode.
-fn render_mux_terminal_pane(frame: &mut Frame, area: Rect, app: &App, group_idx: usize, group: &crate::config::model::BookmarkGroup) {
+fn render_mux_terminal_pane(
+    frame: &mut Frame,
+    area: Rect,
+    app: &App,
+    group_idx: usize,
+    group: &crate::config::model::BookmarkGroup,
+) {
     let tc = &app.theme;
 
     // Determine selected session index
@@ -308,7 +316,8 @@ fn render_mux_terminal_pane(frame: &mut Frame, area: Rect, app: &App, group_idx:
         ])
     } else {
         // Check if there's an active mux connection for this group
-        let content = {
+
+        {
             let conns = app.mux_connections.lock().unwrap();
             if let Some(conn) = conns.get(&group_idx) {
                 match &conn.state {
@@ -316,7 +325,8 @@ fn render_mux_terminal_pane(frame: &mut Frame, area: Rect, app: &App, group_idx:
                         // Show session info with prompt to connect
                         let session = &group.sessions[selected];
                         let display_name = session.display_name(group);
-                        let command = session.effective_on_connect(group, &app.config.profiles)
+                        let command = session
+                            .effective_on_connect(group, &app.config.profiles)
                             .map(|c| c.as_str().to_string())
                             .unwrap_or_else(|| "shell".into());
 
@@ -338,15 +348,13 @@ fn render_mux_terminal_pane(frame: &mut Frame, area: Rect, app: &App, group_idx:
                             )),
                         ])
                     }
-                    MuxState::Connecting => {
-                        Text::from(vec![
-                            Line::from(""),
-                            Line::from(Span::styled(
-                                "Connecting...",
-                                Style::default().fg(tc.warning).add_modifier(Modifier::BOLD),
-                            )),
-                        ])
-                    }
+                    MuxState::Connecting => Text::from(vec![
+                        Line::from(""),
+                        Line::from(Span::styled(
+                            "Connecting...",
+                            Style::default().fg(tc.warning).add_modifier(Modifier::BOLD),
+                        )),
+                    ]),
                     MuxState::Ready => {
                         let lines: Vec<Line> = if conn.output.is_empty() {
                             vec![
@@ -365,7 +373,8 @@ fn render_mux_terminal_pane(frame: &mut Frame, area: Rect, app: &App, group_idx:
                         Text::from(lines)
                     }
                     MuxState::Running => {
-                        let mut lines: Vec<Line> = conn.lines_capped(area.height as usize)
+                        let mut lines: Vec<Line> = conn
+                            .lines_capped(area.height as usize)
                             .iter()
                             .map(|l| Line::from(l.clone()))
                             .collect();
@@ -375,26 +384,25 @@ fn render_mux_terminal_pane(frame: &mut Frame, area: Rect, app: &App, group_idx:
                         )));
                         Text::from(lines)
                     }
-                    MuxState::Error(msg) => {
-                        Text::from(vec![
-                            Line::from(""),
-                            Line::from(Span::styled(
-                                format!("Error: {}", msg),
-                                Style::default().fg(tc.error).add_modifier(Modifier::BOLD),
-                            )),
-                            Line::from(""),
-                            Line::from(Span::styled(
-                                "Press Enter to retry.",
-                                Style::default().fg(tc.fg_muted),
-                            )),
-                        ])
-                    }
+                    MuxState::Error(msg) => Text::from(vec![
+                        Line::from(""),
+                        Line::from(Span::styled(
+                            format!("Error: {}", msg),
+                            Style::default().fg(tc.error).add_modifier(Modifier::BOLD),
+                        )),
+                        Line::from(""),
+                        Line::from(Span::styled(
+                            "Press Enter to retry.",
+                            Style::default().fg(tc.fg_muted),
+                        )),
+                    ]),
                 }
             } else {
                 // No connection yet — show session info
                 let session = &group.sessions[selected];
                 let display_name = session.display_name(group);
-                let command = session.effective_on_connect(group, &app.config.profiles)
+                let command = session
+                    .effective_on_connect(group, &app.config.profiles)
                     .map(|c| c.as_str().to_string())
                     .unwrap_or_else(|| "shell".into());
 
@@ -416,8 +424,7 @@ fn render_mux_terminal_pane(frame: &mut Frame, area: Rect, app: &App, group_idx:
                     )),
                 ])
             }
-        };
-        content
+        }
     };
 
     let paragraph = Paragraph::new(content).alignment(Alignment::Center);
@@ -452,12 +459,18 @@ fn render_bookmark_table(frame: &mut Frame, area: Rect, app: &App) {
                 let env_span = env_badge::env_badge_span(&group.env, &app.config.settings);
                 let env_cell = Cell::from(Line::from(vec![env_span]));
                 let tunnel_cell = if app.tunnel_bookmarks.contains(&group.name) {
-                    Cell::from(Span::styled("T", Style::default().fg(tc.accent).add_modifier(Modifier::BOLD)))
+                    Cell::from(Span::styled(
+                        "T",
+                        Style::default().fg(tc.accent).add_modifier(Modifier::BOLD),
+                    ))
                 } else {
                     Cell::from("")
                 };
                 let name_style = if is_selected {
-                    Style::default().add_modifier(Modifier::BOLD).fg(tc.fg).bg(tc.highlight)
+                    Style::default()
+                        .add_modifier(Modifier::BOLD)
+                        .fg(tc.fg)
+                        .bg(tc.highlight)
                 } else {
                     Style::default().fg(tc.fg)
                 };
@@ -470,7 +483,11 @@ fn render_bookmark_table(frame: &mut Frame, area: Rect, app: &App) {
                     Style::default().fg(tc.fg)
                 };
                 let host_cell = Cell::from(group.host.as_str()).style(host_style);
-                let tags_text = if group.tags.is_empty() { String::new() } else { group.tags.join(", ") };
+                let tags_text = if group.tags.is_empty() {
+                    String::new()
+                } else {
+                    group.tags.join(", ")
+                };
                 let tags_style = if is_selected {
                     Style::default().fg(tc.fg_dim).bg(tc.highlight)
                 } else {
@@ -483,12 +500,18 @@ fn render_bookmark_table(frame: &mut Frame, area: Rect, app: &App) {
                 let env_span = env_badge::env_badge_span(&bookmark.env, &app.config.settings);
                 let env_cell = Cell::from(Line::from(vec![env_span]));
                 let tunnel_cell = if app.tunnel_bookmarks.contains(&bookmark.name) {
-                    Cell::from(Span::styled("T", Style::default().fg(tc.accent).add_modifier(Modifier::BOLD)))
+                    Cell::from(Span::styled(
+                        "T",
+                        Style::default().fg(tc.accent).add_modifier(Modifier::BOLD),
+                    ))
                 } else {
                     Cell::from("")
                 };
                 let name_style = if is_selected {
-                    Style::default().add_modifier(Modifier::BOLD).fg(tc.fg).bg(tc.highlight)
+                    Style::default()
+                        .add_modifier(Modifier::BOLD)
+                        .fg(tc.fg)
+                        .bg(tc.highlight)
                 } else {
                     Style::default().fg(tc.fg)
                 };
@@ -504,7 +527,11 @@ fn render_bookmark_table(frame: &mut Frame, area: Rect, app: &App) {
                     Style::default().fg(tc.fg)
                 };
                 let host_cell = Cell::from(bookmark.host.as_str()).style(host_style);
-                let tags_text = if bookmark.tags.is_empty() { String::new() } else { bookmark.tags.join(", ") };
+                let tags_text = if bookmark.tags.is_empty() {
+                    String::new()
+                } else {
+                    bookmark.tags.join(", ")
+                };
                 let tags_style = if is_selected {
                     Style::default().fg(tc.fg_dim).bg(tc.highlight)
                 } else {

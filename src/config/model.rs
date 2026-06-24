@@ -217,7 +217,9 @@ impl Session {
             .clone()
             .or_else(|| group.identity_file.clone())
             .or_else(|| {
-                group.resolve_profile(profiles).and_then(|p| p.identity_file.clone())
+                group
+                    .resolve_profile(profiles)
+                    .and_then(|p| p.identity_file.clone())
             })
     }
 
@@ -231,7 +233,9 @@ impl Session {
             .clone()
             .or_else(|| group.proxy_jump.clone())
             .or_else(|| {
-                group.resolve_profile(profiles).and_then(|p| p.proxy_jump.clone())
+                group
+                    .resolve_profile(profiles)
+                    .and_then(|p| p.proxy_jump.clone())
             })
     }
 
@@ -245,7 +249,9 @@ impl Session {
             .clone()
             .or_else(|| group.on_connect.clone())
             .or_else(|| {
-                group.resolve_profile(profiles).and_then(|p| p.on_connect.clone())
+                group
+                    .resolve_profile(profiles)
+                    .and_then(|p| p.on_connect.clone())
             })
     }
 
@@ -1772,10 +1778,7 @@ mod tests {
             ..sample_session()
         };
         let settings = Settings::default();
-        assert_eq!(
-            session.effective_user(&group, &settings, &[]),
-            "admin"
-        );
+        assert_eq!(session.effective_user(&group, &settings, &[]), "admin");
     }
 
     #[test]
@@ -1786,10 +1789,7 @@ mod tests {
         };
         let session = sample_session();
         let settings = Settings::default();
-        assert_eq!(
-            session.effective_user(&group, &settings, &[]),
-            "deploy"
-        );
+        assert_eq!(session.effective_user(&group, &settings, &[]), "deploy");
     }
 
     #[test]
@@ -2086,10 +2086,7 @@ mod tests {
         // Session overrides group (TCPKeepAlive)
         assert_eq!(merged.get("TCPKeepAlive").unwrap(), "no");
         // Session-only key
-        assert_eq!(
-            merged.get("StrictHostKeyChecking").unwrap(),
-            "no"
-        );
+        assert_eq!(merged.get("StrictHostKeyChecking").unwrap(), "no");
         assert_eq!(merged.len(), 4);
     }
 

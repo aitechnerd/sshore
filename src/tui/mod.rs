@@ -26,8 +26,10 @@ use crate::keychain;
 use crate::ssh;
 use crate::tui::theme::{ThemeColors, resolve_theme};
 use crate::tui::views::browser::truncate_name;
-use crate::tui::views::confirm::{ConfirmState, ConfirmTarget};
-use crate::tui::views::form::{EditTarget, FIELD_COUNT, FIELD_ENV, FIELD_PROFILE, FormState, UnifiedEntry};
+use crate::tui::views::confirm::ConfirmState;
+use crate::tui::views::form::{
+    EditTarget, FIELD_COUNT, FIELD_ENV, FIELD_PROFILE, FormState, UnifiedEntry,
+};
 use crate::tui::views::{confirm, form, help, import_wizard, list};
 use crate::tui::widgets::{search_bar, status_bar};
 
@@ -140,7 +142,10 @@ const ENV_FILTER_MAP: &[&str] = &[
 /// Action to perform for mux persistent session (set by key handler, processed by event loop).
 enum MuxAction {
     /// Open a shell connection for the given session (non-interactive auth).
-    OpenShell { group_idx: usize, session_idx: usize },
+    OpenShell {
+        group_idx: usize,
+        session_idx: usize,
+    },
     /// Send a command to the existing connection.
     SendCommand { group_idx: usize, command: String },
     /// Close the connection for the given group.
@@ -156,15 +161,13 @@ enum MuxResult {
         output_rx: tokio::sync::mpsc::Receiver<String>,
     },
     /// Shell open failed.
-    ShellError {
-        group_idx: usize,
-        error: String,
-    },
+    ShellError { group_idx: usize, error: String },
     /// Command sent successfully.
     CommandSent { group_idx: usize },
     /// Command send failed.
     CommandError { group_idx: usize, error: String },
     /// Connection closed.
+    #[allow(dead_code)]
     ConnectionClosed { group_idx: usize },
 }
 
@@ -234,7 +237,8 @@ impl App {
     /// Create a new App from loaded config.
     pub fn new(config: AppConfig) -> Self {
         let matcher = SkimMatcherV2::default();
-        let mut filtered_indices = search_bar::filter_bookmarks(&matcher, &config.bookmarks, "", None);
+        let mut filtered_indices =
+            search_bar::filter_bookmarks(&matcher, &config.bookmarks, "", None);
         // Append groups to filtered_indices for unified list
         for (idx, _) in config.groups.iter().enumerate() {
             filtered_indices.push(GROUP_INDEX_MARKER + idx);
@@ -313,8 +317,14 @@ impl App {
         for (idx, group) in self.config.groups.iter().enumerate() {
             // Apply same search/env filter to groups
             let name_match = self.search_query.is_empty()
-                || self.matcher.fuzzy_match(&group.name, &self.search_query).is_some();
-            let env_match = self.env_filter.as_ref().map_or(true, |f| f.is_empty() || group.env == *f);
+                || self
+                    .matcher
+                    .fuzzy_match(&group.name, &self.search_query)
+                    .is_some();
+            let env_match = self
+                .env_filter
+                .as_ref()
+                .is_none_or(|f| f.is_empty() || group.env == *f);
             if name_match && env_match {
                 indices.push(GROUP_INDEX_MARKER + idx);
             }
@@ -527,17 +537,10 @@ pub async fn run(config: &mut AppConfig, cfg_override: Option<&str>) -> Result<(
                     tracing::debug!("returned to TUI after SSH session");
                 } else {
                     let name = &app.config.bookmarks[index].name;
-                    tracing::debug!(
-                        bookmark = name,
-                        index,
-                        "connecting from TUI"
-                    );
-                    if let Err(e) = ssh::connect(
-                        &mut app.config,
-                        index,
-                        app.config_path_override.as_deref(),
-                    )
-                    .await
+                    tracing::debug!(bookmark = name, index, "connecting from TUI");
+                    if let Err(e) =
+                        ssh::connect(&mut app.config, index, app.config_path_override.as_deref())
+                            .await
                     {
                         tracing::debug!(error = %e, "SSH session ended with error");
                         eprintln!("SSH error: {e:#}");
@@ -735,7 +738,10 @@ fn event_loop(
         if let Some(action) = app.mux_action.take() {
             let tx = app.mux_result_tx.clone();
             match action {
-                MuxAction::OpenShell { group_idx, session_idx } => {
+                MuxAction::OpenShell {
+                    group_idx,
+                    session_idx,
+                } => {
                     let config = app.config.clone();
                     // Set state to Connecting immediately
                     app.mux_connections.lock().unwrap().insert(
@@ -752,23 +758,32 @@ fn event_loop(
                             let result = tokio::time::timeout(
                                 std::time::Duration::from_secs(30),
                                 ssh::mux::mux_open_shell(&config, group_idx, session_idx),
-                            ).await;
+                            )
+                            .await;
                             match result {
                                 Ok(Ok((mux_channel, output_rx))) => {
-                                    if tx.send(MuxResult::ShellOpened {
-                                        group_idx,
-                                        channel: mux_channel,
-                                        output_rx,
-                                    }).await.is_err() {
+                                    if tx
+                                        .send(MuxResult::ShellOpened {
+                                            group_idx,
+                                            channel: mux_channel,
+                                            output_rx,
+                                        })
+                                        .await
+                                        .is_err()
+                                    {
                                         tracing::debug!("mux result channel closed");
                                     }
                                 }
                                 Ok(Err(e)) => {
                                     tracing::debug!(error = %e, "mux open shell failed");
-                                    if tx.send(MuxResult::ShellError {
-                                        group_idx,
-                                        error: e.to_string(),
-                                    }).await.is_err() {
+                                    if tx
+                                        .send(MuxResult::ShellError {
+                                            group_idx,
+                                            error: e.to_string(),
+                                        })
+                                        .await
+                                        .is_err()
+                                    {
                                         tracing::debug!("mux result channel closed");
                                     }
                                 }
@@ -809,10 +824,12 @@ fn event_loop(
                                 }
                                 Err(e) => {
                                     if let Some(tx) = tx {
-                                        let _ = tx.send(MuxResult::CommandError {
-                                            group_idx,
-                                            error: e.to_string(),
-                                        }).await;
+                                        let _ = tx
+                                            .send(MuxResult::CommandError {
+                                                group_idx,
+                                                error: e.to_string(),
+                                            })
+                                            .await;
                                     }
                                 }
                             }
@@ -829,7 +846,11 @@ fn event_loop(
         // Drain mux result channel
         while let Ok(result) = app.mux_result_rx.try_recv() {
             match result {
-                MuxResult::ShellOpened { group_idx, channel, output_rx } => {
+                MuxResult::ShellOpened {
+                    group_idx,
+                    channel,
+                    output_rx,
+                } => {
                     app.mux_output_rx.insert(group_idx, output_rx);
                     if let Some(conn) = app.mux_connections.lock().unwrap().get_mut(&group_idx) {
                         conn.state = MuxState::Ready;
@@ -1203,7 +1224,12 @@ fn draw(frame: &mut ratatui::Frame, app: &App) {
 
 /// Handle a key event based on current screen and search state.
 fn handle_key_event(app: &mut App, key: KeyEvent) {
-    tracing::debug!("handle_key_event: code={:?} modifiers={:?} screen={:?}", key.code, key.modifiers, app.screen);
+    tracing::debug!(
+        "handle_key_event: code={:?} modifiers={:?} screen={:?}",
+        key.code,
+        key.modifiers,
+        app.screen
+    );
     // Ctrl+C always quits
     if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
         app.should_quit = true;
@@ -1222,7 +1248,11 @@ fn handle_key_event(app: &mut App, key: KeyEvent) {
 
 /// Handle key events in the list view (not searching).
 fn handle_list_key(app: &mut App, key: KeyEvent) {
-    tracing::debug!("handle_list_key: code={:?} groups={}", key.code, app.config.groups.len());
+    tracing::debug!(
+        "handle_list_key: code={:?} groups={}",
+        key.code,
+        app.config.groups.len()
+    );
     // Unified list: always use bookmark navigation (groups are in filtered_indices)
     match key.code {
         // Quit
@@ -1283,7 +1313,9 @@ fn handle_list_key(app: &mut App, key: KeyEvent) {
         KeyCode::Char('A') => {
             let profile_names: Vec<String> =
                 app.config.profiles.iter().map(|p| p.name.clone()).collect();
-            app.form_state = Some(FormState::new_group_add(&app.config.settings, &profile_names));
+            let mut state = FormState::new_add(&app.config.settings, &profile_names);
+            state.inner_mut().add_session_line();
+            app.form_state = Some(state);
             app.screen = Screen::AddForm;
         }
         KeyCode::Char('e') => {
@@ -1291,13 +1323,23 @@ fn handle_list_key(app: &mut App, key: KeyEvent) {
                 let profile_names: Vec<String> =
                     app.config.profiles.iter().map(|p| p.name.clone()).collect();
                 let bookmark = &app.config.bookmarks[idx];
-                app.form_state = Some(FormState::new_edit(idx, EditTarget::Bookmark, bookmark, &profile_names));
+                app.form_state = Some(FormState::new_edit(
+                    idx,
+                    EditTarget::Bookmark,
+                    bookmark,
+                    &profile_names,
+                ));
                 app.screen = Screen::EditForm(EditTarget::Bookmark, idx);
             } else if let Some(group_idx) = app.selected_group_index() {
                 let profile_names: Vec<String> =
                     app.config.profiles.iter().map(|p| p.name.clone()).collect();
                 let group = &app.config.groups[group_idx];
-                app.form_state = Some(FormState::new_edit(group_idx, EditTarget::Group, group, &profile_names));
+                app.form_state = Some(FormState::new_edit(
+                    group_idx,
+                    EditTarget::Group,
+                    group,
+                    &profile_names,
+                ));
                 app.screen = Screen::EditForm(EditTarget::Group, group_idx);
             }
         }
@@ -1336,6 +1378,7 @@ fn handle_list_key(app: &mut App, key: KeyEvent) {
 /// Navigation moves through sessions within groups, skipping group headers.
 /// Space on a group header toggles collapse/expand.
 /// Enter on a session triggers connection.
+#[allow(dead_code)]
 fn handle_session_list_key(app: &mut App, key: KeyEvent) {
     match key.code {
         // Quit
@@ -1379,7 +1422,9 @@ fn handle_session_list_key(app: &mut App, key: KeyEvent) {
         KeyCode::Char('A') => {
             let profile_names: Vec<String> =
                 app.config.profiles.iter().map(|p| p.name.clone()).collect();
-            app.form_state = Some(FormState::new_group_add(&app.config.settings, &profile_names));
+            let mut state = FormState::new_add(&app.config.settings, &profile_names);
+            state.inner_mut().add_session_line();
+            app.form_state = Some(state);
             app.screen = Screen::AddForm;
         }
 
@@ -1397,7 +1442,12 @@ fn handle_session_list_key(app: &mut App, key: KeyEvent) {
                 let profile_names: Vec<String> =
                     app.config.profiles.iter().map(|p| p.name.clone()).collect();
                 let group = &app.config.groups[group_idx];
-                app.form_state = Some(FormState::new_group_edit(group_idx, group, &profile_names));
+                app.form_state = Some(FormState::new_edit(
+                    group_idx,
+                    EditTarget::Group,
+                    group,
+                    &profile_names,
+                ));
                 app.screen = Screen::EditForm(EditTarget::Group, group_idx);
             }
         }
@@ -1453,7 +1503,7 @@ fn handle_mux_key(app: &mut App, key: KeyEvent) {
             }
             let current = app.mux_session.unwrap_or(0);
             let new = if current == 0 {
-                session_count - 1  // wrap to last
+                session_count - 1 // wrap to last
             } else {
                 current - 1
             };
@@ -1465,7 +1515,7 @@ fn handle_mux_key(app: &mut App, key: KeyEvent) {
             }
             let current = app.mux_session.unwrap_or(0);
             let new = if current >= session_count - 1 {
-                0  // wrap to first
+                0 // wrap to first
             } else {
                 current + 1
             };
@@ -1512,7 +1562,8 @@ fn handle_mux_key(app: &mut App, key: KeyEvent) {
             // Check if there's an existing connection for command sending
             let has_ready_conn = {
                 let conns = app.mux_connections.lock().unwrap();
-                conns.get(&group_idx)
+                conns
+                    .get(&group_idx)
                     .map(|c| matches!(c.state, MuxState::Ready))
                     .unwrap_or(false)
             };
@@ -1540,6 +1591,7 @@ fn handle_mux_key(app: &mut App, key: KeyEvent) {
 
 /// Move session selection by delta (positive = down, negative = up).
 /// Skips group headers and respects collapsed groups.
+#[allow(dead_code)]
 fn move_session_selection(app: &mut App, delta: isize) {
     let sessions = visible_sessions(app);
     if sessions.is_empty() {
@@ -1565,6 +1617,7 @@ fn move_session_selection(app: &mut App, delta: isize) {
 }
 
 /// Move to the first visible session.
+#[allow(dead_code)]
 fn move_session_to_first(app: &mut App) {
     if let Some(&(g, s)) = visible_sessions(app).first() {
         app.selected_session = Some((g, s));
@@ -1572,6 +1625,7 @@ fn move_session_to_first(app: &mut App) {
 }
 
 /// Move to the last visible session.
+#[allow(dead_code)]
 fn move_session_to_last(app: &mut App) {
     if let Some(&(g, s)) = visible_sessions(app).last() {
         app.selected_session = Some((g, s));
@@ -1579,6 +1633,7 @@ fn move_session_to_last(app: &mut App) {
 }
 
 /// Get the list of visible (non-collapsed) sessions as (group_idx, session_idx) pairs.
+#[allow(dead_code)]
 fn visible_sessions(app: &App) -> Vec<(usize, usize)> {
     let mut result = Vec::new();
     for (group_idx, group) in app.config.groups.iter().enumerate() {
@@ -1593,6 +1648,7 @@ fn visible_sessions(app: &App) -> Vec<(usize, usize)> {
 }
 
 /// Toggle collapse/expand for the group containing the currently selected session.
+#[allow(dead_code)]
 fn toggle_group_collapse(app: &mut App) {
     if let Some((group_idx, _)) = app.selected_session {
         if app.collapsed_groups.contains(&group_idx) {
@@ -1611,7 +1667,11 @@ fn handle_unified_form_key(app: &mut App, key: KeyEvent) {
         return;
     };
 
-    tracing::debug!("handle_unified_form_key: code={:?} modifiers={:?}", key.code, key.modifiers);
+    tracing::debug!(
+        "handle_unified_form_key: code={:?} modifiers={:?}",
+        key.code,
+        key.modifiers
+    );
 
     match key.code {
         KeyCode::Esc => {
@@ -1633,7 +1693,7 @@ fn handle_unified_form_key(app: &mut App, key: KeyEvent) {
             tracing::debug!("add_session_line via Ctrl+O (Char+mod)");
             form.add_session_line();
         }
-        KeyCode::Char(c) if c == '\x0f' => {
+        KeyCode::Char('\x0f') => {
             // Ctrl+O sent as raw control character by some terminals
             tracing::debug!("add_session_line via raw \x0f");
             form.add_session_line();
@@ -1687,16 +1747,16 @@ fn try_save_unified_form(app: &mut App) {
                         // Bookmark was edited and gained sessions → became a group.
                         // Migrate password if the name changed.
                         let orig_name = app.config.bookmarks[idx].name.clone();
-                        if orig_name != name {
-                            if let Ok(Some(pw)) = keychain::get_password(&orig_name) {
-                                if let Err(e) = keychain::set_password(&name, &pw) {
-                                    app.set_status(format!("Warning: failed to migrate password: {e}"));
-                                }
-                                if let Err(e) = keychain::delete_password(&orig_name) {
-                                    app.set_status(format!(
-                                        "Warning: failed to remove old keychain entry: {e}"
-                                    ));
-                                }
+                        if orig_name != name
+                            && let Ok(Some(pw)) = keychain::get_password(&orig_name)
+                        {
+                            if let Err(e) = keychain::set_password(&name, &pw) {
+                                app.set_status(format!("Warning: failed to migrate password: {e}"));
+                            }
+                            if let Err(e) = keychain::delete_password(&orig_name) {
+                                app.set_status(format!(
+                                    "Warning: failed to remove old keychain entry: {e}"
+                                ));
                             }
                         }
                         app.config.bookmarks.remove(idx);
@@ -1754,16 +1814,16 @@ fn try_save_unified_form(app: &mut App) {
                     Screen::EditForm(EditTarget::Group, idx) => {
                         // Group was edited and lost all sessions → became a bookmark.
                         let orig_name = app.config.groups[idx].name.clone();
-                        if orig_name != name {
-                            if let Ok(Some(pw)) = keychain::get_password(&orig_name) {
-                                if let Err(e) = keychain::set_password(&name, &pw) {
-                                    app.set_status(format!("Warning: failed to migrate password: {e}"));
-                                }
-                                if let Err(e) = keychain::delete_password(&orig_name) {
-                                    app.set_status(format!(
-                                        "Warning: failed to remove old keychain entry: {e}"
-                                    ));
-                                }
+                        if orig_name != name
+                            && let Ok(Some(pw)) = keychain::get_password(&orig_name)
+                        {
+                            if let Err(e) = keychain::set_password(&name, &pw) {
+                                app.set_status(format!("Warning: failed to migrate password: {e}"));
+                            }
+                            if let Err(e) = keychain::delete_password(&orig_name) {
+                                app.set_status(format!(
+                                    "Warning: failed to remove old keychain entry: {e}"
+                                ));
                             }
                         }
                         app.config.groups.remove(idx);
@@ -1780,16 +1840,16 @@ fn try_save_unified_form(app: &mut App) {
                     app.set_status(format!("Bookmark '{name}' saved"));
                 }
 
-                if let Some(ref old) = old_name {
-                    if let Ok(Some(pw)) = keychain::get_password(old) {
-                        if let Err(e) = keychain::set_password(&name, &pw) {
-                            app.set_status(format!("Warning: failed to migrate password: {e}"));
-                        }
-                        if let Err(e) = keychain::delete_password(old) {
-                            app.set_status(format!(
-                                "Warning: failed to remove old keychain entry: {e}"
-                            ));
-                        }
+                if let Some(ref old) = old_name
+                    && let Ok(Some(pw)) = keychain::get_password(old)
+                {
+                    if let Err(e) = keychain::set_password(&name, &pw) {
+                        app.set_status(format!("Warning: failed to migrate password: {e}"));
+                    }
+                    if let Err(e) = keychain::delete_password(old) {
+                        app.set_status(format!(
+                            "Warning: failed to remove old keychain entry: {e}"
+                        ));
                     }
                 }
 
@@ -1798,10 +1858,8 @@ fn try_save_unified_form(app: &mut App) {
                         if let Err(e) = keychain::set_password(&name, &password_value) {
                             app.set_status(format!("Warning: failed to save password: {e}"));
                         }
-                    } else if has_stored {
-                        if let Err(e) = keychain::delete_password(&name) {
-                            app.set_status(format!("Warning: failed to remove password: {e}"));
-                        }
+                    } else if has_stored && let Err(e) = keychain::delete_password(&name) {
+                        app.set_status(format!("Warning: failed to remove password: {e}"));
                     }
                 }
 
@@ -1811,7 +1869,10 @@ fn try_save_unified_form(app: &mut App) {
             }
             Ok(UnifiedEntry::Group(_)) => {
                 // Should not happen in bookmark path (is_group check above)
-                app.status_message = Some(("Unexpected group entry in bookmark path".to_string(), Instant::now()));
+                app.status_message = Some((
+                    "Unexpected group entry in bookmark path".to_string(),
+                    Instant::now(),
+                ));
             }
             Err(e) => {
                 tracing::debug!(error = %e, "try_save: validate_and_build failed");
@@ -1957,6 +2018,7 @@ fn jump_to_end(app: &mut App) {
 }
 
 #[cfg(test)]
+#[allow(deprecated)]
 mod tests {
     use super::*;
     use crate::config::model::{Bookmark, BookmarkGroup, Session, Settings};
@@ -2191,7 +2253,12 @@ mod tests {
             let profile_names: Vec<String> =
                 app.config.profiles.iter().map(|p| p.name.clone()).collect();
             let bookmark = app.config.bookmarks[idx].clone();
-            app.form_state = Some(FormState::new_edit(idx, EditTarget::Bookmark, &bookmark, &profile_names));
+            app.form_state = Some(FormState::new_edit(
+                idx,
+                EditTarget::Bookmark,
+                &bookmark,
+                &profile_names,
+            ));
             app.screen = Screen::EditForm(EditTarget::Bookmark, idx);
             assert!(app.form_state.is_some());
         }
@@ -2485,7 +2552,9 @@ mod tests {
         let mut app = app_with_groups(vec![sample_group()]);
         // Move to the group (last item in filtered_indices)
         app.selected_index = app.filtered_indices.len() - 1;
-        assert!(App::is_group_index(app.filtered_indices[app.selected_index]));
+        assert!(App::is_group_index(
+            app.filtered_indices[app.selected_index]
+        ));
 
         let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
         handle_key_event(&mut app, enter);
@@ -2524,7 +2593,10 @@ mod tests {
 
         let e = KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE);
         handle_key_event(&mut app, e);
-        assert!(matches!(app.screen, Screen::EditForm(EditTarget::Bookmark, _)));
+        assert!(matches!(
+            app.screen,
+            Screen::EditForm(EditTarget::Bookmark, _)
+        ));
     }
 
     #[test]
@@ -2578,7 +2650,10 @@ mod tests {
         let mut app = sample_app();
         let profile_names: Vec<String> =
             app.config.profiles.iter().map(|p| p.name.clone()).collect();
-        app.form_state = Some(FormState::new_group_add(&app.config.settings, &profile_names));
+        app.form_state = Some(FormState::new_group_add(
+            &app.config.settings,
+            &profile_names,
+        ));
         app.screen = Screen::AddForm;
         assert!(app.form_state.is_some());
         assert_eq!(app.screen, Screen::AddForm);
@@ -2589,7 +2664,10 @@ mod tests {
         let mut app = sample_app();
         let profile_names: Vec<String> =
             app.config.profiles.iter().map(|p| p.name.clone()).collect();
-        app.form_state = Some(FormState::new_group_add(&app.config.settings, &profile_names));
+        app.form_state = Some(FormState::new_group_add(
+            &app.config.settings,
+            &profile_names,
+        ));
         app.screen = Screen::AddForm;
 
         // Simulate Ctrl+O
@@ -2613,7 +2691,10 @@ mod tests {
         let mut app = sample_app();
         let profile_names: Vec<String> =
             app.config.profiles.iter().map(|p| p.name.clone()).collect();
-        app.form_state = Some(FormState::new_group_add(&app.config.settings, &profile_names));
+        app.form_state = Some(FormState::new_group_add(
+            &app.config.settings,
+            &profile_names,
+        ));
         app.screen = Screen::AddForm;
 
         // Add an extra session first
@@ -2650,7 +2731,10 @@ mod tests {
         let mut app = sample_app();
         let profile_names: Vec<String> =
             app.config.profiles.iter().map(|p| p.name.clone()).collect();
-        app.form_state = Some(FormState::new_group_add(&app.config.settings, &profile_names));
+        app.form_state = Some(FormState::new_group_add(
+            &app.config.settings,
+            &profile_names,
+        ));
         app.screen = Screen::AddForm;
 
         // Navigate to the session
@@ -2683,7 +2767,10 @@ mod tests {
         let mut app = sample_app();
         let profile_names: Vec<String> =
             app.config.profiles.iter().map(|p| p.name.clone()).collect();
-        app.form_state = Some(FormState::new_group_add(&app.config.settings, &profile_names));
+        app.form_state = Some(FormState::new_group_add(
+            &app.config.settings,
+            &profile_names,
+        ));
         app.screen = Screen::AddForm;
 
         let key = KeyEvent {
@@ -2705,7 +2792,10 @@ mod tests {
         let mut app = sample_app();
         let profile_names: Vec<String> =
             app.config.profiles.iter().map(|p| p.name.clone()).collect();
-        app.form_state = Some(FormState::new_group_add(&app.config.settings, &profile_names));
+        app.form_state = Some(FormState::new_group_add(
+            &app.config.settings,
+            &profile_names,
+        ));
         app.screen = Screen::AddForm;
 
         // Fill in the form fields
@@ -2734,7 +2824,10 @@ mod tests {
         assert_eq!(group.port, 2222);
         assert_eq!(group.sessions.len(), 2);
         assert_eq!(group.sessions[0].name, "session-a");
-        assert_eq!(group.sessions[0].on_connect, Some("tail -f /var/log/app.log".into()));
+        assert_eq!(
+            group.sessions[0].on_connect,
+            Some("tail -f /var/log/app.log".into())
+        );
         assert_eq!(group.sessions[1].name, "session-b");
         assert_eq!(group.sessions[1].on_connect, Some("htop".into()));
     }
@@ -2828,7 +2921,11 @@ mod tests {
 
         // Verify the bookmark was added
         assert_eq!(app.config.bookmarks.len(), initial_count + 1);
-        let bookmark = app.config.bookmarks.iter().find(|b| b.name == "new-bookmark");
+        let bookmark = app
+            .config
+            .bookmarks
+            .iter()
+            .find(|b| b.name == "new-bookmark");
         assert!(bookmark.is_some());
         assert_eq!(bookmark.unwrap().host, "10.0.1.5");
     }
@@ -3025,7 +3122,10 @@ mod tests {
         // Should set mux_action to OpenShell (no existing connection)
         assert!(matches!(
             app.mux_action,
-            Some(MuxAction::OpenShell { group_idx: 0, session_idx: 0 })
+            Some(MuxAction::OpenShell {
+                group_idx: 0,
+                session_idx: 0
+            })
         ));
     }
 
@@ -3070,7 +3170,10 @@ mod tests {
         let q = KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE);
         handle_key_event(&mut app, q);
         // Should set Close action and return to List
-        assert!(matches!(app.mux_action, Some(MuxAction::Close { group_idx: 0 })));
+        assert!(matches!(
+            app.mux_action,
+            Some(MuxAction::Close { group_idx: 0 })
+        ));
         assert_eq!(app.screen, Screen::List);
     }
 

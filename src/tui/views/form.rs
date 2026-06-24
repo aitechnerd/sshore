@@ -123,13 +123,21 @@ pub trait EditableItem {
 }
 
 impl EditableItem for Bookmark {
-    fn as_bookmark(&self) -> Option<&Bookmark> { Some(self) }
-    fn as_group(&self) -> Option<&BookmarkGroup> { None }
+    fn as_bookmark(&self) -> Option<&Bookmark> {
+        Some(self)
+    }
+    fn as_group(&self) -> Option<&BookmarkGroup> {
+        None
+    }
 }
 
 impl EditableItem for BookmarkGroup {
-    fn as_bookmark(&self) -> Option<&Bookmark> { None }
-    fn as_group(&self) -> Option<&BookmarkGroup> { Some(self) }
+    fn as_bookmark(&self) -> Option<&Bookmark> {
+        None
+    }
+    fn as_group(&self) -> Option<&BookmarkGroup> {
+        Some(self)
+    }
 }
 
 /// Form fields for the unified bookmark/group form.
@@ -351,7 +359,12 @@ impl BookmarkForm {
         if self.focused == FIELD_ENV || self.focused == FIELD_PROFILE {
             return;
         }
-        insert_at_cursor(&mut self.fields, &mut self.cursor_positions, self.focused, c);
+        insert_at_cursor(
+            &mut self.fields,
+            &mut self.cursor_positions,
+            self.focused,
+            c,
+        );
         self.error = None;
 
         if self.focused == FIELD_PASSWORD {
@@ -733,7 +746,12 @@ impl UnifiedForm {
             self.error = None;
             return;
         }
-        insert_at_cursor(&mut self.fields, &mut self.cursor_positions, self.focused, c);
+        insert_at_cursor(
+            &mut self.fields,
+            &mut self.cursor_positions,
+            self.focused,
+            c,
+        );
         self.error = None;
 
         if self.focused == FIELD_PASSWORD {
@@ -757,10 +775,10 @@ impl UnifiedForm {
                 let session = &mut self.sessions[self.session_cursor];
                 if self.focused == FIELD_COUNT {
                     session.name.pop();
-                } else if self.focused == FIELD_COUNT + 1 {
-                    if let Some(ref mut cmd) = session.on_connect {
-                        cmd.pop();
-                    }
+                } else if self.focused == FIELD_COUNT + 1
+                    && let Some(ref mut cmd) = session.on_connect
+                {
+                    cmd.pop();
                 }
             }
             self.error = None;
@@ -800,10 +818,8 @@ impl UnifiedForm {
     /// Expands the sessions section if this is the first session.
     pub fn add_session_line(&mut self) {
         let insert_at = self.session_cursor + 1;
-        self.sessions.insert(
-            insert_at.min(self.sessions.len()),
-            Session::default(),
-        );
+        self.sessions
+            .insert(insert_at.min(self.sessions.len()), Session::default());
         self.session_cursor = insert_at.min(self.sessions.len() - 1);
         self.sessions_collapsed = false;
     }
@@ -836,9 +852,11 @@ impl UnifiedForm {
     /// Returns Bookmark if sessions is empty, BookmarkGroup otherwise.
     pub fn validate_and_build(&mut self, config: &AppConfig) -> Result<UnifiedEntry> {
         if self.is_group() {
-            self.validate_and_build_group(config).map(UnifiedEntry::Group)
+            self.validate_and_build_group(config)
+                .map(UnifiedEntry::Group)
         } else {
-            self.validate_and_build_bookmark(config).map(UnifiedEntry::Bookmark)
+            self.validate_and_build_bookmark(config)
+                .map(UnifiedEntry::Bookmark)
         }
     }
 
@@ -856,13 +874,11 @@ impl UnifiedForm {
             .original_name
             .as_ref()
             .is_some_and(|orig| orig != &name);
-        if (!self.is_edit || is_rename) {
-            if config.bookmarks.iter().any(|b| b.name == name) {
-                anyhow::bail!("A bookmark named '{}' already exists", name);
-            }
-            if config.groups.iter().any(|g| g.name == name) {
-                anyhow::bail!("A group named '{}' already exists", name);
-            }
+        if (!self.is_edit || is_rename) && config.bookmarks.iter().any(|b| b.name == name) {
+            anyhow::bail!("A bookmark named '{}' already exists", name);
+        }
+        if (!self.is_edit || is_rename) && config.groups.iter().any(|g| g.name == name) {
+            anyhow::bail!("A group named '{}' already exists", name);
         }
 
         validate_hostname(&host)?;
@@ -931,13 +947,11 @@ impl UnifiedForm {
             .original_name
             .as_ref()
             .is_some_and(|orig| orig != &name);
-        if (!self.is_edit || is_rename) {
-            if config.groups.iter().any(|g| g.name == name) {
-                anyhow::bail!("A group named '{}' already exists", name);
-            }
-            if config.bookmarks.iter().any(|b| b.name == name) {
-                anyhow::bail!("A bookmark named '{}' already exists", name);
-            }
+        if (!self.is_edit || is_rename) && config.groups.iter().any(|g| g.name == name) {
+            anyhow::bail!("A group named '{}' already exists", name);
+        }
+        if (!self.is_edit || is_rename) && config.bookmarks.iter().any(|b| b.name == name) {
+            anyhow::bail!("A bookmark named '{}' already exists", name);
         }
 
         validate_hostname(&host)?;
@@ -1138,7 +1152,12 @@ impl GroupForm {
         if self.focused == FIELD_ENV || self.focused == FIELD_PROFILE {
             return;
         }
-        insert_at_cursor(&mut self.fields, &mut self.cursor_positions, self.focused, c);
+        insert_at_cursor(
+            &mut self.fields,
+            &mut self.cursor_positions,
+            self.focused,
+            c,
+        );
         self.error = None;
 
         // Auto-detect env when name or host changes
@@ -1176,10 +1195,8 @@ impl GroupForm {
     /// Add a new empty session line after the current cursor position.
     pub fn add_session_line(&mut self) {
         let insert_at = self.session_cursor + 1;
-        self.sessions.insert(
-            insert_at.min(self.sessions.len()),
-            Session::default(),
-        );
+        self.sessions
+            .insert(insert_at.min(self.sessions.len()), Session::default());
         self.session_cursor = insert_at.min(self.sessions.len() - 1);
     }
 
@@ -1291,7 +1308,12 @@ impl FormState {
     /// Create a pre-populated form for editing an existing entry.
     /// For bookmarks, passes the bookmark and creates form with no sessions.
     /// For groups, passes the group and pre-populates sessions.
-    pub fn new_edit(idx: usize, target: EditTarget, item: &dyn EditableItem, profile_names: &[String]) -> Self {
+    pub fn new_edit(
+        idx: usize,
+        target: EditTarget,
+        item: &dyn EditableItem,
+        profile_names: &[String],
+    ) -> Self {
         let form = match target {
             EditTarget::Bookmark => {
                 UnifiedForm::new_edit_bookmark(item.as_bookmark().unwrap(), profile_names)
@@ -1686,7 +1708,16 @@ fn render_unified_form(
 
     // Render all fields
     for (label, field_idx) in &field_labels {
-        render_field(frame, chunks[chunk_idx], label, *field_idx, form as &dyn FormFields, false, settings, tc);
+        render_field(
+            frame,
+            chunks[chunk_idx],
+            label,
+            *field_idx,
+            form as &dyn FormFields,
+            false,
+            settings,
+            tc,
+        );
         chunk_idx += 1;
     }
 
@@ -1713,8 +1744,6 @@ fn render_unified_form(
 
             let name_style = if editing_name {
                 Style::default().fg(tc.accent).add_modifier(Modifier::BOLD)
-            } else if is_current {
-                Style::default().fg(tc.fg)
             } else {
                 Style::default().fg(tc.fg)
             };
@@ -1826,6 +1855,7 @@ fn render_unified_form(
 }
 
 /// Render a group form with fields + session lines section.
+#[allow(dead_code)]
 fn render_group_form(
     frame: &mut Frame,
     area: Rect,
@@ -1862,7 +1892,8 @@ fn render_group_form(
     let visible_fields = 11; // All except password
     let session_line_count = form.sessions.len();
 
-    let mut constraints: Vec<Constraint> = Vec::with_capacity(visible_fields + 1 + session_line_count * 2 + 3);
+    let mut constraints: Vec<Constraint> =
+        Vec::with_capacity(visible_fields + 1 + session_line_count * 2 + 3);
     // Fields
     for _ in 0..visible_fields {
         constraints.push(Constraint::Length(2));
@@ -1899,7 +1930,16 @@ fn render_group_form(
 
     let mut chunk_idx = 0;
     for (label, field_idx) in &field_labels {
-        render_field(frame, chunks[chunk_idx], label, *field_idx, form as &dyn FormFields, true, settings, tc);
+        render_field(
+            frame,
+            chunks[chunk_idx],
+            label,
+            *field_idx,
+            form as &dyn FormFields,
+            true,
+            settings,
+            tc,
+        );
         chunk_idx += 1;
     }
 
@@ -2033,6 +2073,7 @@ fn render_group_form(
 
 /// Render a bookmark-style form (works for both BookmarkForm and GroupForm via trait-like approach).
 /// When `is_group` is true, the form is treated as a group form (different title, no password field).
+#[allow(dead_code)]
 fn render_bookmark_form(
     frame: &mut Frame,
     area: Rect,
@@ -2070,9 +2111,8 @@ fn render_bookmark_form(
 
     // Layout: fields + optional error + hint line
     let field_count = FIELD_COUNT as u16;
-    let mut constraints: Vec<Constraint> = (0..field_count)
-        .map(|_| Constraint::Length(2))
-        .collect();
+    let mut constraints: Vec<Constraint> =
+        (0..field_count).map(|_| Constraint::Length(2)).collect();
     if form.error().is_some() {
         constraints.push(Constraint::Length(1));
     }
@@ -2157,6 +2197,7 @@ fn render_bookmark_form(
 }
 
 /// Trait for shared form field access (used by render functions).
+#[allow(dead_code)]
 trait FormFields {
     fn fields(&self) -> &[String; FIELD_COUNT];
     fn cursor_positions(&self) -> &[usize; FIELD_COUNT];
@@ -2171,42 +2212,102 @@ trait FormFields {
 }
 
 impl FormFields for BookmarkForm {
-    fn fields(&self) -> &[String; FIELD_COUNT] { &self.fields }
-    fn cursor_positions(&self) -> &[usize; FIELD_COUNT] { &self.cursor_positions }
-    fn focused(&self) -> usize { self.focused }
-    fn env_index(&self) -> usize { self.env_index }
-    fn profile_index(&self) -> usize { self.profile_index }
-    fn profile_options(&self) -> &[String] { &self.profile_options }
-    fn is_edit(&self) -> bool { self.is_edit }
-    fn error(&self) -> Option<String> { self.error.clone() }
-    fn has_stored_password(&self) -> bool { self.has_stored_password }
-    fn password_modified(&self) -> bool { self.password_modified }
+    fn fields(&self) -> &[String; FIELD_COUNT] {
+        &self.fields
+    }
+    fn cursor_positions(&self) -> &[usize; FIELD_COUNT] {
+        &self.cursor_positions
+    }
+    fn focused(&self) -> usize {
+        self.focused
+    }
+    fn env_index(&self) -> usize {
+        self.env_index
+    }
+    fn profile_index(&self) -> usize {
+        self.profile_index
+    }
+    fn profile_options(&self) -> &[String] {
+        &self.profile_options
+    }
+    fn is_edit(&self) -> bool {
+        self.is_edit
+    }
+    fn error(&self) -> Option<String> {
+        self.error.clone()
+    }
+    fn has_stored_password(&self) -> bool {
+        self.has_stored_password
+    }
+    fn password_modified(&self) -> bool {
+        self.password_modified
+    }
 }
 
 impl FormFields for GroupForm {
-    fn fields(&self) -> &[String; FIELD_COUNT] { &self.fields }
-    fn cursor_positions(&self) -> &[usize; FIELD_COUNT] { &self.cursor_positions }
-    fn focused(&self) -> usize { self.focused }
-    fn env_index(&self) -> usize { self.env_index }
-    fn profile_index(&self) -> usize { self.profile_index }
-    fn profile_options(&self) -> &[String] { &self.profile_options }
-    fn is_edit(&self) -> bool { self.is_edit }
-    fn error(&self) -> Option<String> { self.error.clone() }
-    fn has_stored_password(&self) -> bool { false }
-    fn password_modified(&self) -> bool { false }
+    fn fields(&self) -> &[String; FIELD_COUNT] {
+        &self.fields
+    }
+    fn cursor_positions(&self) -> &[usize; FIELD_COUNT] {
+        &self.cursor_positions
+    }
+    fn focused(&self) -> usize {
+        self.focused
+    }
+    fn env_index(&self) -> usize {
+        self.env_index
+    }
+    fn profile_index(&self) -> usize {
+        self.profile_index
+    }
+    fn profile_options(&self) -> &[String] {
+        &self.profile_options
+    }
+    fn is_edit(&self) -> bool {
+        self.is_edit
+    }
+    fn error(&self) -> Option<String> {
+        self.error.clone()
+    }
+    fn has_stored_password(&self) -> bool {
+        false
+    }
+    fn password_modified(&self) -> bool {
+        false
+    }
 }
 
 impl FormFields for UnifiedForm {
-    fn fields(&self) -> &[String; FIELD_COUNT] { &self.fields }
-    fn cursor_positions(&self) -> &[usize; FIELD_COUNT] { &self.cursor_positions }
-    fn focused(&self) -> usize { self.focused }
-    fn env_index(&self) -> usize { self.env_index }
-    fn profile_index(&self) -> usize { self.profile_index }
-    fn profile_options(&self) -> &[String] { &self.profile_options }
-    fn is_edit(&self) -> bool { self.is_edit }
-    fn error(&self) -> Option<String> { self.error.clone() }
-    fn has_stored_password(&self) -> bool { self.has_stored_password }
-    fn password_modified(&self) -> bool { self.password_modified }
+    fn fields(&self) -> &[String; FIELD_COUNT] {
+        &self.fields
+    }
+    fn cursor_positions(&self) -> &[usize; FIELD_COUNT] {
+        &self.cursor_positions
+    }
+    fn focused(&self) -> usize {
+        self.focused
+    }
+    fn env_index(&self) -> usize {
+        self.env_index
+    }
+    fn profile_index(&self) -> usize {
+        self.profile_index
+    }
+    fn profile_options(&self) -> &[String] {
+        &self.profile_options
+    }
+    fn is_edit(&self) -> bool {
+        self.is_edit
+    }
+    fn error(&self) -> Option<String> {
+        self.error.clone()
+    }
+    fn has_stored_password(&self) -> bool {
+        self.has_stored_password
+    }
+    fn password_modified(&self) -> bool {
+        self.password_modified
+    }
 }
 
 fn text_field_line(
@@ -2230,6 +2331,7 @@ fn text_field_line(
 }
 
 /// Render a single form field (label + value).
+#[allow(clippy::too_many_arguments)]
 fn render_field(
     frame: &mut Frame,
     area: Rect,
@@ -2280,7 +2382,13 @@ fn render_field(
             Style::default().fg(tc.fg_muted)
         };
         let prefix = if is_focused { "  > " } else { "    " };
-        let line = text_field_line(prefix, value, form.cursor_positions()[field_idx], is_focused, input_style);
+        let line = text_field_line(
+            prefix,
+            value,
+            form.cursor_positions()[field_idx],
+            is_focused,
+            input_style,
+        );
         frame.render_widget(Paragraph::new(line), input_area);
     }
 }
@@ -2395,7 +2503,13 @@ fn render_proxy_jump_field(
         } else {
             Style::default().fg(tc.fg_muted)
         };
-        text_field_line(prefix, value, form.cursor_positions()[FIELD_PROXY], is_focused, style)
+        text_field_line(
+            prefix,
+            value,
+            form.cursor_positions()[FIELD_PROXY],
+            is_focused,
+            style,
+        )
     };
 
     frame.render_widget(Paragraph::new(line), area);
@@ -2414,7 +2528,9 @@ fn render_password_field(
 
     let line = if !value.is_empty() {
         let dots: String = "●".repeat(value.chars().count());
-        let cursor_chars = value[..form.cursor_positions()[FIELD_PASSWORD].min(value.len())].chars().count();
+        let cursor_chars = value[..form.cursor_positions()[FIELD_PASSWORD].min(value.len())]
+            .chars()
+            .count();
         let style = if is_focused {
             Style::default().fg(tc.fg)
         } else {
@@ -2459,6 +2575,7 @@ fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
 }
 
 #[cfg(test)]
+#[allow(deprecated)]
 mod tests {
     use super::*;
 
@@ -3447,7 +3564,12 @@ mod tests {
 
         let result = state.validate_and_build_group(&config);
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("Duplicate session name"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("Duplicate session name")
+        );
     }
 
     #[test]
@@ -3464,7 +3586,12 @@ mod tests {
 
         let result = state.validate_and_build_group(&config);
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("Session name cannot be empty"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("Session name cannot be empty")
+        );
     }
 
     #[test]

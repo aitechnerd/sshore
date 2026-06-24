@@ -102,7 +102,11 @@ pub fn render_confirm(
     } else {
         if state.is_production {
             let (_, bg) = theme::env_style("production", settings);
-            (bg, " \u{26a0}\u{fe0f}  Delete PRODUCTION Bookmark ", "bookmark")
+            (
+                bg,
+                " \u{26a0}\u{fe0f}  Delete PRODUCTION Bookmark ",
+                "bookmark",
+            )
         } else {
             (tc.warning, " Delete Bookmark ", "bookmark")
         }
@@ -147,7 +151,7 @@ pub fn render_confirm(
         let _badge_span = env_badge::env_badge_span(env, settings);
         let type_label = item_type.to_uppercase();
         lines.push(Line::from(vec![
-            Span::styled(format!("  Delete \""), Style::default().fg(tc.fg)),
+            Span::styled("  Delete \"".to_string(), Style::default().fg(tc.fg)),
             Span::styled(
                 name.clone(),
                 Style::default().fg(tc.fg).add_modifier(Modifier::BOLD),
@@ -158,17 +162,15 @@ pub fn render_confirm(
 
     lines.push(Line::from(vec![
         Span::styled("  Host: ", Style::default().fg(tc.fg)),
-        Span::styled(
-            host.clone(),
-            Style::default().fg(tc.fg_muted),
-        ),
+        Span::styled(host.clone(), Style::default().fg(tc.fg_muted)),
     ]));
 
     // Show session count for groups
     if state.target.session_count > 0 {
-        lines.push(Line::from(vec![
-            Span::styled(format!("  Sessions: {}", state.target.session_count), Style::default().fg(tc.fg_muted)),
-        ]));
+        lines.push(Line::from(vec![Span::styled(
+            format!("  Sessions: {}", state.target.session_count),
+            Style::default().fg(tc.fg_muted),
+        )]));
     }
 
     lines.push(Line::from(""));
@@ -348,8 +350,14 @@ mod tests {
             connect_timeout_secs: None,
             ssh_options: std::collections::BTreeMap::new(),
             sessions: vec![
-                Session { name: "s1".into(), ..Session::default() },
-                Session { name: "s2".into(), ..Session::default() },
+                Session {
+                    name: "s1".into(),
+                    ..Session::default()
+                },
+                Session {
+                    name: "s2".into(),
+                    ..Session::default()
+                },
             ],
         };
         let state = ConfirmState::new_group(&group);
